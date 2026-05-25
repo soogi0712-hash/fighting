@@ -1,0 +1,20 @@
+{
+  "005930": {
+    "code": "005930",
+    "name": "삼성전자",
+    "entry_price": 50000,
+    "highest_price": 50000,
+    "current_level": 1,
+    "avg_price": 50000.0,
+    "total_qty": 5,
+    "level_entries": {
+      "1": {
+        "price": 50000,
+        "qty": 5,
+        "remaining": 5,
+        "added_at": "2026-05-25T03:50:19.859096"
+      }
+    },
+    "created_at": "2026-05-25T03:50:19.859082"
+  }
+}

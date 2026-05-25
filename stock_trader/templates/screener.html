@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🔍 종목 스크리너 — 상대강도 AI 분석</title>
+<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+:root{
+  --bg:#0d1117;--surface:#161b22;--surface2:#21262d;--surface3:#2d333b;
+  --border:#30363d;--text:#c9d1d9;--muted:#8b949e;
+  --green:#3fb950;--red:#f85149;--blue:#58a6ff;
+  --yellow:#d29922;--purple:#bc8cff;--orange:#e3b341;--cyan:#39d353;
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:-apple-system,'Segoe UI',sans-serif;background:var(--bg);color:var(--text);font-size:14px;}
+
+/* ── 헤더 ── */
+.header{background:var(--surface);border-bottom:1px solid var(--border);
+  padding:0 20px;height:52px;display:flex;align-items:center;
+  justify-content:space-between;position:sticky;top:0;z-index:100;}
+.header h1{font-size:1rem;font-weight:700;color:var(--blue);}
+.header nav{display:flex;gap:4px;}
+.nav-btn{padding:5px 12px;border-radius:6px;font-size:.78rem;cursor:pointer;
+  text-decoration:none;color:var(--muted);background:transparent;border:1px solid var(--border);}
+.nav-btn:hover,.nav-btn.active{color:var(--blue);border-color:var(--blue);background:rgba(88,166,255,.07);}
+
+/* ── 레이아웃 ── */
+.container{max-width:1400px;margin:0 auto;padding:20px;display:flex;flex-direction:column;gap:16px;}
+
+/* ── 요약 카드 ── */
+.summary-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:10px;}
+.sum-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;
+  padding:12px 14px;text-align:center;}
+.sum-card .lbl{font-size:.68rem;color:var(--muted);margin-bottom:4px;text-transform:uppercase;}
+.sum-card .val{font-size:1.4rem;font-weight:800;}
+.sum-card .sub{font-size:.68rem;color:var(--muted);margin-top:2px;}
+
+/* ── 시장 지수 바 ── */
+.market-bar{background:var(--surface);border:1px solid var(--border);border-radius:10px;
+  padding:14px 20px;display:flex;align-items:center;gap:20px;flex-wrap:wrap;}
+.mkt-item{display:flex;align-items:center;gap:8px;}
+.mkt-item .name{font-size:.78rem;color:var(--muted);}
+.mkt-item .price{font-size:1.05rem;font-weight:700;}
+.mkt-item .chg{font-size:.8rem;font-weight:700;padding:2px 7px;border-radius:4px;}
+.mkt-pos{background:rgba(248,81,73,.15);color:var(--red);}
+.mkt-neg{background:rgba(63,185,80,.15);color:var(--green);}
+
+/* ── 실행 버튼 ── */
+.action-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
+.run-btn{padding:8px 18px;background:var(--blue);border:none;border-radius:8px;
+  color:#fff;font-size:.85rem;font-weight:700;cursor:pointer;transition:all .15s;}
+.run-btn:hover{filter:brightness(1.1);}
+.run-btn:disabled{opacity:.5;cursor:not-allowed;}
+.filter-select{padding:7px 10px;background:var(--surface2);border:1px solid var(--border);
+  border-radius:6px;color:var(--text);font-size:.82rem;}
+.search-input{padding:7px 12px;background:var(--surface2);border:1px solid var(--border);
+  border-radius:6px;color:var(--text);font-size:.82rem;width:200px;}
+.status-badge{padding:4px 10px;border-radius:20px;font-size:.72rem;font-weight:700;}
+.status-running{background:rgba(88,166,255,.2);color:var(--blue);border:1px solid var(--blue);}
+.status-idle{background:rgba(139,148,158,.15);color:var(--muted);border:1px solid var(--muted);}
+
+/* ── 탭 ── */
+.tabs{display:flex;gap:0;border-bottom:1px solid var(--border);}
+.tab{padding:8px 18px;font-size:.83rem;cursor:pointer;color:var(--muted);
+  border-bottom:2px solid transparent;transition:all .15s;}
+.tab.active{color:var(--blue);border-bottom-color:var(--blue);}
+.tab-body{background:var(--surface);border:1px solid var(--border);
+  border-top:none;border-radius:0 0 12px 12px;padding:16px;}
+
+/* ── 종목 테이블 ── */
+.tbl-wrap{overflow-x:auto;max-height:600px;overflow-y:auto;}
+table{width:100%;border-collapse:collapse;font-size:.8rem;}
+th{position:sticky;top:0;text-align:left;padding:8px 10px;color:var(--muted);
+  font-size:.7rem;font-weight:700;letter-spacing:.5px;
+  background:var(--surface2);border-bottom:1px solid var(--border);cursor:pointer;}
+th:hover{color:var(--blue);}
+td{padding:8px 10px;border-bottom:1px solid rgba(48,54,61,.4);}
+tr:hover td{background:rgba(88,166,255,.03);}
+
+/* ── 점수 바 ── */
+.score-bar-wrap{width:80px;height:8px;background:var(--surface3);border-radius:4px;display:inline-block;vertical-align:middle;}
+.score-bar-fill{height:100%;border-radius:4px;}
+
+/* ── 등급 배지 ── */
+.grade{padding:3px 8px;border-radius:20px;font-size:.68rem;font-weight:800;}
+.g-BUY_CANDIDATE{background:rgba(63,185,80,.2);color:var(--green);border:1px solid var(--green);}
+.g-WATCH_HIGH{background:rgba(88,166,255,.2);color:var(--blue);border:1px solid var(--blue);}
+.g-WATCH{background:rgba(210,153,34,.2);color:var(--yellow);border:1px solid var(--yellow);}
+.g-HOLD_ONLY{background:rgba(139,148,158,.15);color:var(--muted);border:1px solid var(--muted);}
+.g-EXCLUDE{background:rgba(248,81,73,.1);color:var(--red);border:1px solid rgba(248,81,73,.3);}
+.g-EXCLUDED{background:rgba(248,81,73,.1);color:var(--red);border:1px solid rgba(248,81,73,.3);}
+
+/* ── 매수 후보 카드 ── */
+.candidates-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;}
+.cand-card{background:var(--surface2);border:1px solid var(--border);
+  border-radius:10px;padding:14px;position:relative;overflow:hidden;}
+.cand-card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;}
+.cand-card.rank-1::before{background:linear-gradient(90deg,#ffd700,#ffb347);}
+.cand-card.rank-2::before{background:linear-gradient(90deg,#c0c0c0,#a8a8a8);}
+.cand-card.rank-3::before{background:linear-gradient(90deg,#cd7f32,#b8722a);}
+.cand-card.rank-other::before{background:var(--blue);}
+.cand-rank{position:absolute;top:10px;right:10px;font-size:.75rem;color:var(--muted);}
+.cand-name{font-size:.95rem;font-weight:700;margin-bottom:4px;}
+.cand-code{font-size:.72rem;color:var(--muted);}
+.cand-score{font-size:1.6rem;font-weight:900;margin:8px 0;}
+.cand-meta{display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:.75rem;margin-top:8px;}
+.cand-meta-item{background:var(--surface3);padding:4px 8px;border-radius:5px;}
+.cand-meta-item .k{color:var(--muted);font-size:.68rem;}
+.cand-meta-item .v{font-weight:700;margin-top:1px;}
+.cand-reason{font-size:.72rem;color:var(--muted);margin-top:8px;line-height:1.4;
+  border-top:1px solid var(--border);padding-top:6px;}
+
+/* ── 단일 종목 분석 패널 ── */
+.analyze-panel{background:var(--surface2);border-radius:10px;padding:16px;}
+.score-breakdown{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-top:12px;}
+.sb-item{background:var(--surface3);border-radius:7px;padding:10px;text-align:center;}
+.sb-item .k{font-size:.65rem;color:var(--muted);text-transform:uppercase;}
+.sb-item .v{font-size:1.1rem;font-weight:800;margin-top:3px;}
+.sb-item .m{font-size:.65rem;color:var(--muted);}
+.score-gauge{width:120px;height:120px;margin:0 auto 12px;}
+
+/* ── RS 시각화 ── */
+.rs-bar{height:20px;background:var(--surface3);border-radius:10px;position:relative;margin:8px 0;}
+.rs-fill{height:100%;border-radius:10px;position:absolute;}
+.rs-mid{position:absolute;left:50%;top:0;bottom:0;width:2px;background:var(--muted);}
+
+/* ── 반응형 ── */
+@media(max-width:1000px){
+  .summary-grid{grid-template-columns:repeat(4,1fr);}
+  .score-breakdown{grid-template-columns:repeat(3,1fr);}
+}
+@media(max-width:700px){
+  .summary-grid{grid-template-columns:repeat(2,1fr);}
+  .candidates-grid{grid-template-columns:1fr;}
+}
+</style>
+</head>
+<body>
+
+<!-- 헤더 -->
+<div class="header">
+  <h1>🔍 종목 스크리너 — 상대강도 AI 분석</h1>
+  <nav class="header">
+    <a href="/demo" class="nav-btn">📈 피라미딩</a>
+    <a href="/screener" class="nav-btn active">🔍 스크리너</a>
+    <a href="/setup" class="nav-btn">⚙️</a>
+  </nav>
+</div>
+
+<div class="container">
+
+  <!-- 시장 지수 -->
+  <div class="market-bar" id="market-bar">
+    <span style="font-size:.78rem;color:var(--muted)">📊 시장 지수</span>
+    <div class="mkt-item">
+      <span class="name">KOSPI</span>
+      <span class="price" id="kospi-price">—</span>
+      <span class="chg" id="kospi-chg">—</span>
+    </div>
+    <div class="mkt-item">
+      <span class="name">KOSDAQ</span>
+      <span class="price" id="kosdaq-price">—</span>
+      <span class="chg" id="kosdaq-chg">—</span>
+    </div>
+    <div style="margin-left:auto;display:flex;align-items:center;gap:8px">
+      <span style="font-size:.72rem;color:var(--muted)" id="last-screen-time">마지막 분석: —</span>
+      <span class="status-badge status-idle" id="screen-status">대기중</span>
+    </div>
+  </div>
+
+  <!-- 요약 통계 -->
+  <div class="summary-grid" id="summary-grid">
+    <div class="sum-card"><div class="lbl">분석 종목</div><div class="val v-blue" id="s-total">—</div><div class="sub">전체 분석</div></div>
+    <div class="sum-card"><div class="lbl">BUY 후보</div><div class="val" style="color:var(--green)" id="s-buy">—</div><div class="sub">90점↑</div></div>
+    <div class="sum-card"><div class="lbl">WATCH_HIGH</div><div class="val" style="color:var(--blue)" id="s-wh">—</div><div class="sub">80~89점</div></div>
+    <div class="sum-card"><div class="lbl">WATCH</div><div class="val" style="color:var(--yellow)" id="s-w">—</div><div class="sub">70~79점</div></div>
+    <div class="sum-card"><div class="lbl">HOLD</div><div class="val" style="color:var(--muted)" id="s-h">—</div><div class="sub">60~69점</div></div>
+    <div class="sum-card"><div class="lbl">EXCLUDE</div><div class="val" style="color:var(--red)" id="s-ex">—</div><div class="sub">60점↓</div></div>
+    <div class="sum-card"><div class="lbl">제외</div><div class="val" style="color:var(--muted)" id="s-filtered">—</div><div class="sub">필터제거</div></div>
+  </div>
+
+  <!-- 실행 제어 -->
+  <div class="action-bar">
+    <button class="run-btn" id="run-btn" onclick="runScreener()">🚀 스크리닝 실행</button>
+    <select class="filter-select" id="grade-filter" onchange="loadResults()">
+      <option value="">전체 등급</option>
+      <option value="BUY_CANDIDATE">BUY_CANDIDATE (90점↑)</option>
+      <option value="WATCH_HIGH">WATCH_HIGH (80~89)</option>
+      <option value="WATCH">WATCH (70~79)</option>
+      <option value="HOLD_ONLY">HOLD_ONLY (60~69)</option>
+      <option value="EXCLUDE">EXCLUDE (60↓)</option>
+    </select>
+    <input class="search-input" id="search-q" placeholder="🔎 종목명/코드 검색..." oninput="filterTable()">
+    <span style="font-size:.78rem;color:var(--muted)">
+      매수기준: 85점↑ · RS양수 · 20일선위 · 신고가근접
+    </span>
+  </div>
+
+  <!-- 탭 -->
+  <div>
+    <div class="tabs">
+      <div class="tab active" onclick="showTab('tab-candidates',this)">🏆 매수 후보 Top10</div>
+      <div class="tab" onclick="showTab('tab-focus',this)">👁 집중감시 30</div>
+      <div class="tab" onclick="showTab('tab-all',this)">📋 전체 목록 200</div>
+      <div class="tab" onclick="showTab('tab-analyze',this)">🔬 종목 분석</div>
+    </div>
+
+    <!-- 매수 후보 Top 10 -->
+    <div class="tab-body" id="tab-candidates">
+      <div class="candidates-grid" id="candidates-grid">
+        <div style="color:var(--muted);padding:20px;text-align:center;grid-column:1/-1">
+          스크리닝을 실행하면 매수 후보가 여기에 표시됩니다.
+        </div>
+      </div>
+    </div>
+
+    <!-- 집중 감시 30 -->
+    <div class="tab-body" id="tab-focus" style="display:none">
+      <div class="tbl-wrap" id="focus-tbl-wrap">
+        <table id="focus-table">
+          <thead><tr>
+            <th onclick="sortTable('focus-table',0)">종목명</th>
+            <th onclick="sortTable('focus-table',1)">코드</th>
+            <th onclick="sortTable('focus-table',2)">시장</th>
+            <th onclick="sortTable('focus-table',3)">업종</th>
+            <th onclick="sortTable('focus-table',4)">점수▼</th>
+            <th onclick="sortTable('focus-table',5)">RS</th>
+            <th onclick="sortTable('focus-table',6)">등급</th>
+            <th>매수가능</th>
+            <th>분석</th>
+          </tr></thead>
+          <tbody id="focus-tbody">
+            <tr><td colspan="9" style="text-align:center;color:var(--muted);padding:20px">스크리닝 실행 후 표시됩니다</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- 전체 목록 200 -->
+    <div class="tab-body" id="tab-all" style="display:none">
+      <div class="tbl-wrap">
+        <table id="all-table">
+          <thead><tr>
+            <th onclick="sortTable('all-table',0)">순위</th>
+            <th onclick="sortTable('all-table',1)">종목명</th>
+            <th onclick="sortTable('all-table',2)">코드</th>
+            <th onclick="sortTable('all-table',3)">시장</th>
+            <th onclick="sortTable('all-table',4)">업종</th>
+            <th onclick="sortTable('all-table',5)">총점▼</th>
+            <th onclick="sortTable('all-table',6)">기본점</th>
+            <th onclick="sortTable('all-table',7)">감점</th>
+            <th onclick="sortTable('all-table',8)">가산점</th>
+            <th onclick="sortTable('all-table',9)">RS</th>
+            <th onclick="sortTable('all-table',10)">등급</th>
+            <th onclick="sortTable('all-table',11)">매수</th>
+            <th>분석</th>
+          </tr></thead>
+          <tbody id="all-tbody">
+            <tr><td colspan="13" style="text-align:center;color:var(--muted);padding:20px">스크리닝 실행 후 표시됩니다</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- 단일 종목 분석 -->
+    <div class="tab-body" id="tab-analyze" style="display:none">
+      <div style="display:flex;gap:8px;margin-bottom:16px;align-items:center;flex-wrap:wrap">
+        <input id="analyze-code" placeholder="종목코드 (예: 005930)" maxlength="6"
+          style="padding:7px 12px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.85rem;width:160px;">
+        <input id="analyze-name" placeholder="종목명 (선택)"
+          style="padding:7px 12px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.85rem;width:140px;">
+        <button onclick="analyzeStock()" class="run-btn">🔬 분석</button>
+        <span id="analyze-status" style="font-size:.8rem;color:var(--muted)"></span>
+      </div>
+      <div id="analyze-result" style="display:none">
+        <!-- 점수 개요 -->
+        <div style="display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap;margin-bottom:16px">
+          <div style="text-align:center;min-width:140px">
+            <div style="font-size:3rem;font-weight:900" id="ar-total-score">—</div>
+            <div style="font-size:.8rem;color:var(--muted)">/ 100+보너스점</div>
+            <div class="grade" id="ar-grade" style="display:inline-block;margin-top:6px">—</div>
+          </div>
+          <div style="flex:1;min-width:200px">
+            <div id="ar-name" style="font-size:1.2rem;font-weight:700;margin-bottom:6px">—</div>
+            <div style="display:flex;gap:12px;flex-wrap:wrap;font-size:.8rem">
+              <span>RS: <b id="ar-rs" style="color:var(--green)">—</b></span>
+              <span>기본: <b id="ar-base">—</b>점</span>
+              <span>감점: <b id="ar-penalty" style="color:var(--red)">—</b></span>
+              <span>가산: <b id="ar-bonus" style="color:var(--green)">—</b></span>
+            </div>
+            <div id="ar-buy-status" style="margin-top:8px;font-size:.82rem;padding:6px 10px;border-radius:6px;"></div>
+          </div>
+        </div>
+
+        <!-- 항목별 점수 -->
+        <div style="font-size:.75rem;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:8px;letter-spacing:.5px">항목별 점수</div>
+        <div class="score-breakdown" id="ar-breakdown"></div>
+
+        <!-- 시장 감점 / 가산점 상세 -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px">
+          <div style="background:var(--surface3);border-radius:8px;padding:12px">
+            <div style="font-size:.72rem;color:var(--red);font-weight:700;margin-bottom:6px">📉 시장 위험 감점</div>
+            <div id="ar-penalties" style="font-size:.78rem;color:var(--muted)">없음</div>
+          </div>
+          <div style="background:var(--surface3);border-radius:8px;padding:12px">
+            <div style="font-size:.72rem;color:var(--green);font-weight:700;margin-bottom:6px">⭐ 강종목 가산점</div>
+            <div id="ar-bonuses" style="font-size:.78rem;color:var(--muted)">없음</div>
+          </div>
+        </div>
+
+        <!-- 매수 조건 체크 -->
+        <div style="margin-top:12px;background:var(--surface3);border-radius:8px;padding:12px">
+          <div style="font-size:.72rem;font-weight:700;color:var(--muted);margin-bottom:8px;text-transform:uppercase">매수 조건 체크</div>
+          <div id="ar-conditions" style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;font-size:.78rem"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /container -->
+
+<script>
+const socket = io();
+let allScores = [], screenRunning = false;
+let sortDir   = {};
+
+// ── 소켓 ────────────────────────────────────────────────────
+socket.on('screen_done', data => {
+  screenRunning = false;
+  updateRunBtn();
+  document.getElementById('screen-status').textContent = '완료';
+  document.getElementById('screen-status').className = 'status-badge status-idle';
+  document.getElementById('last-screen-time').textContent =
+    '마지막 분석: ' + new Date().toLocaleTimeString('ko-KR');
+  if (data.summary) updateSummary(data.summary);
+  loadResults();
+});
+
+// ── 스크리닝 실행 ────────────────────────────────────────────
+async function runScreener(){
+  if(screenRunning) return;
+  screenRunning = true;
+  updateRunBtn();
+  document.getElementById('screen-status').textContent = '분석중...';
+  document.getElementById('screen-status').className = 'status-badge status-running';
+  const r = await fetch('/api/screener/run',{method:'POST'}).then(r=>r.json());
+}
+function updateRunBtn(){
+  const b = document.getElementById('run-btn');
+  b.disabled = screenRunning;
+  b.textContent = screenRunning ? '⏳ 분석 중...' : '🚀 스크리닝 실행';
+}
+
+// ── 결과 로드 ────────────────────────────────────────────────
+async function loadResults(){
+  const grade = document.getElementById('grade-filter').value;
+  const url   = `/api/screener/results?grade=${grade}&limit=200`;
+  const data  = await fetch(url).then(r=>r.json());
+
+  allScores = data.scores || [];
+  if(data.summary && data.summary.total_analyzed) updateSummary(data.summary);
+
+  renderAllTable(allScores);
+  await loadCandidates();
+  await loadFocus();
+}
+
+function updateSummary(s){
+  const set = (id,v) => { const el=document.getElementById(id); if(el) el.textContent=v; };
+  set('s-total',   (s.total_analyzed||0).toLocaleString());
+  set('s-buy',     s.buy_candidate||0);
+  set('s-wh',      s.watch_high||0);
+  set('s-w',       s.watch||0);
+  set('s-h',       s.hold_only||0);
+  set('s-ex',      s.exclude||0);
+  set('s-filtered',s.total_excluded||0);
+  // 시장 지수 수익률
+  const kr = s.market_kospi_ret;
+  const kq = s.market_kosdaq_ret;
+  if(kr!=null){
+    document.getElementById('kospi-chg').textContent = (kr>=0?'+':'')+kr.toFixed(1)+'%';
+    document.getElementById('kospi-chg').className = 'chg '+(kr>=0?'mkt-pos':'mkt-neg');
+  }
+  if(kq!=null){
+    document.getElementById('kosdaq-chg').textContent = (kq>=0?'+':'')+kq.toFixed(1)+'%';
+    document.getElementById('kosdaq-chg').className = 'chg '+(kq>=0?'mkt-pos':'mkt-neg');
+  }
+}
+
+// ── 매수 후보 카드 ──────────────────────────────────────────
+async function loadCandidates(){
+  const cands = await fetch('/api/screener/candidates').then(r=>r.json());
+  const grid  = document.getElementById('candidates-grid');
+  if(!cands.length){
+    grid.innerHTML = '<div style="color:var(--muted);padding:30px;text-align:center;grid-column:1/-1">매수 후보 없음 (스크리닝을 먼저 실행하세요)</div>';
+    return;
+  }
+  const rankCls = {1:'rank-1',2:'rank-2',3:'rank-3'};
+  grid.innerHTML = cands.map((c,i)=>{
+    const rank = i+1;
+    const rs   = (c.rs_value||0);
+    const rsClr= rs>=0 ? 'var(--green)':'var(--red)';  // 양수RS=시장보다강함=초록
+    const rsSign=rs>=0?'+':'';
+    const sc   = (c.score!=null?c.score:c.total_score)||0;  // DB=score, 메모리=total_score
+    const scClr= sc>=90?'var(--green)':sc>=80?'var(--blue)':sc>=70?'var(--yellow)':'var(--muted)';
+    return `<div class="cand-card ${rankCls[rank]||'rank-other'}" onclick="openAnalyze('${c.code}','${c.name||c.code}')">
+      <div class="cand-rank">#${rank}</div>
+      <div class="cand-name">${c.name||c.code}</div>
+      <div class="cand-code">${c.code} · ${c.sector||'—'}</div>
+      <div class="cand-score" style="color:${scClr}">${sc.toFixed(0)}<span style="font-size:.9rem;color:var(--muted)">점</span></div>
+      <div style="display:flex;gap:8px;font-size:.8rem;margin-bottom:4px">
+        <span>RS: <b style="color:${rsClr}">${rsSign}${rs.toFixed(1)}%</b></span>
+        <span class="grade g-${c.grade}">${c.grade||''}</span>
+      </div>
+      <div class="cand-meta">
+        <div class="cand-meta-item"><div class="k">현재가</div><div class="v">${(c.cur_price||0).toLocaleString()}원</div></div>
+        <div class="cand-meta-item"><div class="k">시총</div><div class="v">${c.market_cap?Math.round(c.market_cap/1e8)+'억':'—'}</div></div>
+        <div class="cand-meta-item"><div class="k">거래대금</div><div class="v">${c.daily_amount?Math.round(c.daily_amount/1e8)+'억':'—'}</div></div>
+        <div class="cand-meta-item"><div class="k">시장</div><div class="v">${c.market||'—'}</div></div>
+      </div>
+      <div class="cand-reason">${c.reason||''}</div>
+    </div>`;
+  }).join('');
+}
+
+// ── 집중감시 테이블 ─────────────────────────────────────────
+async function loadFocus(){
+  const list = await fetch('/api/screener/focus').then(r=>r.json());
+  const tbody= document.getElementById('focus-tbody');
+  if(!list.length){
+    tbody.innerHTML='<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:20px">없음</td></tr>';
+    return;
+  }
+  tbody.innerHTML = list.map(r=> stockRow(r, true)).join('');
+}
+
+// ── 전체 목록 테이블 ────────────────────────────────────────
+function renderAllTable(scores){
+  const tbody = document.getElementById('all-tbody');
+  if(!scores.length){
+    tbody.innerHTML='<tr><td colspan="13" style="text-align:center;color:var(--muted);padding:20px">데이터 없음</td></tr>';
+    return;
+  }
+  const q = document.getElementById('search-q').value.toLowerCase();
+  const filtered = q ? scores.filter(s=>
+    (s.name||'').toLowerCase().includes(q)||(s.code||'').includes(q)
+  ) : scores;
+  tbody.innerHTML = filtered.map((r,i)=>
+    `<tr>
+      <td style="color:var(--muted)">${i+1}</td>
+      <td><b style="cursor:pointer;color:var(--blue)" onclick="openAnalyze('${r.code}','${r.name||''}')">${r.name||r.code}</b></td>
+      <td style="color:var(--muted);font-family:monospace">${r.code}</td>
+      <td style="font-size:.72rem">${r.market||'—'}</td>
+      <td style="font-size:.72rem;color:var(--muted)">${r.sector||'—'}</td>
+      <td>
+        <div style="display:flex;align-items:center;gap:6px">
+          <div class="score-bar-wrap"><div class="score-bar-fill" style="width:${Math.min(100,r.total_score||0)}%;background:${scoreColor(r.total_score)}"></div></div>
+          <b style="color:${scoreColor(r.total_score)}">${(r.total_score||0).toFixed(0)}</b>
+        </div>
+      </td>
+      <td>${(r.base_score||0).toFixed(0)}</td>
+      <td style="color:var(--red)">${(r.market_penalty||0).toFixed(0)}</td>
+      <td style="color:var(--green)">${(r.bonus||0)>0?'+'+(r.bonus||0).toFixed(0):(r.bonus||0).toFixed(0)}</td>
+      <td><span style="color:${(r.rs_value||0)>=0?'var(--green)':'var(--red)'};font-weight:700">${(r.rs_value||0)>=0?'+':''}${(r.rs_value||0).toFixed(1)}%</span></td>
+      <td><span class="grade g-${r.grade}">${r.grade||'—'}</span></td>
+      <td>${r.buy_eligible?'<span style="color:var(--green);font-weight:700">✅</span>':'<span style="color:var(--muted)">—</span>'}</td>
+      <td><button onclick="openAnalyze('${r.code}','${r.name||''}')" style="padding:3px 8px;background:var(--surface3);border:1px solid var(--border);border-radius:4px;color:var(--text);cursor:pointer;font-size:.72rem">분석</button></td>
+    </tr>`
+  ).join('');
+}
+
+function stockRow(r, isFocus){
+  const rs = (r.rs_value!=null ? r.rs_value : 0);
+  return `<tr>
+    <td><b style="cursor:pointer;color:var(--blue)" onclick="openAnalyze('${r.code}','${r.name||''}')">${r.name||r.code}</b></td>
+    <td style="color:var(--muted);font-family:monospace">${r.code}</td>
+    <td style="font-size:.72rem">${r.market||'—'}</td>
+    <td style="font-size:.72rem;color:var(--muted)">${r.sector||'—'}</td>
+    <td><b style="color:${scoreColor(r.last_score||r.total_score)}">${(r.last_score||r.total_score||0).toFixed(0)}</b></td>
+    <td><span style="color:${rs>=0?'var(--green)':'var(--red)'};font-weight:700">${rs>=0?'+':''}${rs.toFixed(1)}%</span></td>
+    <td><span class="grade g-${r.last_grade||r.grade}">${r.last_grade||r.grade||'—'}</span></td>
+    <td>${r.is_candidate?'<span style="color:var(--green);font-weight:700">✅</span>':'—'}</td>
+    <td><button onclick="openAnalyze('${r.code}','${r.name||''}')" style="padding:3px 8px;background:var(--surface3);border:1px solid var(--border);border-radius:4px;color:var(--text);cursor:pointer;font-size:.72rem">분석</button></td>
+  </tr>`;
+}
+
+function scoreColor(s){
+  if(s>=90) return 'var(--green)';
+  if(s>=80) return 'var(--blue)';
+  if(s>=70) return 'var(--yellow)';
+  if(s>=60) return 'var(--muted)';
+  return 'var(--red)';
+}
+
+function filterTable(){ renderAllTable(allScores); }
+
+// ── 단일 종목 분석 ──────────────────────────────────────────
+function openAnalyze(code, name){
+  document.getElementById('analyze-code').value = code;
+  document.getElementById('analyze-name').value = name;
+  showTab('tab-analyze', document.querySelectorAll('.tab')[3]);
+  analyzeStock();
+}
+
+async function analyzeStock(){
+  const code = document.getElementById('analyze-code').value.trim();
+  const name = document.getElementById('analyze-name').value.trim() || code;
+  if(!code){ alert('종목코드를 입력하세요'); return; }
+  document.getElementById('analyze-status').textContent = '분석 중...';
+  document.getElementById('analyze-result').style.display = 'none';
+  const data = await fetch(`/api/screener/analyze/${code}?name=${encodeURIComponent(name)}`).then(r=>r.json());
+  if(data.error){ document.getElementById('analyze-status').textContent = data.error; return; }
+  renderAnalysis(data);
+  document.getElementById('analyze-status').textContent = '';
+  document.getElementById('analyze-result').style.display = 'block';
+}
+
+function renderAnalysis(d){
+  const set = (id,v) => { const el=document.getElementById(id); if(el) el.textContent=v; };
+  const total = d.total_score||0;
+  set('ar-total-score', total.toFixed(0));
+  const grade = d.grade||'—';
+  const gradeEl = document.getElementById('ar-grade');
+  if(gradeEl){ gradeEl.textContent=grade; gradeEl.className=`grade g-${grade}`; }
+  set('ar-name', (d.name||d.code||'—'));
+  set('ar-base', (d.base_score||0).toFixed(0));
+  set('ar-rs', ((d.rs_value||0)>=0?'+':'')+(d.rs_value||0).toFixed(1)+'%');
+  document.getElementById('ar-rs').style.color = (d.rs_value||0)>=0?'var(--green)':'var(--red)';  // RS양수=초록
+  set('ar-penalty', (d.market_penalty||0).toFixed(0));
+  set('ar-bonus', '+'+(d.bonus||0).toFixed(0));
+  document.getElementById('ar-total-score').style.color = scoreColor(total);
+
+  // 매수 상태
+  const buyEl = document.getElementById('ar-buy-status');
+  if(d.buy_eligible){
+    buyEl.innerHTML = '✅ 매수 조건 충족';
+    buyEl.style.cssText='background:rgba(63,185,80,.1);border:1px solid rgba(63,185,80,.3);border-radius:6px;padding:6px 10px;color:var(--green);font-size:.82rem;margin-top:8px;';
+  } else {
+    buyEl.innerHTML = '❌ 매수 불가 — '+( d.buy_reason||'');
+    buyEl.style.cssText='background:rgba(248,81,73,.07);border:1px solid rgba(248,81,73,.2);border-radius:6px;padding:6px 10px;color:var(--red);font-size:.82rem;margin-top:8px;';
+  }
+
+  // 항목별 점수
+  const LABEL_MAP = {
+    return_3m:'3개월수익',return_1m:'1개월수익',volume_ratio:'거래량',
+    amount_ratio:'거래대금',inst_net:'기관순매수',foreign_net:'외인순매수',
+    high52w:'신고가',op_growth:'영업이익',roe:'ROE',rs:'상대강도RS',
+    market_penalty:'시장감점',bonus:'가산점'
+  };
+  const detail = d.detail||{};
+  const bkEl = document.getElementById('ar-breakdown');
+  const mainKeys = ['return_3m','return_1m','volume_ratio','amount_ratio','inst_net','foreign_net','high52w','op_growth','roe','rs'];
+  bkEl.innerHTML = mainKeys.map(k=>{
+    const it = detail[k]||{};
+    const sc = it.score||0, mx = it.max||0, raw = it.raw;
+    const pct = mx>0? Math.min(100,sc/mx*100):0;
+    const clr = pct>=80?'var(--green)':pct>=50?'var(--blue)':'var(--muted)';
+    const rawStr = raw==null?'—': typeof raw==='number'?raw.toFixed(1): (Array.isArray(raw)?raw.join(', '):raw);
+    return `<div class="sb-item">
+      <div class="k">${LABEL_MAP[k]||k}</div>
+      <div class="v" style="color:${clr}">${sc.toFixed(0)}<span style="font-size:.65rem;color:var(--muted)">/${mx}</span></div>
+      <div class="m">${rawStr}</div>
+      <div style="height:4px;background:var(--surface2);border-radius:2px;margin-top:4px">
+        <div style="height:100%;width:${pct}%;background:${clr};border-radius:2px"></div>
+      </div>
+    </div>`;
+  }).join('');
+
+  // 감점 상세
+  const penEl = document.getElementById('ar-penalties');
+  const pen   = detail.market_penalty;
+  if(pen && Array.isArray(pen.raw) && pen.raw.length){
+    penEl.innerHTML = pen.raw.map(r=>`<div>• ${r}</div>`).join('');
+  } else {
+    penEl.textContent = '해당 없음 (시장 위험 정상)';
+  }
+
+  // 보너스 상세
+  const bonEl = document.getElementById('ar-bonuses');
+  const bon   = detail.bonus;
+  if(bon && Array.isArray(bon.raw) && bon.raw.length){
+    bonEl.innerHTML = bon.raw.map(r=>`<div style="color:var(--green)">• ${r}</div>`).join('');
+  } else {
+    bonEl.textContent = '해당 없음';
+  }
+
+  // 매수 조건
+  const condEl = document.getElementById('ar-conditions');
+  const br   = d.buy_reason||'';
+  const conds = [
+    {label:'총점 85점↑',  ok: (d.total_score||0)>=85},
+    {label:'RS 양수',      ok: (d.rs_value||0)>0},
+    {label:'거래대금 30억↑', ok: !br.includes('거래대금미달')},
+    {label:'거래량 증가',  ok: !br.includes('거래량감소')},
+    {label:'MA20선 위',    ok: !br.includes('MA20이탈')},
+    {label:'신고가 근접',  ok: !br.includes('신고가원거리')},
+  ];
+  condEl.innerHTML = conds.map(c=>
+    `<div style="display:flex;align-items:center;gap:5px;padding:4px 8px;background:${c.ok?'rgba(63,185,80,.08)':'rgba(248,81,73,.06)'};border-radius:5px">
+      <span>${c.ok?'✅':'❌'}</span>
+      <span style="color:${c.ok?'var(--green)':'var(--red)'}">${c.label}</span>
+    </div>`
+  ).join('');
+}
+
+// ── 탭 전환 ──────────────────────────────────────────────────
+function showTab(id, el){
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  el.classList.add('active');
+  ['tab-candidates','tab-focus','tab-all','tab-analyze'].forEach(tid=>{
+    document.getElementById(tid).style.display = tid===id?'block':'none';
+  });
+  if(id==='tab-all') renderAllTable(allScores);
+  if(id==='tab-focus') loadFocus();
+}
+
+// ── 테이블 정렬 ──────────────────────────────────────────────
+function sortTable(tableId, colIdx){
+  const table = document.getElementById(tableId);
+  if(!table) return;
+  const tbody = table.querySelector('tbody');
+  const rows  = Array.from(tbody.querySelectorAll('tr'));
+  const dir   = sortDir[tableId+colIdx] = !(sortDir[tableId+colIdx]);
+  rows.sort((a,b)=>{
+    const av = a.cells[colIdx]?.textContent.trim()||'';
+    const bv = b.cells[colIdx]?.textContent.trim()||'';
+    const an = parseFloat(av), bn = parseFloat(bv);
+    if(!isNaN(an)&&!isNaN(bn)) return dir?bn-an:an-bn;
+    return dir?bv.localeCompare(av,'ko'):av.localeCompare(bv,'ko');
+  });
+  rows.forEach(r=>tbody.appendChild(r));
+}
+
+// ── 초기화 ───────────────────────────────────────────────────
+(async()=>{
+  await loadResults();
+  const summary = await fetch('/api/screener/summary').then(r=>r.json());
+  if(summary && summary.length){
+    updateSummary(summary[0]);
+    document.getElementById('last-screen-time').textContent =
+      '마지막 분석: '+(summary[0].date||'—');
+  }
+})();
+</script>
+</body>
+</html>

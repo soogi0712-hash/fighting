@@ -1,0 +1,624 @@
+{
+  "calc_date": "2026-05-25",
+  "regime": "LATERAL",
+  "ranking": [
+    {
+      "rank": 1,
+      "strategy_id": "P4",
+      "name": "추가매수 없음",
+      "group": "PYRAMID",
+      "tier": "EXPERIMENT",
+      "score": 27.7,
+      "metrics": {
+        "trade_count": 2,
+        "total_return": 1.1,
+        "cagr": 2.31,
+        "mdd": -8.71,
+        "sharpe": 0.24,
+        "win_rate": 0.0,
+        "avg_win": 0.0,
+        "avg_loss": -63752.0,
+        "profit_factor": 0.0,
+        "avg_hold_days": 0.5,
+        "monthly": {
+          "2026-04": -63752.0
+        },
+        "return_3m": -0.64,
+        "return_6m": -0.64,
+        "final_capital": 10110423,
+        "initial_capital": 10000000
+      },
+      "ai": {
+        "grade": "N/A",
+        "summary": "데이터 부족",
+        "regime_fit": "—",
+        "recommendation": "추가 데이터 수집 필요"
+      },
+      "stop_loss_pct": -10.0,
+      "trailing_pct": -15.0,
+      "add_buy_levels": [],
+      "calc_date": "2026-05-25"
+    },
+    {
+      "rank": 2,
+      "strategy_id": "P2",
+      "name": "추가매수 +15/30/50%",
+      "group": "PYRAMID",
+      "tier": "EXPERIMENT",
+      "score": 24.6,
+      "metrics": {
+        "trade_count": 2,
+        "total_return": 0.05,
+        "cagr": 0.11,
+        "mdd": -10.29,
+        "sharpe": 0.09,
+        "win_rate": 0.0,
+        "avg_win": 0.0,
+        "avg_loss": -84462.0,
+        "profit_factor": 0.0,
+        "avg_hold_days": 0.5,
+        "monthly": {
+          "2026-04": -168923.0
+        },
+        "return_3m": -1.69,
+        "return_6m": -1.69,
+        "final_capital": 10005252,
+        "initial_capital": 10000000
+      },
+      "ai": {
+        "grade": "N/A",
+        "summary": "데이터 부족",
+        "regime_fit": "—",
+        "recommendation": "추가 데이터 수집 필요"
+      },
+      "stop_loss_pct": -10.0,
+      "trailing_pct": -15.0,
+      "add_buy_levels": [
+        15.0,
+        30.0,
+        50.0
+      ],
+      "calc_date": "2026-05-25"
+    },
+    {
+      "rank": 3,
+      "strategy_id": "P3",
+      "name": "추가매수 +20/40/60%",
+      "group": "PYRAMID",
+      "tier": "EXPERIMENT",
+      "score": 24.0,
+      "metrics": {
+        "trade_count": 2,
+        "total_return": -0.28,
+        "cagr": -0.59,
+        "mdd": -10.32,
+        "sharpe": 0.04,
+        "win_rate": 0.0,
+        "avg_win": 0.0,
+        "avg_loss": -101266.0,
+        "profit_factor": 0.0,
+        "avg_hold_days": 0.5,
+        "monthly": {
+          "2026-04": -202532.0
+        },
+        "return_3m": -2.03,
+        "return_6m": -2.03,
+        "final_capital": 9971643,
+        "initial_capital": 10000000
+      },
+      "ai": {
+        "grade": "N/A",
+        "summary": "데이터 부족",
+        "regime_fit": "—",
+        "recommendation": "추가 데이터 수집 필요"
+      },
+      "stop_loss_pct": -10.0,
+      "trailing_pct": -15.0,
+      "add_buy_levels": [
+        20.0,
+        40.0,
+        60.0
+      ],
+      "calc_date": "2026-05-25"
+    },
+    {
+      "rank": 4,
+      "strategy_id": "T1",
+      "name": "트레일 -10%",
+      "group": "TRAIL",
+      "tier": "EXPERIMENT",
+      "score": 22.8,
+      "metrics": {
+        "trade_count": 2,
+        "total_return": -0.54,
+        "cagr": -1.12,
+        "mdd": -11.4,
+        "sharpe": 0.03,
+        "win_rate": 0.0,
+        "avg_win": 0.0,
+        "avg_loss": -114010.0,
+        "profit_factor": 0.0,
+        "avg_hold_days": 0.0,
+        "monthly": {
+          "2026-04": -228021.0
+        },
+        "return_3m": -2.28,
+        "return_6m": -2.28,
+        "final_capital": 9946154,
+        "initial_capital": 10000000
+      },
+      "ai": {
+        "grade": "N/A",
+        "summary": "데이터 부족",
+        "regime_fit": "—",
+        "recommendation": "추가 데이터 수집 필요"
+      },
+      "stop_loss_pct": -10.0,
+      "trailing_pct": -10.0,
+      "add_buy_levels": [
+        10.0,
+        20.0,
+        35.0
+      ],
+      "calc_date": "2026-05-25"
+    },
+    {
+      "rank": 5,
+      "strategy_id": "T2",
+      "name": "트레일 -12%",
+      "group": "TRAIL",
+      "tier": "EXPERIMENT",
+      "score": 22.8,
+      "metrics": {
+        "trade_count": 2,
+        "total_return": -0.54,
+        "cagr": -1.12,
+        "mdd": -11.4,
+        "sharpe": 0.03,
+        "win_rate": 0.0,
+        "avg_win": 0.0,
+        "avg_loss": -114010.0,
+        "profit_factor": 0.0,
+        "avg_hold_days": 0.0,
+        "monthly": {
+          "2026-04": -228021.0
+        },
+        "return_3m": -2.28,
+        "return_6m": -2.28,
+        "final_capital": 9946154,
+        "initial_capital": 10000000
+      },
+      "ai": {
+        "grade": "N/A",
+        "summary": "데이터 부족",
+        "regime_fit": "—",
+        "recommendation": "추가 데이터 수집 필요"
+      },
+      "stop_loss_pct": -10.0,
+      "trailing_pct": -12.0,
+      "add_buy_levels": [
+        10.0,
+        20.0,
+        35.0
+      ],
+      "calc_date": "2026-05-25"
+    },
+    {
+      "rank": 6,
+      "strategy_id": "S3",
+      "name": "손절 -10%",
+      "group": "STOP",
+      "tier": "EXPERIMENT",
+      "score": 21.4,
+      "metrics": {
+        "trade_count": 2,
+        "total_return": -1.32,
+        "cagr": -2.74,
+        "mdd": -12.12,
+        "sharpe": -0.06,
+        "win_rate": 0.0,
+        "avg_win": 0.0,
+        "avg_loss": -153242.0,
+        "profit_factor": 0.0,
+        "avg_hold_days": 0.5,
+        "monthly": {
+          "2026-04": -306485.0
+        },
+        "return_3m": -3.06,
+        "return_6m": -3.06,
+        "final_capital": 9867690,
+        "initial_capital": 10000000
+      },
+      "ai": {
+        "grade": "N/A",
+        "summary": "데이터 부족",
+        "regime_fit": "—",
+        "recommendation": "추가 데이터 수집 필요"
+      },
+      "stop_loss_pct": -10.0,
+      "trailing_pct": -15.0,
+      "add_buy_levels": [
+        10.0,
+        20.0,
+        35.0
+      ],
+      "calc_date": "2026-05-25"
+    },
+    {
+      "rank": 7,
+      "strategy_id": "S4",
+      "name": "손절 -12%",
+      "group": "STOP",
+      "tier": "EXPERIMENT",
+      "score": 21.4,
+      "metrics": {
+        "trade_count": 2,
+        "total_return": -1.32,
+        "cagr": -2.74,
+        "mdd": -12.12,
+        "sharpe": -0.06,
+        "win_rate": 0.0,
+        "avg_win": 0.0,
+        "avg_loss": -153242.0,
+        "profit_factor": 0.0,
+        "avg_hold_days": 0.5,
+        "monthly": {
+          "2026-04": -306485.0
+        },
+        "return_3m": -3.06,
+        "return_6m": -3.06,
+        "final_capital": 9867690,
+        "initial_capital": 10000000
+      },
+      "ai": {
+        "grade": "N/A",
+        "summary": "데이터 부족",
+        "regime_fit": "—",
+        "recommendation": "추가 데이터 수집 필요"
+      },
+      "stop_loss_pct": -12.0,
+      "trailing_pct": -15.0,
+      "add_buy_levels": [
+        10.0,
+        20.0,
+        35.0
+      ],
+      "calc_date": "2026-05-25"
+    },
+    {
+      "rank": 8,
+      "strategy_id": "S5",
+      "name": "손절 -15%",
+      "group": "STOP",
+      "tier": "EXPERIMENT",
+      "score": 21.4,
+      "metrics": {
+        "trade_count": 2,
+        "total_return": -1.32,
+        "cagr": -2.74,
+        "mdd": -12.12,
+        "sharpe": -0.06,
+        "win_rate": 0.0,
+        "avg_win": 0.0,
+        "avg_loss": -153242.0,
+        "profit_factor": 0.0,
+        "avg_hold_days": 0.5,
+        "monthly": {
+          "2026-04": -306485.0
+        },
+        "return_3m": -3.06,
+        "return_6m": -3.06,
+        "final_capital": 9867690,
+        "initial_capital": 10000000
+      },
+      "ai": {
+        "grade": "N/A",
+        "summary": "데이터 부족",
+        "regime_fit": "—",
+        "recommendation": "추가 데이터 수집 필요"
+      },
+      "stop_loss_pct": -15.0,
+      "trailing_pct": -15.0,
+      "add_buy_levels": [
+        10.0,
+        20.0,
+        35.0
+      ],
+      "calc_date": "2026-05-25"
+    },
+    {
+      "rank": 9,
+      "strategy_id": "T3",
+      "name": "트레일 -15%",
+      "group": "TRAIL",
+      "tier": "EXPERIMENT",
+      "score": 21.4,
+      "metrics": {
+        "trade_count": 2,
+        "total_return": -1.32,
+        "cagr": -2.74,
+        "mdd": -12.12,
+        "sharpe": -0.06,
+        "win_rate": 0.0,
+        "avg_win": 0.0,
+        "avg_loss": -153242.0,
+        "profit_factor": 0.0,
+        "avg_hold_days": 0.5,
+        "monthly": {
+          "2026-04": -306485.0
+        },
+        "return_3m": -3.06,
+        "return_6m": -3.06,
+        "final_capital": 9867690,
+        "initial_capital": 10000000
+      },
+      "ai": {
+        "grade": "N/A",
+        "summary": "데이터 부족",
+        "regime_fit": "—",
+        "recommendation": "추가 데이터 수집 필요"
+      },
+      "stop_loss_pct": -10.0,
+      "trailing_pct": -15.0,
+      "add_buy_levels": [
+        10.0,
+        20.0,
+        35.0
+      ],
+      "calc_date": "2026-05-25"
+    },
+    {
+      "rank": 10,
+      "strategy_id": "P1",
+      "name": "추가매수 +10/20/35%",
+      "group": "PYRAMID",
+      "tier": "EXPERIMENT",
+      "score": 21.4,
+      "metrics": {
+        "trade_count": 2,
+        "total_return": -1.32,
+        "cagr": -2.74,
+        "mdd": -12.12,
+        "sharpe": -0.06,
+        "win_rate": 0.0,
+        "avg_win": 0.0,
+        "avg_loss": -153242.0,
+        "profit_factor": 0.0,
+        "avg_hold_days": 0.5,
+        "monthly": {
+          "2026-04": -306485.0
+        },
+        "return_3m": -3.06,
+        "return_6m": -3.06,
+        "final_capital": 9867690,
+        "initial_capital": 10000000
+      },
+      "ai": {
+        "grade": "N/A",
+        "summary": "데이터 부족",
+        "regime_fit": "—",
+        "recommendation": "추가 데이터 수집 필요"
+      },
+      "stop_loss_pct": -10.0,
+      "trailing_pct": -15.0,
+      "add_buy_levels": [
+        10.0,
+        20.0,
+        35.0
+      ],
+      "calc_date": "2026-05-25"
+    },
+    {
+      "rank": 11,
+      "strategy_id": "S1",
+      "name": "손절 -5%",
+      "group": "STOP",
+      "tier": "EXPERIMENT",
+      "score": 20.6,
+      "metrics": {
+        "trade_count": 5,
+        "total_return": -2.51,
+        "cagr": -5.15,
+        "mdd": -11.97,
+        "sharpe": -0.21,
+        "win_rate": 0.0,
+        "avg_win": 0.0,
+        "avg_loss": -97202.0,
+        "profit_factor": 0.0,
+        "avg_hold_days": -1.4,
+        "monthly": {
+          "2026-04": -395340.0,
+          "2026-05": -90672.0
+        },
+        "return_3m": -4.86,
+        "return_6m": -4.86,
+        "final_capital": 9749251,
+        "initial_capital": 10000000
+      },
+      "ai": {
+        "grade": "F",
+        "summary": "총수익률 -2.5% (적자) | MDD -12.0% (주의) | 최근3개월 -4.9%",
+        "regime_fit": "하락장",
+        "strength": "빠른 손절로 하락 방어",
+        "current_regime": "횡보장",
+        "recommendation": "즉시 검토·수정 필요",
+        "score": 20.6
+      },
+      "stop_loss_pct": -5.0,
+      "trailing_pct": -15.0,
+      "add_buy_levels": [
+        10.0,
+        20.0,
+        35.0
+      ],
+      "calc_date": "2026-05-25"
+    },
+    {
+      "rank": 12,
+      "strategy_id": "S2",
+      "name": "손절 -7%",
+      "group": "STOP",
+      "tier": "EXPERIMENT",
+      "score": 20.0,
+      "metrics": {
+        "trade_count": 4,
+        "total_return": -3.03,
+        "cagr": -6.21,
+        "mdd": -12.26,
+        "sharpe": -0.26,
+        "win_rate": 0.0,
+        "avg_win": 0.0,
+        "avg_loss": -133903.0,
+        "profit_factor": 0.0,
+        "avg_hold_days": -0.5,
+        "monthly": {
+          "2026-04": -535611.0
+        },
+        "return_3m": -5.36,
+        "return_6m": -5.36,
+        "final_capital": 9696790,
+        "initial_capital": 10000000
+      },
+      "ai": {
+        "grade": "F",
+        "summary": "총수익률 -3.0% (적자) | MDD -12.3% (주의) | 최근3개월 -5.4%",
+        "regime_fit": "하락장",
+        "strength": "빠른 손절로 하락 방어",
+        "current_regime": "횡보장",
+        "recommendation": "즉시 검토·수정 필요",
+        "score": 20.0
+      },
+      "stop_loss_pct": -7.0,
+      "trailing_pct": -15.0,
+      "add_buy_levels": [
+        10.0,
+        20.0,
+        35.0
+      ],
+      "calc_date": "2026-05-25"
+    },
+    {
+      "rank": 13,
+      "strategy_id": "T4",
+      "name": "트레일 -18%",
+      "group": "TRAIL",
+      "tier": "EXPERIMENT",
+      "score": 19.4,
+      "metrics": {
+        "trade_count": 2,
+        "total_return": -2.65,
+        "cagr": -5.44,
+        "mdd": -13.33,
+        "sharpe": -0.22,
+        "win_rate": 0.0,
+        "avg_win": 0.0,
+        "avg_loss": -219594.0,
+        "profit_factor": 0.0,
+        "avg_hold_days": 1.0,
+        "monthly": {
+          "2026-04": -439189.0
+        },
+        "return_3m": -4.39,
+        "return_6m": -4.39,
+        "final_capital": 9734986,
+        "initial_capital": 10000000
+      },
+      "ai": {
+        "grade": "N/A",
+        "summary": "데이터 부족",
+        "regime_fit": "—",
+        "recommendation": "추가 데이터 수집 필요"
+      },
+      "stop_loss_pct": -10.0,
+      "trailing_pct": -18.0,
+      "add_buy_levels": [
+        10.0,
+        20.0,
+        35.0
+      ],
+      "calc_date": "2026-05-25"
+    },
+    {
+      "rank": 14,
+      "strategy_id": "T5",
+      "name": "트레일 -20%",
+      "group": "TRAIL",
+      "tier": "EXPERIMENT",
+      "score": 18.9,
+      "metrics": {
+        "trade_count": 2,
+        "total_return": -3.06,
+        "cagr": -6.27,
+        "mdd": -13.56,
+        "sharpe": -0.27,
+        "win_rate": 0.0,
+        "avg_win": 0.0,
+        "avg_loss": -233930.0,
+        "profit_factor": 0.0,
+        "avg_hold_days": 1.5,
+        "monthly": {
+          "2026-04": -467861.0
+        },
+        "return_3m": -4.68,
+        "return_6m": -4.68,
+        "final_capital": 9694012,
+        "initial_capital": 10000000
+      },
+      "ai": {
+        "grade": "N/A",
+        "summary": "데이터 부족",
+        "regime_fit": "—",
+        "recommendation": "추가 데이터 수집 필요"
+      },
+      "stop_loss_pct": -10.0,
+      "trailing_pct": -20.0,
+      "add_buy_levels": [
+        10.0,
+        20.0,
+        35.0
+      ],
+      "calc_date": "2026-05-25"
+    },
+    {
+      "rank": 15,
+      "strategy_id": "T6",
+      "name": "트레일 -25%",
+      "group": "TRAIL",
+      "tier": "EXPERIMENT",
+      "score": 17.4,
+      "metrics": {
+        "trade_count": 2,
+        "total_return": -4.06,
+        "cagr": -8.27,
+        "mdd": -14.47,
+        "sharpe": -0.39,
+        "win_rate": 0.0,
+        "avg_win": 0.0,
+        "avg_loss": -283928.0,
+        "profit_factor": 0.0,
+        "avg_hold_days": 3.0,
+        "monthly": {
+          "2026-04": -567857.0
+        },
+        "return_3m": -5.68,
+        "return_6m": -5.68,
+        "final_capital": 9594016,
+        "initial_capital": 10000000
+      },
+      "ai": {
+        "grade": "N/A",
+        "summary": "데이터 부족",
+        "regime_fit": "—",
+        "recommendation": "추가 데이터 수집 필요"
+      },
+      "stop_loss_pct": -10.0,
+      "trailing_pct": -25.0,
+      "add_buy_levels": [
+        10.0,
+        20.0,
+        35.0
+      ],
+      "calc_date": "2026-05-25"
+    }
+  ]
+}
