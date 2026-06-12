@@ -1,76 +1,28 @@
+[2026-05-25 08:33:16] [PyramidStrategy] [INFO] 💰 복리풀 잔액: 0원
+[2026-05-25 08:33:16] [LabDB] [INFO] [LabDB] DB 초기화 완료: /home/user/webapp/stock_trader/strategy_lab/../data/lab.db
+[2026-05-25 08:33:16] [StrategyLab] [INFO] [StrategyLab] 초기화: 15개 실험 전략 포트폴리오 생성
+[2026-05-25 08:33:16] [StrategyLab] [INFO] [StrategyLab] 상태 로드 완료
+[2026-05-25 08:33:16] [Dashboard] [INFO] [App] StrategyLabEngine 초기화 완료
+Werkzeug appears to be used in a production deployment. Consider switching to a production web server instead.
 ============================================================
   📈 주식 자동매매 시스템
   🌐 http://0.0.0.0:5000
 ============================================================
-[2026-05-25 04:30:27] [PyramidStrategy] [INFO] 💰 복리풀 잔액: 0원
-Werkzeug appears to be used in a production deployment. Consider switching to a production web server instead.
  * Serving Flask app 'app'
  * Debug mode: off
-[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
- * Running on all addresses (0.0.0.0)
- * Running on http://127.0.0.1:5000
- * Running on http://169.254.0.21:5000
-[33mPress CTRL+C to quit[0m
-[2026-05-25 04:30:41] [ScreenerDB] [INFO] DB 초기화 완료: /home/user/webapp/stock_trader/screener/../data/screener.db
-127.0.0.1 - - [25/May/2026 04:30:41] "GET /api/screener/analyze/005930 HTTP/1.1" 200 -
-127.0.0.1 - - [25/May/2026 04:30:57] "GET /demo HTTP/1.1" 200 -
-127.0.0.1 - - [25/May/2026 04:30:57] "GET /screener HTTP/1.1" 200 -
-127.0.0.1 - - [25/May/2026 04:30:57] "GET /api/status HTTP/1.1" 200 -
-127.0.0.1 - - [25/May/2026 04:30:57] "GET /api/screener/analyze/005930 HTTP/1.1" 200 -
-127.0.0.1 - - [25/May/2026 04:30:57] "GET /api/screener/results HTTP/1.1" 200 -
-[2026-05-25 04:30:57] [DailyScreener] [INFO] ============================================================
-127.0.0.1 - - [25/May/2026 04:30:57] "POST /api/screener/run HTTP/1.1" 200 -
-[2026-05-25 04:30:57] [DailyScreener] [INFO]   📊 일일 종목 스크리닝 시작: 2026-05-25
-[2026-05-25 04:30:57] [DailyScreener] [INFO] ============================================================
-[2026-05-25 04:30:57] [DailyScreener] [INFO] STEP 1: 시장 지수 수집 중...
-[2026-05-25 04:30:57] [DailyScreener] [INFO]   코스피 2,750pt (-1.5%) | 코스닥 895pt (-1.5%)
-[2026-05-25 04:30:57] [DailyScreener] [INFO] STEP 2: 전체 종목 목록 수집 중...
-[2026-05-25 04:30:57] [DailyScreener] [INFO]   총 30개 종목 수집
-[2026-05-25 04:30:57] [DailyScreener] [INFO] STEP 3: 기본 제외 필터 적용 중...
-[2026-05-25 04:30:57] [StockFilter] [INFO] 필터링 결과: 통과 14개 / 제외 16개 (전체 30개)
-[2026-05-25 04:30:57] [DailyScreener] [INFO]   통과: 14개 / 제외: 16개
-[2026-05-25 04:30:57] [DailyScreener] [INFO] STEP 4: AI 점수화 시작 (14개)...
-[2026-05-25 04:30:57] [DailyScreener] [INFO] STEP 5: 등급 분류 중...
-[2026-05-25 04:30:57] [DailyScreener] [INFO] ============================================================
-[2026-05-25 04:30:57] [DailyScreener] [INFO]   ✅ 스크리닝 완료! (0.1초)
-[2026-05-25 04:30:57] [DailyScreener] [INFO]   분석: 14개 | 제외: 16개
-[2026-05-25 04:30:57] [DailyScreener] [INFO]   BUY_CANDIDATE: 5개
-[2026-05-25 04:30:57] [DailyScreener] [INFO]   WATCH_HIGH:    3개
-[2026-05-25 04:30:57] [DailyScreener] [INFO]   매수 후보 Top10:
-[2026-05-25 04:30:57] [DailyScreener] [INFO]     1. 에코프로비엠(247540) 점수=112 RS=+15.1% [BUY_CANDIDATE]
-[2026-05-25 04:30:57] [DailyScreener] [INFO]     2. 삼성바이오로직스(207940) 점수=105 RS=+20.2% [BUY_CANDIDATE]
-[2026-05-25 04:30:57] [DailyScreener] [INFO]     3. SK이노베이션(096770) 점수=105 RS=+13.9% [BUY_CANDIDATE]
-[2026-05-25 04:30:57] [DailyScreener] [INFO]     4. LG(003550) 점수=92 RS=+11.6% [BUY_CANDIDATE]
-[2026-05-25 04:30:57] [DailyScreener] [INFO]     5. 에코프로(086520) 점수=91 RS=+13.4% [BUY_CANDIDATE]
-[2026-05-25 04:30:57] [DailyScreener] [INFO] ============================================================
-10.64.211.6 - - [25/May/2026 04:31:04] "GET /screener HTTP/1.1" 200 -
-10.64.211.6 - - [25/May/2026 04:31:05] "GET /socket.io/?EIO=4&transport=polling&t=PvTPfSW HTTP/1.1" 200 -
-10.64.211.6 - - [25/May/2026 04:31:05] "GET /api/screener/results?grade=&limit=200 HTTP/1.1" 200 -
-10.64.211.6 - - [25/May/2026 04:31:05] "POST /socket.io/?EIO=4&transport=polling&t=PvTPfVQ&sid=DPz-BEe6c_WAuF2nAAAA HTTP/1.1" 200 -
-10.64.211.6 - - [25/May/2026 04:31:05] "GET /socket.io/?EIO=4&transport=polling&t=PvTPfVT&sid=DPz-BEe6c_WAuF2nAAAA HTTP/1.1" 200 -
-10.64.211.6 - - [25/May/2026 04:31:05] "GET /favicon.ico HTTP/1.1" 200 -
-10.64.211.6 - - [25/May/2026 04:31:05] "GET /api/screener/candidates HTTP/1.1" 200 -
-10.64.211.6 - - [25/May/2026 04:31:05] "GET /api/screener/focus HTTP/1.1" 200 -
-10.64.211.6 - - [25/May/2026 04:31:05] "GET /api/screener/summary HTTP/1.1" 200 -
-10.64.211.6 - - [25/May/2026 04:31:05] "GET /socket.io/?EIO=4&transport=polling&t=PvTPfWi&sid=DPz-BEe6c_WAuF2nAAAA HTTP/1.1" 200 -
-10.64.211.6 - - [25/May/2026 04:31:05] "GET /socket.io/?EIO=4&transport=polling&t=PvTPfaH&sid=DPz-BEe6c_WAuF2nAAAA HTTP/1.1" 200 -
-10.64.211.6 - - [25/May/2026 04:31:11] "GET /socket.io/?EIO=4&transport=websocket&sid=DPz-BEe6c_WAuF2nAAAA HTTP/1.1" 200 -
-10.64.211.6 - - [25/May/2026 04:31:18] "GET /demo HTTP/1.1" 200 -
-10.64.211.6 - - [25/May/2026 04:31:18] "GET /socket.io/?EIO=4&transport=polling&t=PvTPiku HTTP/1.1" 200 -
-10.64.211.6 - - [25/May/2026 04:31:18] "GET /api/signals HTTP/1.1" 200 -
-10.64.211.6 - - [25/May/2026 04:31:18] "GET /api/status HTTP/1.1" 200 -
-10.64.211.6 - - [25/May/2026 04:31:18] "GET /favicon.ico HTTP/1.1" 200 -
-10.64.211.6 - - [25/May/2026 04:31:18] "GET /api/status HTTP/1.1" 200 -
-10.64.211.6 - - [25/May/2026 04:31:18] "POST /socket.io/?EIO=4&transport=polling&t=PvTPimK&sid=NCEAecF2_PyaDHHHAAAC HTTP/1.1" 200 -
-10.64.211.6 - - [25/May/2026 04:31:18] "GET /socket.io/?EIO=4&transport=polling&t=PvTPimM&sid=NCEAecF2_PyaDHHHAAAC HTTP/1.1" 200 -
-10.64.211.6 - - [25/May/2026 04:31:18] "GET /socket.io/?EIO=4&transport=polling&t=PvTPinr&sid=NCEAecF2_PyaDHHHAAAC HTTP/1.1" 200 -
-[2026-05-25 04:31:19] [KIS_API] [ERROR] 잔고 조회 실패: 403 Client Error: Forbidden for url: https://openapivts.koreainvestment.com:29443/oauth2/tokenP
-10.64.211.6 - - [25/May/2026 04:31:19] "GET /api/balance HTTP/1.1" 200 -
-[2026-05-25 04:31:19] [KIS_API] [ERROR] OHLCV 조회 실패 005930: 403 Client Error: Forbidden for url: https://openapivts.koreainvestment.com:29443/oauth2/tokenP
-10.64.211.6 - - [25/May/2026 04:31:19] "GET /api/chart/005930 HTTP/1.1" 200 -
-10.64.211.6 - - [25/May/2026 04:31:19] "GET /api/status HTTP/1.1" 200 -
-[2026-05-25 04:31:19] [KIS_API] [ERROR] 잔고 조회 실패: 403 Client Error: Forbidden for url: https://openapivts.koreainvestment.com:29443/oauth2/tokenP
-10.64.211.6 - - [25/May/2026 04:31:19] "GET /api/balance HTTP/1.1" 200 -
-10.64.211.6 - - [25/May/2026 04:31:20] "GET /api/status HTTP/1.1" 200 -
-10.64.211.6 - - [25/May/2026 04:31:20] "GET /api/logs HTTP/1.1" 200 -
-10.64.211.6 - - [25/May/2026 04:31:26] "GET /socket.io/?EIO=4&transport=websocket&sid=NCEAecF2_PyaDHHHAAAC HTTP/1.1" 200 -
+Address already in use
+Port 5000 is in use by another program. Either identify and stop that program, or start the server with a different port.
+[2026-05-25 08:41:02] [PyramidStrategy] [INFO] 💰 복리풀 잔액: 0원
+[2026-05-25 08:41:02] [LabDB] [INFO] [LabDB] DB 초기화 완료: /home/user/webapp/stock_trader/strategy_lab/../data/lab.db
+[2026-05-25 08:41:02] [StrategyLab] [INFO] [StrategyLab] 초기화: 15개 실험 전략 포트폴리오 생성
+[2026-05-25 08:41:02] [StrategyLab] [INFO] [StrategyLab] 상태 로드 완료
+[2026-05-25 08:41:02] [Dashboard] [INFO] [App] StrategyLabEngine 초기화 완료
+Werkzeug appears to be used in a production deployment. Consider switching to a production web server instead.
+============================================================
+  📈 주식 자동매매 시스템
+  🌐 http://0.0.0.0:5000
+============================================================
+ * Serving Flask app 'app'
+ * Debug mode: off
+Address already in use
+Port 5000 is in use by another program. Either identify and stop that program, or start the server with a different port.
