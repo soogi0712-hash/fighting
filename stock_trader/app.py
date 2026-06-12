@@ -198,10 +198,13 @@ def _init_api() -> bool:
         _strategy_mgr = StrategyManager(_api)
         _log("✅ KIS API 초기화 완료")
 
-        # ★ 재진입 차단 모듈 — 만료 항목 정리 (봇 재시작 시 1회)
+        # ★ 재진입 차단 모듈 — 서버 시작 시 오늘 SELL 이력으로 복원 + 만료 정리
         try:
             from strategies.reentry_guard import ReentryGuard
             _rg = ReentryGuard()
+            # ① 오늘 trade_log SELL 이력 → reentry_guard.json 복원 (재시작 후 이력 유지)
+            _rg.restore_from_trade_log()
+            # ② 이미 만료된 항목 정리
             _rg.purge_expired()
             _blocked = _rg.get_blocked_list()
             if _blocked:
