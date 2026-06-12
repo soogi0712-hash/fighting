@@ -1,0 +1,12 @@
+.env
+*.log
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+data/screener.db
+data/lab.db
+nohup.out
+*.pid
+.idea/
+.vscode/
