@@ -472,7 +472,7 @@ class StrategyManager:
             # 장전시간외(05): 전일종가 지정가
             # 장후시간외(06): 매수 자체 금지 (_order()에서도 이중 차단)
             # 시장가(01):  0원 고정
-            from api.kis_api import KisApi as _KisApi
+            from api.kis_api import KISApi as _KisApi
             if ord_dvsn == "05":
                 use_price = price if price > 0 else int(cur_price)
             elif ord_dvsn == "06":
