@@ -321,6 +321,8 @@ class StrategyManager:
         if action in ("BUY_LEVEL1_EARLY", "BUY_LEVEL1_FULL",
                       "BUY_LEVEL2", "BUY_LEVEL3"):
             _re_blocked, _re_info = self.reentry.check("KR", code, name)
+            # ★ 항상 로그 출력 (blocked/allowed 무관) — 차단 미동작 추적용
+            ReentryGuard.log_check("KR", code, name, _re_blocked, _re_info)
             if _re_blocked:
                 ReentryGuard.log_block(_re_info)
                 action = "SKIP"
@@ -824,6 +826,25 @@ class StrategyManager:
                 f"msg_cd={result.get('msg_cd','?')} "
                 f"msg1={result.get('msg1','?')!r}"
             )
+            # ── ★ SELL_FAIL 경로에서도 재진입 차단 등록 ──────────
+            # 이유: ORDER PRICE CHECK 차단 등 첫 시도 실패 후 재시도로
+            # 나중에 체결될 수 있음 → 선제적으로 차단 등록 (오늘 자정까지)
+            # 재시도 체결 시 record_sell이 다시 호출되어 덮어쓰기됨 (무해)
+            try:
+                _is_sl_fail = is_forced and "손절" in reason
+                self.reentry.record_sell(
+                    market      = "KR",
+                    code        = code,
+                    name        = name,
+                    reason      = f"SELL_FAIL_예약차단|{reason}",
+                    is_stoploss = _is_sl_fail,
+                )
+                logger.info(
+                    f"[재진입 차단 예약] SELL_FAIL이지만 재진입 차단 선등록: "
+                    f"{name}({code})"
+                )
+            except Exception as _rge:
+                logger.debug(f"[재진입 차단 예약] record_sell 실패(무시): {_rge}")
             return {
                 "action":       "SELL_FAIL",
                 "code":         code,

@@ -41,7 +41,7 @@
 
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 
 from utils.logger import get_logger
 
@@ -165,10 +165,35 @@ class ReentryGuard:
             blocked, market, code, name,
             sold_at, sell_reason, is_stoploss,
             cooldown_until, block_reason, remaining_hours
+
+        ★ 폴백 로직:
+            reentry_guard.json에 없더라도 오늘 trade_log에 SELL 이력이
+            있으면 즉시 차단 + guard 파일에 등록.
         """
         data = _load()
         k    = _key(market, code)
         entry = data.get(k)
+
+        # ── ★ trade_log 직접 폴백 체크 ──────────────────────────
+        # guard 파일에 없는 경우 trade_log에서 오늘 SELL 이력 검색
+        if entry is None:
+            tl_entry = self._find_today_sell_in_trade_log(market, code)
+            if tl_entry:
+                logger.warning(
+                    f"[ReentryGuard] guard 파일 미등록이나 trade_log에서 오늘 SELL 발견 "
+                    f"→ 즉시 차단 등록: {name}({code}) 사유={tl_entry.get('reason','')}"
+                )
+                # 즉시 guard 파일에 등록
+                self.record_sell(
+                    market     = market,
+                    code       = code,
+                    name       = tl_entry.get("name", name),
+                    reason     = tl_entry.get("reason", "오늘매도(trade_log복원)"),
+                    is_stoploss= _is_stoploss_reason(tl_entry.get("reason", "")),
+                )
+                # 방금 등록했으므로 다시 로드
+                data  = _load()
+                entry = data.get(k)
 
         if entry is None:
             return False, {}
@@ -209,6 +234,36 @@ class ReentryGuard:
         return True, info
 
     # ──────────────────────────────────────────────────────────
+    # trade_log에서 오늘 해당 종목 SELL 이력 탐색
+    # ──────────────────────────────────────────────────────────
+    def _find_today_sell_in_trade_log(
+        self, market: str, code: str
+    ) -> dict | None:
+        """
+        trade_log.json에서 오늘 날짜의 해당 종목 SELL 레코드를 반환.
+        없으면 None.  (KR 시장 코드 비교는 대소문자 무시)
+        """
+        trade_log_path = os.path.join(_DATA_DIR, "trade_log.json")
+        if not os.path.exists(trade_log_path):
+            return None
+        today = date.today().isoformat()
+        try:
+            with open(trade_log_path, "r", encoding="utf-8") as f:
+                logs = json.load(f)
+        except Exception as e:
+            logger.debug(f"[ReentryGuard] trade_log 읽기 실패: {e}")
+            return None
+        # 최신 순으로 탐색 (마지막 SELL 우선)
+        for entry in reversed(logs):
+            if entry.get("action") != "SELL":
+                continue
+            if not str(entry.get("timestamp", "")).startswith(today):
+                continue
+            if str(entry.get("code", "")).upper() == code.upper():
+                return entry
+        return None
+
+    # ──────────────────────────────────────────────────────────
     # [재진입 차단] 로그 출력 헬퍼 (공통 포맷)
     # ──────────────────────────────────────────────────────────
     @staticmethod
@@ -240,6 +295,88 @@ class ReentryGuard:
             f"차단사유={info.get('block_reason','?')} | "
             f"잔여={info.get('remaining_hours',0):.1f}h"
         )
+
+    @staticmethod
+    def log_check(market: str, code: str, name: str,
+                  blocked: bool, info: dict):
+        """
+        매수 직전 항상 출력하는 재진입 체크 로그.
+        blocked=True/False 모두 출력 → 차단 미동작 추적용.
+        """
+        guard_file = os.path.join(_DATA_DIR, "reentry_guard.json")
+        registered = os.path.exists(guard_file) and _key(market, code) in _load()
+        result_tag = "BUY_SKIP" if blocked else "BUY_ALLOWED"
+        block_reason = info.get("block_reason", "") if blocked else ""
+        logger.info(
+            f"[{market} 재진입 체크] "
+            f"종목={name}({code}) | "
+            f"guard_file={guard_file} | "
+            f"등록여부={registered} | "
+            f"blocked={blocked} | "
+            f"차단사유={block_reason} | "
+            f"결과={result_tag}"
+        )
+
+    # ──────────────────────────────────────────────────────────
+    # 서버 시작 시 trade_log 기반 오늘 SELL 이력 복원
+    # ──────────────────────────────────────────────────────────
+    def restore_from_trade_log(self, trade_log_path: str = None):
+        """
+        서버 시작 시 호출 — trade_log.json의 오늘 SELL 이력을
+        reentry_guard.json에 복원.
+
+        ★ 이미 등록된 항목은 덮어쓰지 않음 (기존 쿨다운 유지).
+        """
+        if trade_log_path is None:
+            trade_log_path = os.path.join(_DATA_DIR, "trade_log.json")
+        if not os.path.exists(trade_log_path):
+            logger.debug("[ReentryGuard] trade_log.json 없음 → 복원 스킵")
+            return
+
+        today = date.today().isoformat()
+        try:
+            with open(trade_log_path, "r", encoding="utf-8") as f:
+                logs = json.load(f)
+        except Exception as e:
+            logger.warning(f"[ReentryGuard] trade_log 로드 실패: {e}")
+            return
+
+        data = _load()
+        restored = 0
+        skipped  = 0
+        for entry in logs:
+            if entry.get("action") != "SELL":
+                continue
+            if not str(entry.get("timestamp", "")).startswith(today):
+                continue
+            code   = entry.get("code", "")
+            name   = entry.get("name", code)
+            reason = entry.get("reason", "오늘매도(trade_log복원)")
+            # market은 trade_log에 없을 수 있음 → 기본 KR
+            market = entry.get("market", "KR")
+            k = _key(market, code)
+            if k in data:
+                skipped += 1
+                continue
+            # 새로 등록
+            self.record_sell(
+                market     = market,
+                code       = code,
+                name       = name,
+                reason     = reason,
+                is_stoploss= _is_stoploss_reason(reason),
+            )
+            restored += 1
+            logger.info(
+                f"[ReentryGuard] trade_log 복원 완료: "
+                f"{name}({code}) 사유={reason[:30]}"
+            )
+        if restored or skipped:
+            logger.info(
+                f"[ReentryGuard] 복원 결과 — "
+                f"신규등록={restored}건, 기존유지={skipped}건 "
+                f"(기준일={today})"
+            )
 
     # ──────────────────────────────────────────────────────────
     # 만료 항목 일괄 정리 (주기적으로 호출 가능)
