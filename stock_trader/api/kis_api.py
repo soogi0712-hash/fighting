@@ -414,7 +414,7 @@ class KISApi:
         """
         if price <= 0:
             return price
-        tick = KisApi.tick_size(price)
+        tick = KISApi.tick_size(price)
         if direction >= 1:
             return ((price + tick - 1) // tick) * tick   # 올림
         elif direction <= -1:
