@@ -28,18 +28,16 @@ import random, math
 
 class KISDataFetcher(KISApi):
     """
-    KIS API 확장 클래스.
-    실제 API 키가 없거나 실패하면 데모 데이터를 반환한다.
+    KIS API 확장 클래스. 실전 전용.
     """
 
     def __init__(self, demo_mode: bool = False):
-        self.demo_mode = demo_mode
-        if not demo_mode:
-            try:
-                super().__init__()
-            except Exception as e:
-                logger.warning(f"KIS API 초기화 실패 → 데모 모드: {e}")
-                self.demo_mode = True
+        # demo_mode 인자는 하위 호환성 유지용 — 항상 실전 모드
+        self.demo_mode = False
+        try:
+            super().__init__()
+        except Exception as e:
+            logger.warning(f"KIS API 초기화 실패: {e}")
 
     # ── 시장 지수 ──────────────────────────────────────────────
     def get_market_index(self, market: str = "KOSPI") -> dict:
@@ -47,9 +45,6 @@ class KISDataFetcher(KISApi):
         코스피 / 코스닥 지수 현재가 + 이동평균 + 수익률
         market: "KOSPI" | "KOSDAQ"
         """
-        if self.demo_mode:
-            return self._demo_market_index(market)
-
         code_map = {"KOSPI": "0001", "KOSDAQ": "1001"}
         code = code_map.get(market, "0001")
         url  = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-index-price"
@@ -86,8 +81,6 @@ class KISDataFetcher(KISApi):
 
     def get_index_ohlcv(self, market: str = "KOSPI", count: int = 130) -> list:
         """지수 일봉 데이터"""
-        if self.demo_mode:
-            return self._demo_ohlcv_index(market, count)
         code_map = {"KOSPI": "0001", "KOSDAQ": "1001"}
         code = code_map.get(market, "0001")
         url  = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice"
@@ -119,13 +112,8 @@ class KISDataFetcher(KISApi):
     # ── 전체 종목 목록 ─────────────────────────────────────────
     def get_stock_list(self, market: str = "ALL") -> list[dict]:
         """
-        코스피 + 코스닥 전체 종목 기본 목록 반환
-        실제로는 KIS '주식 전체 종목 조회' API 사용
-        데모 모드에서는 대표 종목 샘플 반환
+        코스피 + 코스닥 전체 종목 기본 목록 반환 (실전 전용)
         """
-        if self.demo_mode:
-            return self._demo_stock_list()
-
         results = []
         for mkt, code in [("KOSPI", "J"), ("KOSDAQ", "Q")]:
             if market not in ("ALL", mkt):
@@ -166,7 +154,7 @@ class KISDataFetcher(KISApi):
                     })
             except Exception as e:
                 logger.error(f"종목목록 조회 실패({mkt}): {e}")
-        return results or self._demo_stock_list()
+        return results or []
 
     # ── 종목 상세 데이터 ──────────────────────────────────────
     def get_stock_detail(self, code: str, market_info: dict = None) -> dict:
@@ -174,9 +162,6 @@ class KISDataFetcher(KISApi):
         스크리너에 필요한 종목 전체 데이터 수집
         (OHLCV + 투자자 + 재무 통합)
         """
-        if self.demo_mode:
-            return self._demo_stock_detail(code)
-
         try:
             # 일봉 데이터
             candles = self.get_ohlcv(code, period="D", count=130)
@@ -475,13 +460,8 @@ class KISDataFetcher(KISApi):
 
     def get_etf_list(self) -> list[dict]:
         """
-        투자 대상 ETF 목록 반환.
-        데모 모드: asset_universe.get_demo_etf_list() 활용
-        실전 모드: KIS API ETF 목록 조회
+        투자 대상 ETF 목록 반환 (실전 전용 KIS API).
         """
-        if self.demo_mode:
-            from screener.asset_universe import get_demo_etf_list
-            return get_demo_etf_list()
         try:
             return self._real_etf_list()
         except Exception as e:
@@ -525,17 +505,18 @@ class KISDataFetcher(KISApi):
                 })
         except Exception as e:
             logger.error(f"실전 ETF 목록 조회 실패: {e}")
-        return results or self.get_etf_list()   # 폴백
+        if results:
+            return results
+        # KIS API가 ETF 전체 목록 조회를 지원하지 않을 경우 → 정적 ETF 목록 사용
+        logger.info("ETF 목록 KIS API 미지원 → 정적 ETF 목록(asset_universe) 사용")
+        from screener.asset_universe import get_demo_etf_list
+        return get_demo_etf_list()
 
     def get_etf_detail(self, code: str, asset_type: str = None) -> dict:
         """
-        ETF 1종목 상세 데이터 (ETFScorer 입력용).
-        개별주식과 동일한 구조 반환 (재무 항목은 N/A).
+        ETF 1종목 상세 데이터 (ETFScorer 입력용). 실전 전용.
         """
-        if self.demo_mode:
-            return self._demo_etf_detail(code, asset_type)
         try:
-            # 실전: get_stock_detail 을 재활용 (구조 동일)
             return self.get_stock_detail(code)
         except Exception as e:
             logger.error(f"ETF 상세 조회 실패({code}): {e}")

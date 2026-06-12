@@ -2,19 +2,81 @@
   "005930": {
     "code": "005930",
     "name": "삼성전자",
-    "entry_price": 50000,
-    "highest_price": 50000,
+    "entry_price": 300000.0,
+    "highest_price": 323000.0,
     "current_level": 1,
-    "avg_price": 50000.0,
-    "total_qty": 5,
+    "avg_price": 300045.0,
+    "total_qty": 1,
     "level_entries": {
       "1": {
-        "price": 50000,
-        "qty": 5,
-        "remaining": 5,
-        "added_at": "2026-05-25T03:50:19.859096"
+        "price": 300000.0,
+        "avg_price": 300045.0,
+        "qty": 1,
+        "remaining": 1,
+        "total_cost": 300045.0,
+        "added_at": "2026-05-26T05:35:03.776228"
       }
     },
-    "created_at": "2026-05-25T03:50:19.859082"
+    "created_at": "2026-05-26T05:35:03.776197"
+  },
+  "069500": {
+    "code": "069500",
+    "name": "KODEX 200",
+    "entry_price": 133766.25,
+    "highest_price": 134855.0,
+    "current_level": 1,
+    "avg_price": 133786.315,
+    "total_qty": 4,
+    "level_entries": {
+      "1": {
+        "price": 133766.25,
+        "avg_price": 133786.315,
+        "qty": 4,
+        "remaining": 4,
+        "total_cost": 535145.26,
+        "added_at": "2026-05-27T00:31:50.471129"
+      }
+    },
+    "created_at": "2026-05-27T00:31:50.471098"
+  },
+  "091160": {
+    "code": "091160",
+    "name": "KODEX 반도체",
+    "entry_price": 168905.0,
+    "highest_price": 170790.0,
+    "current_level": 1,
+    "avg_price": 168930.33666666667,
+    "total_qty": 3,
+    "level_entries": {
+      "1": {
+        "price": 168905.0,
+        "avg_price": 168930.33666666667,
+        "qty": 3,
+        "remaining": 3,
+        "total_cost": 506791.01,
+        "added_at": "2026-05-27T00:31:50.472844"
+      }
+    },
+    "created_at": "2026-05-27T00:31:50.472824"
+  },
+  "133690": {
+    "code": "133690",
+    "name": "TIGER 미국나스닥100",
+    "entry_price": 199997.5,
+    "highest_price": 200460.0,
+    "current_level": 1,
+    "avg_price": 200027.5,
+    "total_qty": 6,
+    "level_entries": {
+      "1": {
+        "price": 199997.5,
+        "avg_price": 200027.5,
+        "qty": 6,
+        "remaining": 6,
+        "total_cost": 1200165.0,
+        "added_at": "2026-05-27T00:31:50.474186"
+      }
+    },
+    "created_at": "2026-05-27T00:31:50.474170"
   }
 }

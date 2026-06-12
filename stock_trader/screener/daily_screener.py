@@ -95,7 +95,8 @@ class DailyScreener:
     """
 
     def __init__(self, fetcher=None, demo_mode: bool = False):
-        self.demo_mode  = demo_mode
+        # demo_mode 인자는 하위 호환성 유지 — 항상 실전 모드
+        self.demo_mode  = False
         self.fetcher    = fetcher
         self.filter     = StockFilter()
         self.etf_filter = ETFFilter()
@@ -107,7 +108,7 @@ class DailyScreener:
         if self.fetcher:
             return self.fetcher
         from screener.kis_data_fetcher import KISDataFetcher
-        self.fetcher = KISDataFetcher(demo_mode=self.demo_mode)
+        self.fetcher = KISDataFetcher(demo_mode=False)
         return self.fetcher
 
     # ══════════════════════════════════════════════════════════

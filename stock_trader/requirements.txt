@@ -12,3 +12,4 @@ python-dotenv>=1.0.0
 plotly>=5.18.0
 SQLAlchemy>=2.0.0
 tensorflow>=2.13.0
+yfinance>=0.2.40
