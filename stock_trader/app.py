@@ -198,6 +198,23 @@ def _init_api() -> bool:
         _strategy_mgr = StrategyManager(_api)
         _log("✅ KIS API 초기화 완료")
 
+        # ★ 재진입 차단 모듈 — 만료 항목 정리 (봇 재시작 시 1회)
+        try:
+            from strategies.reentry_guard import ReentryGuard
+            _rg = ReentryGuard()
+            _rg.purge_expired()
+            _blocked = _rg.get_blocked_list()
+            if _blocked:
+                _names = ", ".join(
+                    b["name"] + "(" + b["market"] + ",잔" + str(int(b["remaining_hours"])) + "h)"
+                    for b in _blocked[:5]
+                )
+                _log(f"🔒 [재진입차단] 현재 {len(_blocked)}개 종목 쿨다운 중: {_names}")
+            else:
+                _log("🔓 [재진입차단] 쿨다운 종목 없음")
+        except Exception as _rge:
+            _log(f"⚠️ [재진입차단] 초기화 오류: {_rge}", "warning")
+
         # ★ 해외주식 전략 매니저 초기화
         max_us_usd   = float(os.environ.get("MAX_US_INVESTMENT_USD", 3000.0))
         _us_strategy = USStrategyManager(_api, max_total_usd=max_us_usd)
@@ -2496,6 +2513,22 @@ def api_build():
         "started": _BUILD_START,
         "build_time": _BUILD_START,
     })
+
+
+@app.route("/api/reentry")
+def api_reentry():
+    """재진입 차단 중인 종목 목록 조회 (국내장 + 미국장 공통)"""
+    try:
+        from strategies.reentry_guard import ReentryGuard
+        guard = ReentryGuard()
+        guard.purge_expired()
+        blocked_list = guard.get_blocked_list()
+        return jsonify({
+            "count":   len(blocked_list),
+            "blocked": blocked_list,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ── ★ 일일 손익 관리 (DailyPnLGuard) API ──────────────────

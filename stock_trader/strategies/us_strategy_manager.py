@@ -55,6 +55,7 @@ from utils.market_session     import (
     US_PHASE_PRIME, US_PHASE_NEUTRAL, US_PHASE_CONSERVATIVE,
 )
 from strategies.daily_pnl_guard import DailyPnLGuard
+from strategies.reentry_guard   import ReentryGuard, _is_stoploss_reason
 
 logger = get_logger("USStrategy")
 
@@ -625,6 +626,9 @@ class USStrategyManager:
             name            = "미국장",
             use_us_session  = True,   # ★ 미국장 ET 날짜 기준 리셋 (한국 날짜 변경 무관)
         )
+
+        # ★ 재진입 차단 (국내장/미국장 공통 파일 기반)
+        self.reentry = ReentryGuard()
 
         # ── [US OPEN SCAN] 인스턴스 레벨 추적 ──────────────
         self._us_open_scan: dict = {
@@ -1631,6 +1635,20 @@ class USStrategyManager:
           - FULL  진입: 1.00 (100%)
           - EARLY 진입: 0.50 ( 50%) → INVEST_PER_TRADE_USD의 50%만 집행
         """
+        # ── ★ 재진입 차단 체크 (매도 후 24h/72h 쿨다운) ──────
+        _re_blocked, _re_info = self.reentry.check("US", symbol, name)
+        if _re_blocked:
+            ReentryGuard.log_block(_re_info)
+            return {
+                "action":  "SKIP",
+                "symbol":  symbol, "name": name, "excd": excd,
+                "reason":  (
+                    f"⛔재진입 차단 — {_re_info['block_reason']} "
+                    f"(잔여 {_re_info['remaining_hours']:.1f}h)"
+                ),
+                "session": sess.get("session", ""),
+            }
+
         # ── 실제 USD 주문가능금액 기준 동적 수량 계산 ──────────
         # 매수 종목 기준 TTTS3007R 조회 → 정확한 ovrs_ord_psbl_amt 확보
         try:
@@ -1804,6 +1822,18 @@ class USStrategyManager:
                 f"최고={pnl_st['peak_pnl']:+,.0f}원 | "
                 f"상태={pnl_st['state']}"
             )
+
+            # ── ★ 재진입 차단 등록 (SELL 체결 완료 직후) ──────
+            # 부분 익절은 포지션 유지이므로 전량 매도일 때만 등록
+            if action_tag == "SELL":
+                _is_sl = _is_stoploss_reason(reason)
+                self.reentry.record_sell(
+                    market     = "US",
+                    code       = symbol,
+                    name       = name,
+                    reason     = reason,
+                    is_stoploss= _is_sl,
+                )
 
             return {
                 "action":      action_tag,

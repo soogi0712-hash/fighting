@@ -49,6 +49,7 @@ from config import Config
 from strategies.pyramid_strategy   import PyramidStrategyManager
 from strategies.indicator_validator import IndicatorValidator
 from strategies.daily_pnl_guard     import DailyPnLGuard
+from strategies.reentry_guard       import ReentryGuard
 from screener.trade_decision        import TradeDecisionEngine
 from screener.transaction_cost      import net_profit_pct_from_cost
 
@@ -86,6 +87,9 @@ class StrategyManager:
             name            = "국내장",
             use_us_session  = False,   # ★ KST 날짜 기준 리셋
         )
+
+        # ★ 재진입 차단 (국내장/미국장 공통 파일 기반)
+        self.reentry = ReentryGuard()
 
     # ── 하위 호환: daily_loss_krw 프로퍼티 ──────────────────
     @property
@@ -310,6 +314,19 @@ class StrategyManager:
                     f"5분상승률={iv5['rise_5m_pct']:+.2f}% | "
                     f"연속양봉수={iv5['consec_bull']} | "
                     f"사유={chase_reason}"
+                )
+
+        # ── ★ 재진입 차단 체크 (매도 후 24h/72h 쿨다운) ─────────
+        # BUY 계열이고 아직 SKIP 되지 않은 경우에만 체크
+        if action in ("BUY_LEVEL1_EARLY", "BUY_LEVEL1_FULL",
+                      "BUY_LEVEL2", "BUY_LEVEL3"):
+            _re_blocked, _re_info = self.reentry.check("KR", code, name)
+            if _re_blocked:
+                ReentryGuard.log_block(_re_info)
+                action = "SKIP"
+                decision["reason"] = (
+                    f"⛔재진입 차단 — {_re_info['block_reason']} "
+                    f"(잔여 {_re_info['remaining_hours']:.1f}h)"
                 )
 
         # ── 세션별 BUY 지표 기준 ──────────────────────────
@@ -754,6 +771,17 @@ class StrategyManager:
                         "peak_pnl":        pnl_status["peak_pnl"],
                         "pnl_state":       pnl_status["state"],
                     }
+                )
+
+                # ── ★ 재진입 차단 등록 (SELL 체결 완료 직후) ──────
+                # is_forced + "손절" 포함 여부로 손절 판단
+                _is_sl = is_forced and "손절" in reason
+                self.reentry.record_sell(
+                    market     = "KR",
+                    code       = code,
+                    name       = name,
+                    reason     = reason,
+                    is_stoploss= _is_sl,
                 )
 
                 sell_result = {
