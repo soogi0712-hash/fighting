@@ -40,6 +40,7 @@ from typing import Any
 import pytz
 
 from utils.v2_logger import get_logger
+from adaptive.strategy_evolution import StrategyEvolutionEngine
 
 logger  = get_logger("DailyReview")
 KST     = pytz.timezone("Asia/Seoul")
@@ -94,10 +95,12 @@ class DailyReviewEngine:
     # ── 메인 실행 ────────────────────────────────────────────────
 
     def run(self, market: str = "KR",
-            target_date: str | None = None) -> dict:
+            target_date: str | None = None,
+            run_evolution: bool = True) -> dict:
         """
         market: "KR" 또는 "US"
         target_date: "YYYY-MM-DD" (기본 = 오늘)
+        run_evolution: True이면 DAILY_REVIEW 후 전략 진화 엔진 자동 실행
         Returns: 보고서 dict
         """
         market_up   = market.upper()
@@ -111,6 +114,9 @@ class DailyReviewEngine:
             logger.info(
                 f"[DAILY_REVIEW] {market_up} {today} — 종료 거래 없음 (건너뜀)"
             )
+            # 거래 없어도 진화 엔진은 누적 DB 기준으로 실행
+            if run_evolution:
+                self._run_evolution(market_up)
             return {"date": today, "market": market_up,
                     "generated_at": generated, "trade_count": 0}
 
@@ -122,6 +128,11 @@ class DailyReviewEngine:
 
         # ── 누적 저장 ─────────────────────────────────────────
         self._save_history(report)
+
+        # ── 전략 진화 엔진 실행 ──────────────────────────────
+        if run_evolution:
+            evolution_result = self._run_evolution(market_up)
+            report["evolution"] = evolution_result
 
         return report
 
@@ -135,7 +146,9 @@ class DailyReviewEngine:
                        exit_reason, exit_pct, hold_min,
                        pnl_krw, buy_score, signal_type,
                        max_pct, min_pct, entry_time, exit_time,
-                       exit_category, outcome
+                       exit_category, outcome,
+                       strategy, rsi, vol_score, vwap_state,
+                       breakout_bonus
                 FROM trades
                 WHERE status='closed'
                   AND market=?
@@ -296,6 +309,9 @@ class DailyReviewEngine:
         # ── [10] 누적 통계 (최근 100건 기준) ────────────────
         cumulative = self._calc_cumulative(market)
 
+        # ── [11] 전략 A/B 일간 성과 집계 ────────────────────
+        strategy_daily = self._calc_strategy_daily(trades)
+
         # ── 조립 ─────────────────────────────────────────────
         return {
             "date":         today,
@@ -346,6 +362,9 @@ class DailyReviewEngine:
 
             # 누적
             "cumulative":  cumulative,
+
+            # 전략 A/B 일간 성과
+            "strategy_daily": strategy_daily,
         }
 
     # ── 누적 통계 ────────────────────────────────────────────────
@@ -547,11 +566,71 @@ class DailyReviewEngine:
                 f"PROFIT_PROTECT={cum.get('profit_protect_cnt', 0)}건"
             )
 
+        # ── 8. 전략 A/B 일간 성과 ───────────────────────────
+        sd = r.get("strategy_daily", {})
+        if sd:
+            lines.append(sep2)
+            lines.append("  [8] 전략 A/B 일간 성과")
+            lines.append(
+                f"      {'전략':<4} {'건수':>5} {'승률':>7} {'평균손익':>9} {'합계P&L':>10}"
+            )
+            lines.append(f"      {'─'*45}")
+            for strat in ("A", "B"):
+                if strat not in sd:
+                    continue
+                p = sd[strat]
+                marker = "(모멘텀돌파)" if strat == "A" else "(BB회귀)"
+                lines.append(
+                    f"      {strat:<4} {p['count']:>5}건 "
+                    f"{p['win_rate']:>6.1f}% "
+                    f"{p['avg_pct']:>+9.3f}% "
+                    f"{p['total_pct']:>+10.3f}%  {marker}"
+                )
+
+        lines.append(SEP)
+        lines.append(
+            "  ⚡ DAILY_REVIEW 완료 → 전략 진화 엔진 실행 중 "
+            "(data/evolution_report.json 저장)"
+        )
         lines.append(SEP)
 
         # ── 출력 ─────────────────────────────────────────────
         for line in lines:
             logger.info(line)
+
+    # ── 전략 A/B 일간 성과 집계 ─────────────────────────────────
+
+    @staticmethod
+    def _calc_strategy_daily(trades: list[dict]) -> dict:
+        """당일 거래를 strategy별로 분리 집계."""
+        result: dict[str, dict] = {}
+        for strat in ("A", "B"):
+            sub = [t for t in trades if (t.get("strategy") or "A") == strat]
+            if not sub:
+                continue
+            pcts = [(t["exit_pct"] or 0) for t in sub]
+            wins = [p for p in pcts if p > 0]
+            wr   = len(wins) / len(pcts) * 100 if pcts else 0
+            avg  = sum(pcts) / len(pcts) if pcts else 0
+            result[strat] = {
+                "count":     len(sub),
+                "win_rate":  round(wr, 1),
+                "avg_pct":   round(avg, 3),
+                "ev":        round(avg, 3),
+                "total_pct": round(sum(pcts), 3),
+            }
+        return result
+
+    # ── 전략 진화 엔진 실행 ──────────────────────────────────────
+
+    def _run_evolution(self, market: str) -> dict:
+        """StrategyEvolutionEngine 호출 — DAILY_REVIEW 직후 자동 실행."""
+        try:
+            engine = StrategyEvolutionEngine()
+            return engine.run(market=market)
+        except Exception as e:
+            logger.warning(f"[DAILY_REVIEW] 진화 엔진 실행 실패: {e}")
+            return {"status": "error", "error": str(e)}
 
     # ── 누적 파일 저장 ───────────────────────────────────────────
 
