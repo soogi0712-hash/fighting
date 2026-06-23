@@ -95,7 +95,21 @@ _KIS_ORDER_BLACKLIST: dict[str, str] = {
     "ACHR": "KIS종목정보없음(APBK0656)",   # 2026-06-15 BUY_FAIL 반복 확인
 }
 
-# ── Candle max count for indicators ──────────────────────────
+# ══════════════════════════════════════════════════════════════
+# 전략 B (BB하단 평균회귀) 파라미터
+# ══════════════════════════════════════════════════════════════
+# strategy=A : 기존 돌파/모멘텀 전략 (BUY_SCORE >= 0.40)
+# strategy=B : 볼린저밴드 하단 평균회귀 전략 (눌림목 반등 포착)
+
+_STRAT_B_BB_PROX    = 1.02   # BB 하단의 102% 이내 (하단 근접 기준)
+_STRAT_B_MA20_FLOOR = 0.995  # MA20의 99.5% 이상 (하락추세 제외)
+_STRAT_B_RSI_MIN    = 40.0   # RSI 하한 (극단 과매도 제외)
+_STRAT_B_RSI_MAX    = 60.0   # RSI 상한 (과열 제외)
+_STRAT_B_VOL_MULT   = 1.1    # 최근 20봉 평균 대비 거래량 증가 기준
+_STRAT_B_SURGE_PCT  = 5.0    # 급등주 제외: 당일 변동률 > 5%
+_STRAT_B_VOL_SURGE  = 3.0    # 급등주 제외: 거래량 > 20봉평균 × 3배
+
+
 _CANDLE_MIN  = 5    # 최소 5분봉 수 (계산 가능 최소치)
 _CANDLE_MAX  = 20   # 지표 계산에 사용하는 봉 수
 
@@ -391,13 +405,38 @@ class USStrategy:
         if not self.pnl.can_buy:
             return self._skip(code, name, f"[US PnL] {self.pnl.block_reason()}")
 
-        return self._eval_entry(
+        # ── 전략 A + B 동시 평가 ────────────────────────────────
+        # 전략 A (모멘텀 돌파): BUY_SCORE >= 0.40
+        result_a = self._eval_entry(
             code=code, name=name, exch_cd=exch_cd,
             cur_price=cur_price,
             candles_5m=candles_5m,
             price_data=price_data,
             now_kst=now_kst,
         )
+        # 전략 A가 진입 성공하면 즉시 반환 (우선순위)
+        if result_a.get("ok"):
+            result_a["strategy"] = "A"
+            return result_a
+
+        # 전략 A 진입 불가 → 전략 B 시도 (BB하단 평균회귀)
+        result_b = self._eval_entry_b(
+            code=code, name=name, exch_cd=exch_cd,
+            cur_price=cur_price,
+            candles_5m=candles_5m,
+            price_data=price_data,
+            now_kst=now_kst,
+        )
+        if result_b.get("ok"):
+            result_b["strategy"] = "B"
+            logger.info(
+                f"[전략B 진입] {name}({code}) | 전략A 미충족 후 B 진입 | "
+                f"현재가=${cur_price:.2f} | 사유={result_b.get('reason','')}"
+            )
+            return result_b
+
+        # 둘 다 실패 → 전략 A 결과(SKIP) 반환
+        return result_a
 
     # ════════════════════════════════════════════════════════════
     # 진입 평가
@@ -584,7 +623,90 @@ class USStrategy:
             f"BUY_SCORE={buy_score:.3f} < 임계({BUY_SCORE_EARLY:.2f})"
         )
 
-    def _place_buy(self,
+    # ════════════════════════════════════════════════════════════
+    # 전략 B: 볼린저밴드 하단 평균회귀 진입 평가
+    # ════════════════════════════════════════════════════════════
+
+    def _eval_entry_b(self,
+                      code: str, name: str, exch_cd: str,
+                      cur_price: float,
+                      candles_5m: list,
+                      price_data: dict,
+                      now_kst: datetime) -> dict:
+        """
+        전략 B 진입 조건 평가 — 볼린저밴드 하단 평균회귀.
+
+        전략 A와 독립적으로 실행. 동시 보유 불가 (이미 포지션 있으면 SKIP).
+        진입 성공 시 signal_type="B_BB_REVERT", strategy="B" 태깅.
+        """
+        # 재진입 차단
+        blocked, block_info = self.reentry.check("US", code, name)
+        if blocked:
+            return self._skip(code, name, f"⛔ [B] 재진입 차단 — {block_info.get('block_reason','')}")
+
+        # 자금 사전 확인
+        _price_krw = int(cur_price * self.usd_krw)
+        _entry_pre = self.account.calc_entry_amount(_price_krw, market="US", usd_krw=self.usd_krw)
+        if not _entry_pre.get("can_enter"):
+            return self._skip(code, name, f"[B] 자금부족: {_entry_pre.get('block_reason','')}")
+
+        # 전략 B 지표 계산
+        iv_b = self._calc_indicators_b(candles_5m, price_data)
+
+        # 조건 미충족 → SKIP (상세 로그)
+        if not iv_b["strat_b_ok"]:
+            failed = []
+            if not iv_b["cond_bb"]:      failed.append(f"BB위치={iv_b['bb_pos']:.2f}(>{_STRAT_B_BB_PROX})")
+            if not iv_b["cond_ma20"]:    failed.append(f"MA20이탈(cur={cur_price:.2f}<MA20×{_STRAT_B_MA20_FLOOR})")
+            if not iv_b["cond_rsi"]:     failed.append(f"RSI={iv_b['rsi']:.1f}(범위외 {_STRAT_B_RSI_MIN}~{_STRAT_B_RSI_MAX})")
+            if not iv_b["cond_vol"]:     failed.append(f"거래량부족({iv_b['cur_vol']:.0f}<avg×{_STRAT_B_VOL_MULT})")
+            if not iv_b["cond_nosurge"]: failed.append("급등주감지")
+            logger.debug(
+                f"[전략B SKIP] {name}({code}) | 미충족={', '.join(failed)}"
+            )
+            return self._skip(code, name, f"[B] 조건미충족: {', '.join(failed)}")
+
+        # ── 진입 실행 ────────────────────────────────────────────
+        bb_l   = iv_b["bb_lower"]
+        bb_m   = iv_b["bb_mean"]
+        bb_pos = iv_b["bb_pos"]
+
+        logger.info(
+            f"[전략B 진입신호] {name}({code}) | "
+            f"현재가=${cur_price:.2f} | BB하단=${bb_l:.2f}(위치={bb_pos:.2f}) | "
+            f"MA20=${iv_b['ma20']:.2f} | RSI={iv_b['rsi']:.1f} | "
+            f"거래량={iv_b['cur_vol']:.0f}/avg={iv_b['avg_vol20']:.0f}"
+        )
+
+        # 목표가: BB 중심선 (평균회귀 목표)
+        target_pct = (bb_m - cur_price) / cur_price * 100 if cur_price > 0 else 0
+
+        reason = (
+            f"B_BB_REVERT(bb_pos={bb_pos:.2f},rsi={iv_b['rsi']:.1f},"
+            f"target+{target_pct:.1f}%)"
+        )
+
+        return self._place_buy(
+            code=code, name=name, exch_cd=exch_cd,
+            cur_price=cur_price,
+            ratio=1.0,             # 전략 B는 단일 진입 (분할 없음)
+            reason=reason,
+            candles_5m=candles_5m,
+            iv={
+                "buy_score": 0.55,   # B전략 고정값 (tracker용)
+                "rsi":       iv_b["rsi"],
+                "vwap":      bb_m,
+                "vol_ok":    iv_b["cond_vol"],
+                "vol_surge": False,
+                "above_vwap": False,
+                "bb_lower":  bb_l,
+                "bb_mean":   bb_m,
+                "strategy":  "B",    # ★ 전략 구분 태그
+            },
+            now_kst=now_kst,
+        )
+
+    def _place_buy(
                    code: str, name: str, exch_cd: str,
                    cur_price: float, ratio: float,
                    reason: str, candles_5m: list,
@@ -1868,6 +1990,102 @@ class USStrategy:
             return cur_price * 0.98
         # 첫 번째 봉(최신)의 저가 반환
         return candles_5m[0].get("low", cur_price * 0.98)
+
+    # ════════════════════════════════════════════════════════════
+    # 전략 B: 볼린저밴드 하단 평균회귀 지표 계산
+    # ════════════════════════════════════════════════════════════
+
+    def _calc_indicators_b(self,
+                           candles_5m: list,
+                           price_data: dict) -> dict:
+        """
+        전략 B 전용 지표 계산.
+        볼린저밴드 하단 평균회귀 전략 (눌림목 반등 포착).
+
+        진입 조건 (5개 ALL 충족):
+          1. BB 하단 근접: cur_price <= BB_lower × 1.02
+          2. MA20 유지:   cur_price >= MA20 × 0.995
+          3. RSI 40~60:   중립 구간 (극단 회피)
+          4. 거래량 증가:  cur_vol >= avg_vol20 × 1.1
+          5. 급등주 제외:  change_pct <= 5% AND vol < avg_vol20 × 3
+
+        Returns: {
+          "strat_b_ok":    bool,    # 5개 조건 전부 충족 여부
+          "rsi":           float,
+          "ma20":          float,
+          "bb_upper":      float,
+          "bb_mean":       float,
+          "bb_lower":      float,
+          "bb_pos":        float,   # 0=BB하단 1=중심선
+          "avg_vol20":     float,
+          "cond_bb":       bool,
+          "cond_ma20":     bool,
+          "cond_rsi":      bool,
+          "cond_vol":      bool,
+          "cond_nosurge":  bool,
+        }
+        """
+        if len(candles_5m) < _CANDLE_MIN:
+            return {"strat_b_ok": False, "cond_bb": False, "cond_ma20": False,
+                    "cond_rsi": False, "cond_vol": False, "cond_nosurge": True}
+
+        candles = candles_5m[:max(20, len(candles_5m))]
+        closes  = [c["close"]  for c in candles]
+        volumes = [c["volume"] for c in candles]
+
+        cur_price  = price_data.get("cur_price", closes[0])
+        change_pct = abs(price_data.get("change_pct", 0.0))
+
+        # RSI (14기간)
+        rsi = self._calc_rsi(closes)
+
+        # 볼린저밴드 20기간
+        bb_period = min(20, len(closes))
+        bb_mean   = sum(closes[:bb_period]) / bb_period
+        bb_std    = (sum((c - bb_mean)**2 for c in closes[:bb_period]) / bb_period) ** 0.5
+        bb_upper  = bb_mean + 2 * bb_std
+        bb_lower  = bb_mean - 2 * bb_std
+
+        # MA20
+        ma20 = bb_mean  # 동일 계산
+
+        # 거래량 (최근 20봉 평균)
+        avg_vol20 = sum(volumes[:bb_period]) / bb_period if bb_period > 0 else 1.0
+        cur_vol   = volumes[0] if volumes else 0
+
+        # BB 하단 대비 위치 (0=정확히 하단, 1=중심선, >1=중심선 위)
+        bb_pos = (cur_price - bb_lower) / (bb_mean - bb_lower) if (bb_mean - bb_lower) > 0 else 1.0
+
+        # ── 개별 조건 평가 ───────────────────────────────────────
+        cond_bb      = cur_price <= bb_lower * _STRAT_B_BB_PROX     # BB 하단 근접
+        cond_ma20    = cur_price >= ma20 * _STRAT_B_MA20_FLOOR       # MA20 이상
+        cond_rsi     = _STRAT_B_RSI_MIN <= rsi <= _STRAT_B_RSI_MAX  # RSI 40~60
+        cond_vol     = cur_vol >= avg_vol20 * _STRAT_B_VOL_MULT      # 거래량 증가
+        cond_nosurge = not (
+            change_pct > _STRAT_B_SURGE_PCT or                       # 급등주 제외
+            (avg_vol20 > 0 and cur_vol > avg_vol20 * _STRAT_B_VOL_SURGE)  # 거래량 폭증 제외
+        )
+
+        strat_b_ok = cond_bb and cond_ma20 and cond_rsi and cond_vol and cond_nosurge
+
+        return {
+            "strat_b_ok":   strat_b_ok,
+            "rsi":          rsi,
+            "ma20":         ma20,
+            "bb_upper":     bb_upper,
+            "bb_mean":      bb_mean,
+            "bb_lower":     bb_lower,
+            "bb_pos":       round(bb_pos, 3),
+            "avg_vol20":    avg_vol20,
+            "cur_vol":      cur_vol,
+            "cond_bb":      cond_bb,
+            "cond_ma20":    cond_ma20,
+            "cond_rsi":     cond_rsi,
+            "cond_vol":     cond_vol,
+            "cond_nosurge": cond_nosurge,
+        }
+
+
 
     # ════════════════════════════════════════════════════════════
     # 포지션 영속화

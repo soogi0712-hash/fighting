@@ -65,6 +65,17 @@ CHASE_BULL_CNT  = 3      # 연속 양봉 수
 BUY_STOP_TIME   = dtime(14, 30)
 FORCE_CLOSE_TIME = dtime(15, 20)
 
+# ════════════════════════════════════════════════════════════
+# ■ 전략 B (BB하단 평균회귀) 상수
+# ════════════════════════════════════════════════════════════
+_STRAT_B_BB_PROX    = 1.02   # BB하단 근접: cur_price <= bb_lower * 1.02
+_STRAT_B_MA20_FLOOR = 0.995  # MA20 하한선: cur_price >= ma20 * 0.995
+_STRAT_B_RSI_MIN    = 40.0   # RSI 하한
+_STRAT_B_RSI_MAX    = 60.0   # RSI 상한
+_STRAT_B_VOL_MULT   = 1.1    # 거래량 배수: cur_vol >= avg20 * 1.1
+_STRAT_B_SURGE_PCT  = 5.0    # 급등주 제외: 당일 상승률 >= 5%
+_STRAT_B_VOL_SURGE  = 3.0    # 급등주 거래량 기준: cur_vol >= avg20 * 3.0 (급등 의심)
+
 
 class KRStrategy:
     """
@@ -171,9 +182,29 @@ class KRStrategy:
         if not self.pnl.can_buy:
             return self._skip(code, name, f"일일수익잠금: {self.pnl.block_reason()}")
 
-        return self._eval_entry(
+        # ★ [시간대별 신호 스캔 로그] — 전략 A/B 동시 평가
+        logger.debug(
+            f"[SIGNAL_SCAN] {name}({code}) | KST={t.strftime('%H:%M')} | "
+            f"A/B 전략 평가 시작"
+        )
+
+        # ── 전략 A 평가 (기존 모멘텀 돌파) ──────────────────
+        result_a = self._eval_entry(
+            code, name, cur_price, candles_5m, price_data, now,
+            strategy="A"
+        )
+        if result_a.get("action") == "BUY":
+            return result_a
+
+        # ── 전략 B 평가 (BB하단 평균회귀) ───────────────────
+        result_b = self._eval_entry_b(
             code, name, cur_price, candles_5m, price_data, now
         )
+        if result_b.get("action") == "BUY":
+            return result_b
+
+        # 둘 다 통과 못하면 A의 SKIP 반환 (사유 포함)
+        return result_a
 
     # ════════════════════════════════════════════════════════════
     # ■ 진입 판단
@@ -182,7 +213,8 @@ class KRStrategy:
     def _eval_entry(self,
                     code: str, name: str, cur_price: int,
                     candles_5m: list, price_data: dict,
-                    now: datetime) -> dict:
+                    now: datetime, strategy: str = "A") -> dict:
+        """전략 A (모멘텀 돌파) 진입 판단."""
 
         # ★ B6 수정: 재진입 차단 체크 (이전 누락)
         blocked, block_info = self.reentry.check("KR", code, name)
@@ -195,7 +227,7 @@ class KRStrategy:
         if not entry_pre["can_enter"] or entry_pre.get("max_qty", 0) <= 0:
             pre_reason = entry_pre.get("block_reason", "수량0 예상")
             logger.info(
-                f"[ENTRY_EXCLUDE] 종목={name}({code}) | 시장=KR | "
+                f"[ENTRY_EXCLUDE] 종목={name}({code}) | 시장=KR | strategy={strategy} | "
                 f"현재가={cur_price:,}원 | "
                 f"배정금액={entry_pre.get('entry_amount_krw', 0):,.0f}원 | "
                 f"사유={pre_reason}"
@@ -209,9 +241,10 @@ class KRStrategy:
 
         # ── 항상 로그 ────────────────────────────────────────
         logger.info(
-            f"[진입평가] {name}({code}) | "
+            f"[진입평가-A] {name}({code}) | strategy={strategy} | "
             f"현재가={cur_price:,} | "
             f"BUY={buy_score:.2f} | SELL={sell_score} | "
+            f"RSI={iv.get('rsi', 0):.0f} | "
             f"거래량증가={iv['vol_increase']} | "
             f"VWAP위={iv['vwap_above']} | "
             f"추격={iv['chase_blocked']}"
@@ -253,8 +286,9 @@ class KRStrategy:
         _vol_inc    = "✅" if iv.get("vol_increase") else "❌"
         _vwap_above = "✅" if iv.get("vwap_above")   else "❌"
         logger.info(
-            f"[KR BUY 판정] {name}({code}) | "
+            f"[KR BUY 판정-A] {name}({code}) | strategy={strategy} | "
             f"현재가={cur_price:,.0f}원 | VWAP={_vwap_val:,.0f} | "
+            f"RSI={iv.get('rsi', 0):.0f} | "
             f"거래량={_vol_inc} | VWAP위={_vwap_above} | "
             f"SELL={sell_score} | BUY={buy_score:.3f} | "
             f"단계={self._entry_stage.get(code, 'NONE')} | "
@@ -273,19 +307,19 @@ class KRStrategy:
         if buy_score >= BUY_SCORE_FULL and stage != "EARLY":
             # Full Entry: 100%
             qty    = max_qty
-            reason = f"Full진입 BUY_SCORE={buy_score:.2f} signal={signal_type}"
+            reason = f"[A]Full진입 BUY_SCORE={buy_score:.2f} signal={signal_type}"
             stage_next = "FULL"
         elif buy_score >= BUY_SCORE_EARLY and not stage:
             # Early Entry: 30%
             qty    = max(1, int(max_qty * 0.30))
-            reason = f"Early진입 BUY_SCORE={buy_score:.2f} signal={signal_type}"
+            reason = f"[A]Early진입 BUY_SCORE={buy_score:.2f} signal={signal_type}"
             stage_next = "EARLY"
         elif buy_score >= BUY_SCORE_FULL and stage == "EARLY":
             # Early → 나머지 70% 추가
             total_qty   = max_qty
             current_qty = self._get_held_qty_internal(code)
             qty         = max(1, total_qty - current_qty)
-            reason      = f"Early→Full 추가진입 BUY_SCORE={buy_score:.2f} signal={signal_type}"
+            reason      = f"[A]Early→Full 추가진입 BUY_SCORE={buy_score:.2f} signal={signal_type}"
             stage_next  = "FULL"
         else:
             return self._skip(code, name,
@@ -328,7 +362,7 @@ class KRStrategy:
             entry_price_log = ord_price if ord_price > 0 else cur_price
             logger.info(
                 f"[BUY_OK] 종목={name}({code}) | "
-                f"시장=KR | "
+                f"시장=KR | strategy={strategy} | "
                 f"단계={stage_next} | "
                 f"수량={qty}주 | "
                 f"진입가={entry_price_log:,}원 | "
@@ -343,7 +377,7 @@ class KRStrategy:
             logger.info(
                 f"[ENTRY_QUALITY] 종목={name}({code}) | "
                 f"BUY_SCORE={buy_score:.3f} | "
-                f"진입단계={stage_next} | "
+                f"진입단계={stage_next} | strategy={strategy} | "
                 f"진입사유={reason} | "
                 f"돌파저가={breakout_low:,.0f} | "
                 f"유효손절선={_eff_stop:,.0f}(gap={_stop_gap:+.2f}%) | "
@@ -361,6 +395,8 @@ class KRStrategy:
             # ★ Adaptive Engine: 진입 기록 (order_no + signal_time + order_time 포함)
             if self.recorder:
                 try:
+                    iv_with_strategy = dict(iv)
+                    iv_with_strategy["strategy"] = strategy   # ★ strategy 태그 주입
                     self.recorder.record_entry(
                         market       = "KR",
                         code         = code,
@@ -368,7 +404,7 @@ class KRStrategy:
                         price        = float(ord_price if ord_price > 0 else cur_price),
                         qty          = qty,
                         reason       = reason,
-                        iv           = iv,
+                        iv           = iv_with_strategy,
                         stage        = stage_next,
                         signal_time  = signal_time,
                         order_time   = order_time,
@@ -626,10 +662,15 @@ class KRStrategy:
             "vol_increase": False,
             "vwap_above":   False,
             "vwap_5m_above": False,
+            "rsi":          0.0,    # ★ RSI 버그수정: iv에 명시적 저장
             "rsi_falling":  False,
             "chase_blocked": False,
             "chase_reason": "",
             "breakout_bonus": 0.0,
+            "bb_lower":     0.0,    # ★ 전략 B용
+            "bb_upper":     0.0,    # ★ 전략 B용
+            "ma20":         0.0,    # ★ 전략 B용
+            "avg_vol20":    0.0,    # ★ 전략 B용
         }
 
         if len(candles_5m) < 4:
@@ -663,7 +704,11 @@ class KRStrategy:
 
         # ── RSI ───────────────────────────────────────────────
         if len(closes) >= 14:
+            rsi = self._calc_rsi(closes, 14)
+            iv["rsi"]         = rsi   # ★ RSI 버그수정: iv에 저장
             iv["rsi_falling"] = self._is_rsi_falling(closes)
+        else:
+            rsi = 50.0   # 봉 수 부족 시 중립값
 
         # ── 추격매수 차단 ─────────────────────────────────────
         if len(closes) >= 4:
@@ -688,11 +733,24 @@ class KRStrategy:
         score = 0.0
 
         # MA 배열 (MA5 > MA20)
+        ma20 = 0.0
+        bb_lower = 0.0
+        bb_upper = 0.0
         if len(closes) >= 20:
             ma5  = np.mean(closes[-5:])
-            ma20 = np.mean(closes[-20:])
+            ma20 = float(np.mean(closes[-20:]))
+            bb_std = float(np.std(closes[-20:]))
+            bb_lower = ma20 - 2.0 * bb_std
+            bb_upper = ma20 + 2.0 * bb_std
+            iv["ma20"]     = ma20       # ★ 전략 B용
+            iv["bb_lower"] = bb_lower   # ★ 전략 B용
+            iv["bb_upper"] = bb_upper   # ★ 전략 B용
             if ma5 > ma20:
                 score += 1.0
+
+        # 거래량 평균 (최근 20봉)
+        avg_vol20 = float(np.mean(volumes[-20:])) if len(volumes) >= 20 else float(avg_vol4)
+        iv["avg_vol20"] = avg_vol20   # ★ 전략 B용
 
         # OBV 추세
         if len(closes) >= 5:
@@ -704,18 +762,17 @@ class KRStrategy:
             if obv_up >= 3:
                 score += 1.0
 
-        # RSI 중립~상승 (40~70)
-        if len(closes) >= 14:
-            rsi = self._calc_rsi(closes, 14)
-            if 40 <= rsi <= 70:
-                score += 1.0
+        # RSI 중립~상승 (40~70) — iv["rsi"]는 위에서 이미 설정됨
+        rsi_val = iv.get("rsi", 0.0)
+        if rsi_val == 0.0 and len(closes) >= 14:
+            rsi_val = self._calc_rsi(closes, 14)
+            iv["rsi"] = rsi_val
+        if 40 <= rsi_val <= 70:
+            score += 1.0
 
         # 볼린저밴드 중심선 위
-        if len(closes) >= 20:
-            bb_mid = ma20
-            bb_std = np.std(closes[-20:])
-            if bb_std > 0 and cur_close > bb_mid:
-                score += 1.0
+        if ma20 > 0 and cur_close > ma20:
+            score += 1.0
 
         # 거래량 보너스
         if vol_surge:
@@ -926,6 +983,150 @@ class KRStrategy:
             }
         except Exception:
             return None
+
+    # ════════════════════════════════════════════════════════════
+    # ■ 전략 B — BB하단 평균회귀 진입 판단
+    # ════════════════════════════════════════════════════════════
+
+    def _eval_entry_b(self,
+                      code: str, name: str, cur_price: int,
+                      candles_5m: list, price_data: dict,
+                      now: datetime) -> dict:
+        """
+        전략 B (BB하단 평균회귀) 진입 판단.
+        조건:
+          ① cur_price <= bb_lower * _STRAT_B_BB_PROX   (BB하단 근접)
+          ② cur_price >= ma20 * _STRAT_B_MA20_FLOOR     (MA20 위)
+          ③ _STRAT_B_RSI_MIN <= RSI <= _STRAT_B_RSI_MAX (RSI 40~60)
+          ④ cur_vol >= avg_vol20 * _STRAT_B_VOL_MULT    (거래량 증가)
+          ⑤ 급등주 제외: 당일 상승률 < _STRAT_B_SURGE_PCT (5%)
+          ⑥ 급등량 제외: cur_vol < avg_vol20 * _STRAT_B_VOL_SURGE
+        """
+        # 재진입 차단
+        blocked, block_info = self.reentry.check("KR", code, name)
+        if blocked:
+            return self._skip(code, name,
+                               f"[B] 재진입 차단 — {block_info.get('block_reason', '')}")
+
+        # 수량 사전 체크
+        entry_pre = self.account.calc_entry_amount(cur_price)
+        if not entry_pre["can_enter"] or entry_pre.get("max_qty", 0) <= 0:
+            return self._skip(code, name,
+                               f"[B] {entry_pre.get('block_reason', '수량0')}")
+
+        # 지표 계산 (전략 A와 공유 — _calc_indicators 재활용)
+        iv = self._calc_indicators(candles_5m, price_data)
+
+        bb_lower  = iv.get("bb_lower", 0.0)
+        ma20      = iv.get("ma20", 0.0)
+        rsi       = iv.get("rsi", 0.0)
+        avg_vol20 = iv.get("avg_vol20", 0.0)
+
+        closes  = [c["close"]  for c in candles_5m] if candles_5m else []
+        volumes = [c["volume"] for c in candles_5m] if candles_5m else []
+        cur_vol = volumes[-1] if volumes else 0
+
+        # ── 조건 평가 ─────────────────────────────────────────
+        # 당일 상승률 (open 대비)
+        open_price = price_data.get("open", cur_price)
+        day_rise_pct = (cur_price - open_price) / open_price * 100 if open_price > 0 else 0.0
+
+        cond_bb    = bb_lower > 0 and cur_price <= bb_lower * _STRAT_B_BB_PROX
+        cond_ma20  = ma20 > 0 and cur_price >= ma20 * _STRAT_B_MA20_FLOOR
+        cond_rsi   = _STRAT_B_RSI_MIN <= rsi <= _STRAT_B_RSI_MAX
+        cond_vol   = avg_vol20 > 0 and cur_vol >= avg_vol20 * _STRAT_B_VOL_MULT
+        cond_surge = day_rise_pct < _STRAT_B_SURGE_PCT
+        cond_vol_surge = not (avg_vol20 > 0 and cur_vol >= avg_vol20 * _STRAT_B_VOL_SURGE)
+
+        logger.info(
+            f"[진입평가-B] {name}({code}) | strategy=B | "
+            f"현재가={cur_price:,} | bb_lower={bb_lower:,.0f} | ma20={ma20:,.0f} | "
+            f"RSI={rsi:.0f} | cur_vol={cur_vol:,} | avg_vol20={avg_vol20:,.0f} | "
+            f"day_rise={day_rise_pct:+.1f}% | "
+            f"BB근접={cond_bb} MA20위={cond_ma20} RSI범위={cond_rsi} "
+            f"거래량={cond_vol} 급등제외={cond_surge} 급등량제외={cond_vol_surge}"
+        )
+
+        # 전체 조건 미충족 시 SKIP
+        if not cond_bb:
+            return self._skip(code, name,
+                               f"[B] BB하단 미근접 cur={cur_price} bb_lower={bb_lower:.0f}×{_STRAT_B_BB_PROX}")
+        if not cond_ma20:
+            return self._skip(code, name,
+                               f"[B] MA20 하회 cur={cur_price} ma20={ma20:.0f}×{_STRAT_B_MA20_FLOOR}")
+        if not cond_rsi:
+            return self._skip(code, name,
+                               f"[B] RSI 범위이탈 rsi={rsi:.0f} 허용={_STRAT_B_RSI_MIN}~{_STRAT_B_RSI_MAX}")
+        if not cond_vol:
+            return self._skip(code, name,
+                               f"[B] 거래량 미달 cur_vol={cur_vol} avg20={avg_vol20:.0f}×{_STRAT_B_VOL_MULT}")
+        if not cond_surge:
+            return self._skip(code, name,
+                               f"[B] 급등주 제외 day_rise={day_rise_pct:+.1f}% >= {_STRAT_B_SURGE_PCT}%")
+        if not cond_vol_surge:
+            return self._skip(code, name,
+                               f"[B] 급등거래량 제외 cur_vol={cur_vol} >= avg20×{_STRAT_B_VOL_SURGE}")
+
+        # ── 진입 실행 ─────────────────────────────────────────
+        max_qty = entry_pre["max_qty"]
+        reason  = (f"[B]BB하단회귀 bb_lower={bb_lower:.0f} RSI={rsi:.0f} "
+                   f"vol={cur_vol/avg_vol20:.1f}×avg")
+
+        ord_price, ord_dvsn = self._decide_order_price(cur_price, price_data)
+        signal_time = now.isoformat()
+        order_time  = datetime.now(KST).isoformat()
+
+        result = self.executor.execute_buy(
+            code     = code,
+            name     = name,
+            price    = ord_price,
+            qty      = max_qty,
+            reason   = reason,
+            ord_dvsn = ord_dvsn,
+        )
+
+        if result.get("action") == "BUY":
+            self._entry_stage[code] = "FULL"
+            breakout_low = self._get_breakout_low(candles_5m, cur_price)
+            self._positions[code] = PositionGuard(
+                code         = code,
+                name         = name,
+                avg_price    = ord_price if ord_price > 0 else float(cur_price),
+                qty          = max_qty,
+                entry_time   = now,
+                breakout_low = breakout_low,
+            )
+            self._save_positions()
+            order_no = result.get("order_no", "") or ""
+            entry_price_log = ord_price if ord_price > 0 else cur_price
+            logger.info(
+                f"[BUY_OK] 종목={name}({code}) | 시장=KR | strategy=B | "
+                f"수량={max_qty}주 | 진입가={entry_price_log:,}원 | "
+                f"bb_lower={bb_lower:.0f} | RSI={rsi:.0f} | "
+                f"order_no={order_no} | 사유={reason}"
+            )
+            if self.recorder:
+                try:
+                    iv_b = dict(iv)
+                    iv_b["strategy"] = "B"
+                    self.recorder.record_entry(
+                        market       = "KR",
+                        code         = code,
+                        name         = name,
+                        price        = float(ord_price if ord_price > 0 else cur_price),
+                        qty          = max_qty,
+                        reason       = reason,
+                        iv           = iv_b,
+                        stage        = "FULL",
+                        signal_time  = signal_time,
+                        order_time   = order_time,
+                        order_no     = order_no,
+                        price_source = "KIS지정가" if ord_price > 0 else "KIS시장가",
+                    )
+                except Exception as _re:
+                    logger.debug(f"[KRStrategy-B] 진입 기록 실패: {_re}")
+
+        return result
 
     # ── 유틸 ─────────────────────────────────────────────────
 

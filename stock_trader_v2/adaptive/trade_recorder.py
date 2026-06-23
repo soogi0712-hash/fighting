@@ -255,6 +255,8 @@ class TradeRecorder:
             rsi           = float(iv.get("rsi", 0.0))
             breakout_bonus= float(iv.get("breakout_bonus", 0.0))
             strength      = float(iv.get("strength",       0.0))
+            # ★ strategy 태그: iv에 "strategy" 키가 있으면 사용, 없으면 "A" (기본)
+            strategy_tag  = iv.get("strategy", "A")
 
             # 지연 계산
             sig_delay = None
@@ -275,15 +277,15 @@ class TradeRecorder:
                      buy_score, sell_score, vol_score, vwap_state, rsi,
                      breakout_bonus, strength,
                      signal_time, order_time, signal_delay_sec,
-                     price_source, order_no)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     price_source, order_no, strategy)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, (
                     trade_id, market, code, name, signal_type, "open",
                     entry_time, price, qty, reason,
                     buy_score, sell_score, vol_score, vwap_state, rsi,
                     breakout_bonus, strength,
                     signal_time or now_iso, order_time or now_iso, sig_delay,
-                    price_source or "", order_no or "",
+                    price_source or "", order_no or "", strategy_tag,
                 ))
                 conn.commit()
                 conn.close()
@@ -303,6 +305,7 @@ class TradeRecorder:
                 "signal_time": signal_time, "order_time": order_time,
                 "signal_delay_sec": sig_delay, "order_no": order_no,
                 "price_source": price_source,
+                "strategy": strategy_tag,    # ★ 전략 구분 태그
             })
 
             logger.info(
