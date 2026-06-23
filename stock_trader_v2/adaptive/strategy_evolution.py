@@ -51,9 +51,87 @@ _PROPOSALS_FILE   = os.path.join(_DATA_DIR, "evolution_proposals.json")
 _EVOLUTION_REPORT = os.path.join(_DATA_DIR, "evolution_report.json")
 
 # ── 백테스트 필터 개선 임계 ──────────────────────────────────────
-_IMPROVEMENT_THRESHOLD_WR  = 10.0   # 승률 개선 +10%p 이상
-_IMPROVEMENT_THRESHOLD_EV  = 0.10   # EV 개선 +0.10% 이상
+_IMPROVEMENT_THRESHOLD_WR  = 10.0   # 승률 개선 +10%p 이상 → 채택안
+_IMPROVEMENT_THRESHOLD_EV  = 0.10   # EV 개선 +0.10% 이상 → 채택안
 _MIN_TRADES_FOR_ANALYSIS   = 30     # 최소 거래 건수
+
+# ── 시험적용안 승격 임계 ─────────────────────────────────────────
+# EV 개선 가능성(ev_impact) TOP1 이 이 값 이상이면
+# 채택안 없어도 "시험안"으로 자동 승격하여 내일 운영안에 포함
+_TRIAL_THRESHOLD_EV        = 0.30   # EV 개선 +0.30%p 이상 → 시험안 승격
+
+# ── 손절사유→완화 실험 매핑 ──────────────────────────────────────
+# {그룹명: (짧은설명, 실험방향, 코드파일, 코드힌트)}
+_GROUP_TRIAL_MAP: dict[str, dict] = {
+    "돌파봉이탈_손절": {
+        "short":      "돌파봉이탈 손절 완화",
+        "direction":  "돌파봉저가이탈 조건 허용폭 확대 또는 1회 허용",
+        "file":       "position_guard.py",
+        "hint":       "position_guard.py: 돌파봉저가이탈 조건 완화\n"
+                      "  → BREAKOUT_LOW_TOLERANCE = 0.003 (현재 0) 으로 0.3% 여유\n"
+                      "  또는 1회 이탈 후 재진입 허용 로직 추가",
+    },
+    "약진입_손절": {
+        "short":      "약진입(WEAK_ENTRY) 손절 임계 상향",
+        "direction":  "WEAK_ENTRY 판단 BUY_SCORE 기준을 소폭 높여 진입 자체를 줄임",
+        "file":       "kr_strategy.py",
+        "hint":       "kr_strategy.py: BUY_SCORE_EARLY 임계 0.40 → 0.44 상향\n"
+                      "  → 약한 진입 자체를 사전 차단하여 WEAK_ENTRY 손절 건수 감소",
+    },
+    "에어백_손절": {
+        "short":      "에어백 손절 허용폭 완화",
+        "direction":  "AIRBAG 손절 임계를 현재보다 0.2~0.3%p 낮춰 조기 손절 방지",
+        "file":       "position_guard.py",
+        "hint":       "position_guard.py: STOPLOSS_HARD_PCT 완화 또는\n"
+                      "  에어백 발동 조건 횟수 기준 +1 완화",
+    },
+    "시간초과_손절": {
+        "short":      "시간초과 손절 기준 연장",
+        "direction":  "TIME_EXIT 보유시간 임계를 현재보다 2~5분 연장 실험",
+        "file":       "position_guard.py",
+        "hint":       "position_guard.py: TIME_EXIT_MIN 을 현재값+3분 으로 연장\n"
+                      "  → 추가 반등 여유 부여",
+    },
+    "오후장_손실": {
+        "short":      "오후장(11~13시) 신규매수 차단",
+        "direction":  "11시 이후 신규 BUY 금지 시험 운영",
+        "file":       "kr_strategy.py",
+        "hint":       "kr_strategy.py: BUY_STOP_TIME = dtime(11, 0) 으로 단축\n"
+                      "  → 오후장 전체 신규매수 차단 실험",
+    },
+    "RSI과매수_진입": {
+        "short":      "RSI 과매수 진입 차단",
+        "direction":  "RSI > 70 진입 금지 조건 추가",
+        "file":       "kr_strategy.py",
+        "hint":       "kr_strategy.py: _eval_entry()에 if iv['rsi'] > 70: return SKIP 추가",
+    },
+    "저BuyScore_손실": {
+        "short":      "저BuyScore 진입 기준 상향",
+        "direction":  "BUY_SCORE_EARLY 0.40 → 0.45 상향 실험",
+        "file":       "kr_strategy.py",
+        "hint":       "kr_strategy.py: BUY_SCORE_EARLY = 0.40 → 0.45 변경",
+    },
+    "비돌파_손실": {
+        "short":      "비돌파(breakout_bonus=0) 진입 차단",
+        "direction":  "돌파보너스=0인 진입 비허용 조건 추가",
+        "file":       "kr_strategy.py",
+        "hint":       "kr_strategy.py: if iv['breakout_bonus'] == 0: return SKIP 추가",
+    },
+    "즉시청산_손실": {
+        "short":      "즉시청산 최소보유 2분 강제",
+        "direction":  "보유 2분 미만 청산 방지 쿨다운 추가",
+        "file":       "position_guard.py",
+        "hint":       "position_guard.py: HOLD_MIN_BEFORE_EXIT = 2.0 추가\n"
+                      "  → hold_min < 2.0 이면 WEAK_ENTRY 청산 보류",
+    },
+    "기타_손실": {
+        "short":      "미분류 손실 패턴 추가 모니터링",
+        "direction":  "exit_reason 기록 상세화로 분류 정확도 개선",
+        "file":       "trade_recorder.py",
+        "hint":       "trade_recorder.py: exit_reason에 세부 사유 코드 추가 기록\n"
+                      "  → 다음 진화 사이클에서 정밀 분류 가능",
+    },
+}
 
 # ── 후보 필터 정의 (각 필터가 TRUE이면 해당 거래 진입 허용) ───────
 # 형식: (filter_id, label, sql_condition_or_python_fn_desc)
@@ -228,7 +306,8 @@ class StrategyEvolutionEngine:
 
         # ── [10] 내일 추천 운영안 생성 ──────────────────────
         recommendation = self._generate_recommendation(
-            strategy_perf, weight_sim, capital_sim, baseline, proposals
+            strategy_perf, weight_sim, capital_sim, baseline, proposals,
+            ev_impact   # ← EV 영향 분석 결과 추가 전달
         )
 
         # ── 로그 출력 ────────────────────────────────────
@@ -976,7 +1055,7 @@ class StrategyEvolutionEngine:
         }
 
     # ────────────────────────────────────────────────────────────
-    # ⑤ 내일 추천 운영안 생성
+    # ⑤ 내일 추천 운영안 생성 — [보수안] / [시험안] / [공격안] 3단계
     # ────────────────────────────────────────────────────────────
 
     def _generate_recommendation(
@@ -986,98 +1065,228 @@ class StrategyEvolutionEngine:
         capital_sim:   dict,
         baseline:      dict,
         proposals:     dict,
+        ev_impact:     dict,
     ) -> dict:
         """
-        [내일 추천 운영안] 출력용 데이터 생성.
+        [내일 추천 운영안] — 3단계 찬별 출력용 데이터 생성.
 
-        결정 로직:
-          1. 채택안 있으면 → 채택안 적용 + 최적 비중
-          2. 채택안 없고 B 데이터 10건 이상 → weight_sim 최적 비중 추천
-          3. B 데이터 없으면 → 현행 A100% 유지
-          4. 예상 거래수: 최근 30일 평균 일간 거래수 기반
-          5. 예상 승률/EV: 추천 비중의 가중 평균
+        ┌─────────────────────────────────────────────────────────────┐
+        │ [보수안] 현행 유지                                           │
+        │ [시험안] EV 개선 가능성 TOP1 적용 (delta_ev >= 0.30%p 시)  │
+        │ [공격안] TOP1 + TOP2 동시 적용                              │
+        └─────────────────────────────────────────────────────────────┘
+
+        각 안마다: 예상 거래수 / 예상 승률 / 예상 EV / 예상 일손익 / 위험요소
+
+        결정 규칙:
+          - 채택안 있으면 → 채택안을 시험안/공격안의 기반 필터로 사용
+          - 채택안 없고 ev_impact TOP1 delta_ev >= _TRIAL_THRESHOLD_EV
+            → 해당 그룹 "시험적용안"으로 자동 승격
+          - B 데이터 10건 이상이면 비중 최적화 추천
         """
         perf_a = strategy_perf.get("A", {})
         perf_b = strategy_perf.get("B", {})
         cnt_a  = perf_a.get("count", 0)
         cnt_b  = perf_b.get("count", 0)
-        ev_a   = perf_a.get("ev", 0.0)
-        ev_b   = perf_b.get("ev", 0.0)
+        ev_a   = perf_a.get("ev",       0.0)
+        ev_b   = perf_b.get("ev",       0.0)
         wr_a   = perf_a.get("win_rate", 0.0)
         wr_b   = perf_b.get("win_rate", 0.0)
-
-        # B 데이터 없으면 A 추정치 사용
         if cnt_b == 0:
-            ev_b = ev_a
-            wr_b = wr_a
+            ev_b, wr_b = ev_a, wr_a
 
-        # ── 추천 비중 결정 ────────────────────────────────────
-        채택안 = proposals.get("채택안", [])
-        best_mix = weight_sim.get("best_mix", {})
-        b_available = weight_sim.get("b_data_available", False)
+        채택안       = proposals.get("채택안", [])
+        b_available  = weight_sim.get("b_data_available", False)
+        best_mix     = weight_sim.get("best_mix", {})
+        best3_imp    = ev_impact.get("best_improvements", [])
+        base_ev      = baseline.get("ev", ev_a)
 
-        # 기본값: A100%
-        rec_wa = 100
-        rec_wb = 0
-        basis  = "현행 유지 (채택안 없음, B 데이터 부족)"
+        # ── 일간 거래수 추정 ─────────────────────────────────
+        est_days    = 30
+        daily_a     = cnt_a / est_days
+        daily_b     = cnt_b / est_days if cnt_b > 0 else 0.0
 
-        if 채택안:
-            # 채택안이 있으면 최적 비중 적용
-            rec_wa = best_mix.get("weight_a", 100)
-            rec_wb = best_mix.get("weight_b", 0)
-            basis  = f"채택안 {len(채택안)}개 적용 + 비중 최적화"
-        elif b_available and best_mix.get("sim_ev", ev_a) > ev_a + 0.03:
-            # B 데이터 10건 이상 + EV 개선 효과 있으면 비중 전환 권장
-            rec_wa = best_mix.get("weight_a", 70)
-            rec_wb = best_mix.get("weight_b", 30)
-            basis  = f"B전략 데이터 {cnt_b}건 축적 → EV 개선 비중 추천"
-        elif b_available:
-            # B 데이터는 있지만 EV 개선 미미 → 보수적 배분
-            rec_wa = 70
-            rec_wb = 30
-            basis  = f"B전략 {cnt_b}건 데이터 유효 — 보수적 30% 배분"
-        # else: A100% 유지
+        def _make_scenario(
+            label:     str,
+            wa:        int,
+            wb:        int,
+            ev_boost:  float,       # EV 기대 개선폭 (필터 효과)
+            wr_boost:  float,       # 승률 기대 개선폭
+            trade_scale: float,     # 거래수 배율 (필터 시 거래 감소)
+            filters:   list[str],   # 적용 필터 설명 목록
+            risks:     list[str],   # 위험요소 목록
+        ) -> dict:
+            wa_f  = wa / 100
+            wb_f  = wb / 100
+            # EV / 승률: 비중 가중 평균 + 필터 부스트
+            s_ev  = round(ev_a * wa_f + ev_b * wb_f + ev_boost, 3)
+            s_wr  = round(wr_a * wa_f + wr_b * wb_f + wr_boost, 1)
+            # 예상 일거래수
+            s_cnt = round((daily_a * wa_f + daily_b * wb_f) * trade_scale, 1)
+            s_cnt = max(0.5, s_cnt)
+            # 예상 일손익 (EV% × 거래수 → 단순 합산, 실제 금액은 포지션크기 미반영)
+            # 부호+상대 크기만 의미있음
+            daily_ev_pct = round(s_ev * s_cnt, 3)
+            return {
+                "label":        label,
+                "weight_a":     wa,
+                "weight_b":     wb,
+                "exp_ev":       s_ev,
+                "exp_wr":       s_wr,
+                "exp_trades":   s_cnt,
+                "daily_ev_pct": daily_ev_pct,
+                "filters":      filters,
+                "risks":        risks,
+            }
 
-        # ── 예상 거래수 추정 ──────────────────────────────────
-        # 전체 건수 기준 일간 거래수 추정 (30일 가정)
-        total_cnt   = cnt_a + cnt_b
-        est_days    = max(1, 30)  # 고정 30일 기준
-        daily_a_est = round(cnt_a / est_days, 1)
-        daily_b_est = round(cnt_b / est_days, 1)
-
-        # 추천 비중 적용 후 예상 일간 거래수
-        est_daily   = round(
-            daily_a_est * (rec_wa / 100) + daily_b_est * (rec_wb / 100), 1
+        # ────────────────────────────────────────────────────
+        # [보수안] — 현행 그대로
+        # ────────────────────────────────────────────────────
+        conservative = _make_scenario(
+            label        = "보수안",
+            wa           = 100,
+            wb           = 0,
+            ev_boost     = 0.0,
+            wr_boost     = 0.0,
+            trade_scale  = 1.0,
+            filters      = ["현행 전략 A 유지", "필터 변경 없음"],
+            risks        = ["현 EV 수준 지속 시 누적 손실 위험",
+                            "돌파봉이탈 손절 패턴 반복 가능성"],
         )
-        # 최소 0.5건, 최대 현행의 1.5배 캡
-        est_daily   = max(0.5, min(est_daily, (daily_a_est + daily_b_est) * 1.5))
 
-        # ── 예상 승률/EV ──────────────────────────────────────
-        wa_f = rec_wa / 100
-        wb_f = rec_wb / 100
-        exp_wr = round(wr_a * wa_f + wr_b * wb_f, 1)
-        exp_ev = round(ev_a * wa_f + ev_b * wb_f, 3)
+        # ────────────────────────────────────────────────────
+        # [시험안] — EV 개선 TOP1 적용
+        # ────────────────────────────────────────────────────
+        trial_filters  = []
+        trial_risks    = []
+        trial_ev_boost = 0.0
+        trial_wr_boost = 0.0
+        trial_scale    = 0.85    # 필터 적용 시 거래 약 15% 감소 추정
+        trial_wa       = 90
+        trial_wb       = 10 if b_available else 0
 
-        # ── 최선 필터 힌트 ────────────────────────────────────
-        filter_hint = ""
+        top1 = best3_imp[0] if best3_imp else None
+        top2 = best3_imp[1] if len(best3_imp) > 1 else None
+
         if 채택안:
-            filter_hint = f"필터 적용: {채택안[0]['label']}"
+            # 채택안이 있으면 채택안 필터를 시험안 기반으로
+            top1_filter = 채택안[0]
+            trial_filters.append(f"[채택안] {top1_filter['label']}")
+            trial_ev_boost = top1_filter.get("delta_ev", 0.0) * 0.6  # 현실화 계수
+            trial_wr_boost = top1_filter.get("delta_wr", 0.0) * 0.6
+            trial_risks.extend([
+                f"채택안 필터({top1_filter['label']}) 실 적용 첫날 — 예상과 다를 수 있음",
+                "필터 효과는 과거 데이터 기반 — 전방향성 없음",
+            ])
+        elif top1 and top1.get("delta_ev", 0) >= _TRIAL_THRESHOLD_EV:
+            # EV 개선 가능성 TOP1이 임계 이상 → 시험적용안 자동 승격
+            g_info = _GROUP_TRIAL_MAP.get(top1["group"], {})
+            trial_filters.append(
+                g_info.get("short", top1["group"]) + " 실험"
+            )
+            # 개선폭의 60%를 현실적 기대치로 사용 (백테스트 과적합 할인)
+            trial_ev_boost = top1["delta_ev"] * 0.6
+            trial_wr_boost = 0.0   # 승률은 불확실 — 0으로 보수적 추정
+            trial_risks.extend([
+                f"미검증 실험 (백테스트 기반, 실전 미확인)",
+                f"거래 건수 감소 가능 (해당 패턴 {top1['count']}건 제거)",
+                g_info.get("direction", ""),
+            ])
         else:
+            # EV 개선 임계 미달 — 최선 후보 소극적 적용
             best_p = self._pick_best_pending(proposals)
             if best_p:
-                filter_hint = (
-                    f"최선 후보(보류): [{best_p['filter_id']}] {best_p['label']} "
-                    f"EV={best_p.get('delta_ev', 0):+.3f}%p"
+                trial_filters.append(
+                    f"[보류→소극적 시험] {best_p['label']}"
                 )
+                trial_ev_boost = best_p.get("delta_ev", 0.0) * 0.4
+            trial_risks.extend([
+                "EV 개선 가능성 낮음 — 효과 미미할 수 있음",
+                "데이터 추가 누적 후 재평가 권장",
+            ])
+
+        if b_available and trial_wb > 0:
+            trial_filters.append(f"전략 B {trial_wb}% 배분 추가")
+            trial_risks.append(f"B전략 데이터 {cnt_b}건 (소표본 불안정)")
+
+        trial = _make_scenario(
+            label        = "시험안",
+            wa           = trial_wa,
+            wb           = trial_wb,
+            ev_boost     = trial_ev_boost,
+            wr_boost     = trial_wr_boost,
+            trade_scale  = trial_scale,
+            filters      = trial_filters if trial_filters else ["변경 없음"],
+            risks        = trial_risks   if trial_risks   else ["일반 시장 위험"],
+        )
+
+        # ────────────────────────────────────────────────────
+        # [공격안] — TOP1 + TOP2 동시 적용
+        # ────────────────────────────────────────────────────
+        agg_filters  = list(trial_filters)   # 시험안 필터 포함
+        agg_risks    = ["복합 필터 상호작용 불확실", "거래 기회 추가 감소"]
+        agg_ev_boost = trial_ev_boost
+        agg_wr_boost = trial_wr_boost
+        agg_scale    = 0.72     # TOP1+TOP2 동시 적용 시 거래 추가 감소
+        agg_wa       = max(70, trial_wa - 10)
+        agg_wb       = min(30, trial_wb + 10) if b_available else trial_wb
+
+        if 채택안 and len(채택안) >= 2:
+            top2_filter = 채택안[1]
+            agg_filters.append(f"[채택안 #2] {top2_filter['label']}")
+            agg_ev_boost += top2_filter.get("delta_ev", 0.0) * 0.5
+            agg_wr_boost += top2_filter.get("delta_wr", 0.0) * 0.5
+        elif top2 and top2.get("delta_ev", 0) >= _TRIAL_THRESHOLD_EV * 0.5:
+            # TOP2 개선 가능성 0.15%p 이상이면 공격안에 추가
+            g2_info = _GROUP_TRIAL_MAP.get(top2["group"], {})
+            agg_filters.append(
+                g2_info.get("short", top2["group"]) + " 추가 실험"
+            )
+            agg_ev_boost += top2["delta_ev"] * 0.5
+            agg_risks.append(
+                f"2개 패턴 동시 제거 시 정상 거래도 차단될 수 있음"
+            )
+        elif top1 and top1.get("delta_ev", 0) >= _TRIAL_THRESHOLD_EV:
+            # TOP2 없어도 시험안 필터 + B비중 확대로 공격안 구성
+            if b_available:
+                agg_wb  = min(30, agg_wb + 10)
+                agg_wa  = max(70, 100 - agg_wb)
+                agg_filters.append(f"전략 B 비중 {agg_wb}%로 확대")
+                agg_risks.append("B 비중 확대에 따른 소표본 노출")
+            else:
+                agg_filters.append("약진입_손절 임계 추가 완화 실험")
+                agg_ev_boost += 0.05
+                agg_risks.append("약진입 임계 이중 완화 — 실전 검증 미완료")
+
+        aggressive = _make_scenario(
+            label        = "공격안",
+            wa           = agg_wa,
+            wb           = agg_wb,
+            ev_boost     = agg_ev_boost,
+            wr_boost     = agg_wr_boost,
+            trade_scale  = agg_scale,
+            filters      = agg_filters if agg_filters else ["시험안 필터 확장"],
+            risks        = agg_risks,
+        )
+
+        # ────────────────────────────────────────────────────
+        # 추천 안 선택 (기본 제시 순서: 시험안)
+        # ────────────────────────────────────────────────────
+        # 채택안 있거나 TOP1 임계 초과 → "시험안" 권장
+        # 아니면 → "보수안" 권장
+        has_trial_basis = bool(채택안) or (
+            top1 is not None and top1.get("delta_ev", 0) >= _TRIAL_THRESHOLD_EV
+        )
+        recommended = "시험안" if has_trial_basis else "보수안"
 
         return {
-            "rec_weight_a":   rec_wa,
-            "rec_weight_b":   rec_wb,
-            "basis":          basis,
-            "exp_trades_day": round(est_daily, 1),
-            "exp_win_rate":   exp_wr,
-            "exp_ev":         exp_ev,
-            "filter_hint":    filter_hint,
+            "conservative":   conservative,
+            "trial":          trial,
+            "aggressive":     aggressive,
+            "recommended":    recommended,
+            "has_trial_basis": has_trial_basis,
+            "trial_top1":     top1,
+            "trial_top2":     top2,
             "b_data_available": b_available,
             "b_count":        cnt_b,
         }
@@ -1400,24 +1609,80 @@ class StrategyEvolutionEngine:
             )
         lines.append(sep2)
 
-        # ── [9] 내일 추천 운영안 ─────────────────────────────
+        # ── [9] 내일 추천 운영안 — 3단계 ──────────────────────
         rec = recommendation
-        lines.append(f"\n  {'★'*3} [내일 추천 운영안] {'★'*3}")
-        lines.append(f"  {'═'*50}")
-        lines.append(f"    전략 A 비중:   {rec['rec_weight_a']:>3}%")
-        lines.append(f"    전략 B 비중:   {rec['rec_weight_b']:>3}%")
-        lines.append(f"    예상 거래수:   일 ~{rec['exp_trades_day']:.1f}건")
-        lines.append(f"    예상 승률:     {rec['exp_win_rate']:.1f}%")
-        lines.append(f"    예상 EV:       {rec['exp_ev']:+.3f}%/거래")
-        lines.append(f"    근거:          {rec['basis']}")
-        if rec.get("filter_hint"):
-            lines.append(f"    필터 적용:     {rec['filter_hint']}")
+        SEP9 = "═" * 60
+
+        lines.append(f"\n  {'★'*4} [내일 추천 운영안] {'★'*4}")
+        lines.append(f"  {SEP9}")
+
+        # 권장 안 표시
+        recommended_label = rec.get("recommended", "보수안")
+        lines.append(
+            f"  ▶ 권장: [{recommended_label}] "
+            + ("← EV 개선 실험 근거 있음" if rec.get("has_trial_basis") else "← 데이터 부족, 현행 유지")
+        )
+        if rec.get("trial_top1"):
+            t1 = rec["trial_top1"]
+            lines.append(
+                f"  ▶ 시험 근거: [{t1['group']}] 제거 시 EV "
+                f"{t1['ev_without']:+.3f}% (+{t1['delta_ev']:+.3f}%p)"
+            )
+        lines.append(f"  {SEP9}")
+
+        def _print_scenario(tag: str, sc: dict, is_recommended: bool) -> None:
+            mark  = " ◀ 권장" if is_recommended else ""
+            wa    = sc.get("weight_a", 100)
+            wb    = sc.get("weight_b", 0)
+            ev    = sc.get("exp_ev",     0.0)
+            wr    = sc.get("exp_wr",     0.0)
+            cnt   = sc.get("exp_trades", 0.0)
+            daily = sc.get("daily_ev_pct", 0.0)
+            fts   = sc.get("filters",  [])
+            risks = sc.get("risks",    [])
+
+            lines.append(f"\n  ┌── [{tag}]{mark}")
+            lines.append(f"  │  전략 A 비중:  {wa:>3}%   전략 B 비중: {wb:>3}%")
+            lines.append(f"  │  예상 거래수:  일 ~{cnt:.1f}건")
+            lines.append(f"  │  예상 승률:    {wr:.1f}%")
+            lines.append(f"  │  예상 EV:      {ev:+.3f}%/거래")
+            # 예상 일손익: EV × 거래수 (상대 스케일 — 부호/크기만 참조)
+            daily_sign = "+" if daily >= 0 else ""
+            lines.append(
+                f"  │  예상 일손익:  {daily_sign}{daily:.3f}% (EV×거래수, 참고용)"
+            )
+            if fts:
+                lines.append(f"  │  필터 적용:")
+                for f in fts:
+                    if f:
+                        lines.append(f"  │    · {f}")
+            if risks:
+                lines.append(f"  │  위험요소:")
+                for r in risks:
+                    if r:
+                        lines.append(f"  │    ⚠ {r}")
+            lines.append(f"  └{'─'*56}")
+
+        _print_scenario("보수안", rec["conservative"], recommended_label == "보수안")
+        _print_scenario("시험안", rec["trial"],        recommended_label == "시험안")
+        _print_scenario("공격안", rec["aggressive"],   recommended_label == "공격안")
+
+        # 시험안 코드 힌트 (TOP1 그룹 매핑)
+        t1 = rec.get("trial_top1")
+        if t1 and rec.get("has_trial_basis"):
+            g_info = _GROUP_TRIAL_MAP.get(t1.get("group", ""), {})
+            hint   = g_info.get("hint", "")
+            if hint:
+                lines.append(f"\n  [시험안 코드 힌트 — {t1['group']}]")
+                for hl in hint.split("\n"):
+                    lines.append(f"    {hl}")
+
         if not rec.get("b_data_available"):
             lines.append(
-                f"    ⚠ B전략 데이터 {rec.get('b_count', 0)}건 — "
-                f"10건 이상 누적 시 비중 재산정 예정"
+                f"\n  ℹ B전략 데이터 {rec.get('b_count', 0)}건 — "
+                f"10건 이상 누적 시 비중 자동 재산정"
             )
-        lines.append(f"  {'═'*50}\n")
+        lines.append(f"  {SEP9}\n")
 
         lines.append(SEP)
 
