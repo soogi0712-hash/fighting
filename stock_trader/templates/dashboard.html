@@ -22,9 +22,22 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:var(--bg);color:
   justify-content:space-between;position:sticky;top:0;z-index:100;}
 .header h1{font-size:1rem;font-weight:700;color:var(--blue);}
 .header .right{display:flex;align-items:center;gap:10px;}
+
+/* ── 빌드 배지 ── */
+#build-badge{
+  display:flex;align-items:center;gap:6px;
+  background:rgba(88,166,255,.08);
+  border:1px solid rgba(88,166,255,.25);
+  border-radius:8px;padding:3px 10px;
+  font-family:monospace;font-size:.72rem;
+  color:var(--muted);cursor:default;
+  white-space:nowrap;
+}
+#build-badge .bb-commit{color:var(--blue);font-weight:700;}
+#build-badge .bb-pid{color:var(--green);}
+#build-badge .bb-time{color:var(--muted);font-size:.68rem;}
 .badge{padding:3px 9px;border-radius:20px;font-size:0.72rem;font-weight:700;}
 .badge.real{background:rgba(248,81,73,.2);color:var(--red);border:1px solid var(--red);}
-.badge.virt{background:rgba(88,166,255,.15);color:var(--blue);border:1px solid var(--blue);}
 .badge.on{background:rgba(63,185,80,.2);color:var(--green);border:1px solid var(--green);}
 .badge.off{background:rgba(139,148,158,.2);color:var(--muted);border:1px solid var(--muted);}
 .badge.pre{background:rgba(210,153,34,.2);color:var(--yellow);border:1px solid var(--yellow);}
@@ -67,6 +80,20 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:var(--bg);color:
 .balance-card .total{font-size:1.3rem;font-weight:700;}
 .balance-row{display:flex;justify-content:space-between;font-size:.75rem;
   color:var(--muted);margin-top:6px;}
+
+/* ── 손익현황 카드 ── */
+.pnl-card{background:var(--surface2);border:1px solid var(--border);
+  border-radius:10px;padding:14px;}
+.pnl-card .pnl-title{font-size:.7rem;color:var(--muted);margin-bottom:2px;font-weight:600;letter-spacing:.3px;}
+.pnl-card .pnl-main{font-size:1.25rem;font-weight:800;margin-bottom:6px;}
+.pnl-row{display:flex;justify-content:space-between;font-size:.74rem;padding:3px 0;
+  border-bottom:1px solid rgba(255,255,255,.04);color:var(--muted);}
+.pnl-row:last-child{border-bottom:none;}
+.pnl-row .pv{font-weight:600;color:var(--text);}
+.pv.up{color:var(--red)!important;}.pv.dn{color:var(--blue)!important;}.pv.eq{color:var(--muted)!important;}
+/* 총자산 분해 토글 */
+#asset-detail-body{display:none;margin-top:6px;padding-top:6px;
+  border-top:1px solid rgba(255,255,255,.07);}
 
 /* ── 관심종목 ── */
 .wl-item{display:flex;align-items:center;justify-content:space-between;
@@ -138,11 +165,42 @@ canvas{width:100%!important;}
 
 /* ── 로그 ── */
 .log-area{background:#0d1117;border:1px solid var(--border);border-radius:8px;
-  padding:12px;height:240px;overflow-y:auto;font-family:monospace;font-size:.76rem;}
-.log-entry{margin-bottom:3px;line-height:1.5;}
+  padding:12px;height:360px;overflow-y:auto;font-family:monospace;font-size:.76rem;}
+.log-entry{margin-bottom:4px;line-height:1.5;}
 .log-entry .t{color:var(--muted);}
 .log-buy{color:var(--green);} .log-sell{color:var(--blue);}
 .log-error{color:var(--red);} .log-info{color:var(--text);}
+/* 주문실패 상세 블록 */
+.log-detail-block{
+  display:none;margin-top:4px;margin-left:70px;
+  padding:6px 10px;border-left:3px solid var(--red);
+  background:rgba(248,81,73,.08);border-radius:0 4px 4px 0;
+  font-size:.72rem;color:#f0b0a0;white-space:pre-wrap;word-break:break-all;
+  cursor:pointer;
+}
+.log-detail-block.collapsed{display:none;}
+.log-fail-toggle{
+  cursor:pointer;font-size:.68rem;color:var(--muted);
+  border:1px solid var(--border);border-radius:3px;
+  padding:1px 5px;margin-left:6px;background:var(--surface2);
+}
+/* ── V2 로그 구분 ── */
+.log-v2{color:#bc8cff;}  /* 보라: V2 일반 */
+.log-v2-buy{color:#3fb950;font-weight:700;}  /* 초록: 매수 */
+.log-v2-sell{color:#58a6ff;font-weight:700;}  /* 파랑: 매도 */
+.log-v2-open{color:#e3b341;font-weight:700;}  /* 노랑: 개장 */
+.log-v2-profit{color:#f0e040;font-weight:700;}  /* 금색: 목표달성 */
+.log-v2-close{color:#8b949e;}  /* 회색: 장종료 */
+.log-v2-status{color:#58a6ff;}  /* 파랑: 상태 */
+.log-v2-badge{display:inline-block;padding:0 4px;border-radius:3px;
+  background:rgba(188,140,255,.15);color:#bc8cff;font-size:.68rem;
+  margin-right:4px;border:1px solid rgba(188,140,255,.3);}
+
+/* ── 로그 필터 버튼 ── */
+.log-filter-btn{padding:2px 8px;background:var(--surface2);border:1px solid var(--border);
+  border-radius:4px;color:var(--muted);cursor:pointer;font-size:.7rem;transition:all .15s;}
+.log-filter-btn.active{background:rgba(88,166,255,.15);border-color:var(--blue);color:var(--blue);}
+.log-filter-btn:hover{border-color:var(--blue);color:var(--blue);}
 
 /* ── 테이블 ── */
 .table-wrap{overflow-x:auto;}
@@ -185,15 +243,52 @@ tr:hover td{background:rgba(88,166,255,.03);}
 <div class="header">
   <h1>📈 피라미딩 자동매매 시스템</h1>
   <div class="right">
-    <span class="badge {{ 'real' if is_real else 'virt' }}">
-      {{ '🔴 실전' if is_real else '📊 모의' }}
-    </span>
+    <!-- 빌드 정보 배지 -->
+    <div id="build-badge" title="운영 인스턴스 정보">
+      <span>Build</span>
+      <span class="bb-commit" id="bb-commit">...</span>
+      <span style="color:var(--border)">|</span>
+      <span>PID</span>
+      <span class="bb-pid" id="bb-pid">...</span>
+      <span style="color:var(--border)">|</span>
+      <span class="bb-time" id="bb-time">...</span>
+    </div>
+    <!-- 실전투자 고정 배지 -->
+    <span class="badge real" title="실전투자 전용 시스템">🔴 실전투자</span>
     <span class="badge off" id="bot-badge">⏹ 정지</span>
     <span id="clock" style="font-size:.78rem;color:var(--muted);font-family:monospace"></span>
     <a href="/screener" style="padding:4px 10px;border-radius:6px;font-size:.78rem;color:var(--blue);text-decoration:none;border:1px solid var(--blue);background:rgba(88,166,255,.07)">🔍 스크리너</a>
     <a href="/lab" style="padding:4px 10px;border-radius:6px;font-size:.78rem;color:var(--purple);text-decoration:none;border:1px solid var(--purple);background:rgba(188,140,255,.07)">🧪 실험실</a>
     <a href="/setup" style="font-size:.75rem;color:var(--muted);text-decoration:none">⚙️</a>
   </div>
+</div>
+
+<!-- ══ V2 LIVE 상태 패널 ══════════════════════════════════════════ -->
+<div id="v2-panel" style="
+  background:#0a1628;
+  border-bottom:2px solid #1f4080;
+  padding:8px 20px;
+  font-size:0.78rem;
+  font-family:monospace;
+  display:flex;
+  flex-wrap:wrap;
+  gap:16px;
+  align-items:center;
+">
+  <span style="font-weight:700;color:#58a6ff;font-size:.82rem;">⚡ V2 ENGINE</span>
+  <span>모드: <strong id="v2-mode" style="color:#f85149">확인중...</strong></span>
+  <span>V1루프: <strong id="v2-v1loop" style="color:#8b949e">-</strong></span>
+  <span>V2루프: <strong id="v2-v2loop" style="color:#8b949e">-</strong></span>
+  <span>PID: <span id="v2-pid" style="color:#3fb950">-</span></span>
+  <span>Commit: <span id="v2-commit" style="color:#58a6ff">-</span></span>
+  <span>시작: <span id="v2-start" style="color:#8b949e">-</span></span>
+  <span>총자산: <strong id="v2-asset" style="color:#3fb950">-</strong></span>
+  <span style="font-size:.78rem;color:#8b949e">└ 국내예수금: <span id="v2-kr-cash" style="color:#c9d1d9">-</span> | 국내평가: <span id="v2-kr-eval" style="color:#c9d1d9">-</span> | 외화예수금: <span id="v2-us-cash" style="color:#c9d1d9">-</span> | 해외평가: <span id="v2-us-eval" style="color:#c9d1d9">-</span></span>
+  <span>주문가능: <span id="v2-orderable">-</span></span>
+  <span>KR손익: <strong id="v2-pnl-kr">-</strong></span>
+  <span>US손익: <strong id="v2-pnl-us">-</strong></span>
+  <span>당일거래: <span id="v2-trades">-</span>회</span>
+  <span>수익목표: <span style="color:#d29922">KR+30만 / US+30만</span></span>
 </div>
 
 <!-- 세션바 -->
@@ -232,22 +327,73 @@ tr:hover td{background:rgba(88,166,255,.03);}
   <div>
     <div class="sb-title">💳 계좌 잔고</div>
     <div class="balance-card">
-      <div class="lbl" style="font-size:.7rem;color:var(--muted)">총 평가금액</div>
+      <div class="lbl" style="font-size:.7rem;color:var(--muted)">총 평가금액 <span style="font-size:.64rem;color:var(--muted);">(MTS 총자산)</span></div>
       <div class="total" id="total-eval">—</div>
       <div id="total-profit" class="v-green" style="font-size:.85rem;margin-top:3px">—</div>
+      <div class="balance-row"><span>보유평가</span><span id="scts-eval">—</span></div>
       <div class="balance-row"><span>예수금</span><span id="cash">—</span></div>
+      <div class="balance-row"><span>전일정산</span><span id="prev-settle">—</span></div>
       <div class="balance-row"><span>보유종목</span><span id="hold-cnt">—</span></div>
     </div>
   </div>
 
+  <!-- 손익현황 -->
+  <div>
+    <div class="sb-title">📊 손익현황</div>
+    <div class="pnl-card">
+      <!-- 누적복리수익률 (핵심 지표) -->
+      <div class="pnl-title">누적복리수익률</div>
+      <div class="pnl-main" id="pnl-cumulative-ret">—</div>
+
+      <!-- 총자산 요약 -->
+      <div class="pnl-row">
+        <span>초기기준자산</span>
+        <span class="pv" id="pnl-initial-asset">—</span>
+      </div>
+      <div class="pnl-row">
+        <span>현재총자산</span>
+        <span class="pv" id="pnl-total-eval">—</span>
+      </div>
+
+      <!-- 손익 분리 (절대 혼합 금지) -->
+      <div class="pnl-row" style="margin-top:4px;padding-top:4px;border-top:1px solid rgba(255,255,255,.07);">
+        <span>실현손익 <span style="font-size:.62rem;color:var(--muted);">(매도완료)</span></span>
+        <span class="pv" id="pnl-realized">—</span>
+      </div>
+      <div class="pnl-row">
+        <span>평가손익 <span style="font-size:.62rem;color:var(--muted);">(보유기준)</span></span>
+        <span class="pv" id="pnl-unrealized">—</span>
+      </div>
+      <div class="pnl-row">
+        <span>일일손익</span>
+        <span class="pv" id="pnl-daily">—</span>
+      </div>
+      <div class="pnl-row" style="margin-top:4px;padding-top:4px;border-top:1px solid rgba(255,255,255,.07);">
+        <span>총수익률</span>
+        <span class="pv" id="pnl-total-return">—</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- 시장 국면 배지 -->
+  <div style="margin-bottom:8px;padding:8px 10px;background:var(--surface2);border-radius:8px;border:1px solid var(--border);">
+    <div style="font-size:.7rem;color:var(--muted);margin-bottom:4px;">📍 시장 국면</div>
+    <div id="sb-regime-badge" style="font-size:.82rem;font-weight:700;color:var(--yellow);">— 로딩 중...</div>
+    <div id="sb-regime-weights" style="margin-top:6px;font-size:.68rem;color:var(--muted);line-height:1.6;"></div>
+  </div>
+
   <!-- 관심종목 -->
   <div style="flex:1">
-    <div class="sb-title">📋 관심 종목</div>
+    <div class="sb-title">📋 관심 종목 <span id="sb-wl-counts" style="font-size:.68rem;color:var(--muted);font-weight:400;"></span></div>
     <div id="wl-container"></div>
-    <div class="add-form">
-      <input id="add-code" placeholder="종목코드" maxlength="6">
-      <input id="add-name" placeholder="종목명" style="max-width:80px">
-      <button onclick="addStock()">+</button>
+    <div class="add-form" style="display:flex;flex-direction:column;gap:6px;margin-top:8px;">
+      <div style="display:flex;gap:4px;">
+        <input id="add-code" placeholder="종목코드 (예:005930)" maxlength="6" style="flex:1;padding:7px 8px;border-radius:6px;border:1px solid #444;background:#1e1e2e;color:#fff;font-size:0.85rem;">
+        <input id="add-name" placeholder="종목명" style="flex:1;padding:7px 8px;border-radius:6px;border:1px solid #444;background:#1e1e2e;color:#fff;font-size:0.85rem;">
+      </div>
+      <button onclick="addStock()" style="width:100%;padding:9px;background:linear-gradient(135deg,#2ecc71,#27ae60);color:#fff;border:none;border-radius:8px;font-size:0.95rem;font-weight:700;cursor:pointer;letter-spacing:0.5px;">
+        ＋ 관심종목 추가
+      </button>
     </div>
   </div>
 </aside>
@@ -282,17 +428,104 @@ tr:hover td{background:rgba(88,166,255,.03);}
       <div class="val" id="stat-session" style="font-size:1rem">—</div>
       <div class="sub" id="stat-interval">점검주기 자동</div>
     </div>
+    <div class="stat-card">
+      <div class="lbl">시장 국면</div>
+      <div class="val" id="stat-regime" style="font-size:.95rem">—</div>
+      <div class="sub" id="stat-regime-sub">ETF 전략 자동 전환</div>
+    </div>
+    <div class="stat-card">
+      <div class="lbl">ETF 관심종목</div>
+      <div class="val v-orange" id="stat-etf-watch">0개</div>
+      <div class="sub" id="stat-etf-sub">레버리지·인버스 포함</div>
+    </div>
   </div>
 
-  <!-- 피라미딩 포지션 시각화 -->
-  <div class="pyramid-container">
-    <h2>🔺 피라미딩 포지션 현황
+  <!-- 자산배분 현황 패널 (국면별 ETF 전략) -->
+  <div class="pyramid-container" id="allocation-panel" style="display:none">
+    <h2>🎯 자산배분 현황
       <span style="font-size:.72rem;color:var(--muted);font-weight:400">
-        1단계 25% → 2단계+2% → 3단계+4% → 4단계+6%
+        국면별 ETF·레버리지·인버스 자동 전환
+      </span>
+      <span id="alloc-regime-badge" style="margin-left:8px;padding:3px 10px;border-radius:12px;font-size:.72rem;font-weight:700;"></span>
+    </h2>
+    <div id="allocation-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;margin-top:4px;"></div>
+    <div id="etf-watchlist-section" style="margin-top:12px;"></div>
+  </div>
+
+  <!-- 실제 계좌 보유현황 (KIS 증권사 실시간) -->
+  <div class="pyramid-container" id="kis-holdings-section">
+    <h2>💼 실제 계좌 보유현황
+      <span style="font-size:.72rem;color:var(--muted);font-weight:400">
+        KIS 증권사 실시간 · <span id="holdings-updated">로딩 중...</span>
+      </span>
+      <button onclick="loadHoldings()" style="margin-left:auto;padding:4px 10px;font-size:.72rem;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);cursor:pointer;">🔄 새로고침</button>
+    </h2>
+    <div id="kis-holdings-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;padding:4px 0;">
+      <div style="color:var(--muted);padding:20px;text-align:center">로딩 중...</div>
+    </div>
+  </div>
+
+  <!-- 피라미딩 포지션 시각화 (봇이 직접 매수한 종목) -->
+  <div class="pyramid-container">
+    <h2>🔺 봇 피라미딩 포지션
+      <span style="font-size:.72rem;color:var(--muted);font-weight:400">
+        봇이 직접 매수한 종목만 표시 · 1단계 25% → 2단계+2% → 3단계+4% → 4단계+6%
       </span>
     </h2>
     <div class="pyramid-grid" id="pyramid-grid">
-      <div style="color:var(--muted);padding:20px;text-align:center">보유 포지션 없음</div>
+      <div style="color:var(--muted);padding:20px;text-align:center">봇이 매수한 포지션이 없습니다</div>
+    </div>
+  </div>
+
+  <!-- ★ 해외주식 섹션 -->
+  <div class="pyramid-container" id="us-section">
+    <h2>🇺🇸 해외주식 (미국)
+      <span id="us-session-badge" style="margin-left:8px;padding:3px 10px;border-radius:12px;font-size:.72rem;font-weight:700;background:#1a3a5c;color:#58a6ff;">로딩 중</span>
+      <span style="font-size:.72rem;color:var(--muted);font-weight:400;margin-left:8px">ET 09:30~16:00 자동매매</span>
+      <button onclick="loadUSBalance()" style="margin-left:auto;padding:4px 10px;font-size:.72rem;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);cursor:pointer;">🔄 잔고</button>
+    </h2>
+
+    <!-- 해외 잔고 요약 -->
+    <div id="us-balance-bar" style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px;padding:10px 14px;background:var(--surface2);border-radius:8px;font-size:.8rem;">
+      <span>💵 예수금: <b id="us-cash">—</b></span>
+      <span>📊 평가금: <b id="us-eval">—</b></span>
+      <span>📈 손익: <b id="us-pnl">—</b></span>
+      <span>💱 환율: <b id="us-rate">—</b></span>
+    </div>
+
+    <!-- 해외 보유 종목 -->
+    <div id="us-holdings-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;margin-bottom:16px;">
+      <div style="color:var(--muted);font-size:.82rem;padding:12px">보유 해외주식 없음</div>
+    </div>
+
+    <!-- 해외 피라미딩 포지션 (봇 관리) -->
+    <div style="margin-top:4px;">
+      <div style="font-size:.8rem;font-weight:700;color:var(--muted);margin-bottom:8px;">🔺 봇 US 포지션</div>
+      <div id="us-pyramid-grid" class="pyramid-grid">
+        <div style="color:var(--muted);font-size:.82rem;padding:12px">US 봇 포지션 없음</div>
+      </div>
+    </div>
+
+    <!-- 해외 관심종목 -->
+    <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:12px;">
+      <div style="font-size:.8rem;font-weight:700;color:var(--muted);margin-bottom:8px;">📋 해외 관심종목</div>
+      <div id="us-watchlist-container" style="display:flex;flex-direction:column;gap:6px;margin-bottom:10px;max-height:240px;overflow-y:auto;"></div>
+      <div style="display:flex;gap:6px;margin-top:8px;">
+        <input id="us-symbol-input" placeholder="티커 (예: NVDA)" style="flex:1;padding:7px 10px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.82rem;">
+        <input id="us-name-input"   placeholder="종목명 (예: 엔비디아)" style="flex:1.2;padding:7px 10px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.82rem;">
+        <select id="us-excd-input" style="padding:7px 8px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.82rem;">
+          <option value="NASD">나스닥</option>
+          <option value="NYSE">NYSE</option>
+          <option value="AMEX">AMEX</option>
+        </select>
+        <button onclick="addUSStock()" style="padding:7px 14px;background:linear-gradient(135deg,#1a6be0,#0d4ea6);color:#fff;border:none;border-radius:6px;font-size:.82rem;font-weight:700;cursor:pointer;">＋ 추가</button>
+      </div>
+    </div>
+
+    <!-- 해외 신호 -->
+    <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:12px;">
+      <div style="font-size:.8rem;font-weight:700;color:var(--muted);margin-bottom:8px;">📡 US 매매 신호</div>
+      <div id="us-signals-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:8px;"></div>
     </div>
   </div>
 
@@ -300,10 +533,93 @@ tr:hover td{background:rgba(88,166,255,.03);}
   <div class="panel">
     <div class="tabs">
       <div class="tab active" onclick="showTab('tab-chart',this)">📊 차트</div>
+      <div class="tab" onclick="showTab('tab-us',this);loadUSMarket()">🇺🇸 미국증시</div>
       <div class="tab" onclick="showTab('tab-indicator',this)">🎯 지표 검증</div>
       <div class="tab" onclick="showTab('tab-trades',this)">📜 거래내역</div>
       <div class="tab" onclick="showTab('tab-backtest',this)">🧪 백테스트</div>
+      <div class="tab" onclick="showTab('tab-review',this);loadDailyReview()">📋 복기</div>
       <div class="tab" onclick="showTab('tab-logs',this)">📡 로그</div>
+    </div>
+
+    <!-- 🇺🇸 미국 증시 탭 -->
+    <div id="tab-us" style="display:none;padding:16px">
+
+      <!-- 헤더: 분석시각 + 수동실행 -->
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:8px;">
+        <div>
+          <span style="font-size:1rem;font-weight:700;">🇺🇸 미국 증시 야간 분석</span>
+          <span id="us-analyzed-at" style="font-size:.72rem;color:var(--muted);margin-left:10px;">—</span>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <span id="us-regime-badge" style="padding:4px 12px;border-radius:20px;font-size:.75rem;font-weight:700;">—</span>
+          <button onclick="runUSMarket()" id="btn-us-run"
+            style="padding:6px 14px;background:var(--surface2);border:1px solid var(--blue);border-radius:6px;color:var(--blue);cursor:pointer;font-size:.8rem;font-weight:600;">
+            ▶ 즉시 분석
+          </button>
+        </div>
+      </div>
+
+      <!-- 한국 시장 영향 예측 -->
+      <div id="us-korea-impact" style="background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:16px;display:none;">
+        <div style="font-size:.72rem;color:var(--muted);margin-bottom:6px;">📌 내일 한국 시장 예측</div>
+        <div id="us-korea-text" style="font-size:.95rem;font-weight:700;"></div>
+        <div id="us-korea-reason" style="font-size:.78rem;color:var(--muted);margin-top:4px;"></div>
+        <div id="us-semicon-note" style="font-size:.78rem;color:var(--yellow);margin-top:4px;"></div>
+      </div>
+
+      <!-- 주요 지수 -->
+      <div style="margin-bottom:16px;">
+        <div style="font-size:.72rem;color:var(--muted);font-weight:700;letter-spacing:1px;text-transform:uppercase;margin-bottom:8px;">주요 지수</div>
+        <div id="us-indices" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:8px;"></div>
+      </div>
+
+      <!-- 섹터 강도 -->
+      <div style="margin-bottom:16px;">
+        <div style="font-size:.72rem;color:var(--muted);font-weight:700;letter-spacing:1px;text-transform:uppercase;margin-bottom:8px;">섹터별 강도</div>
+        <div id="us-sectors" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:6px;"></div>
+      </div>
+
+      <!-- 매수 TOP10 -->
+      <div>
+        <div style="font-size:.72rem;color:var(--muted);font-weight:700;letter-spacing:1px;text-transform:uppercase;margin-bottom:8px;">🔺 매수 신호 TOP 10</div>
+        <div style="overflow-x:auto;">
+          <table style="width:100%;border-collapse:collapse;font-size:.8rem;">
+            <thead>
+              <tr style="color:var(--muted);border-bottom:1px solid var(--border);">
+                <th style="padding:8px 6px;text-align:left;">종목</th>
+                <th style="padding:8px 6px;text-align:right;">현재가</th>
+                <th style="padding:8px 6px;text-align:right;">등락</th>
+                <th style="padding:8px 6px;text-align:right;">점수</th>
+                <th style="padding:8px 6px;text-align:right;">RSI</th>
+                <th style="padding:8px 6px;text-align:right;">MACD</th>
+                <th style="padding:8px 6px;text-align:right;">52주고점대비</th>
+                <th style="padding:8px 6px;text-align:center;">신호</th>
+              </tr>
+            </thead>
+            <tbody id="us-top-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- 전체 종목 분석 -->
+      <div style="margin-top:16px;">
+        <div style="font-size:.72rem;color:var(--muted);font-weight:700;letter-spacing:1px;text-transform:uppercase;margin-bottom:8px;">전체 종목 분석</div>
+        <div style="overflow-x:auto;">
+          <table style="width:100%;border-collapse:collapse;font-size:.78rem;">
+            <thead>
+              <tr style="color:var(--muted);border-bottom:1px solid var(--border);">
+                <th style="padding:6px;text-align:left;">종목</th>
+                <th style="padding:6px;text-align:right;">현재가</th>
+                <th style="padding:6px;text-align:right;">등락</th>
+                <th style="padding:6px;text-align:right;">점수</th>
+                <th style="padding:6px;text-align:right;">RSI</th>
+                <th style="padding:6px;text-align:center;">신호</th>
+              </tr>
+            </thead>
+            <tbody id="us-all-tbody"></tbody>
+          </table>
+        </div>
+      </div>
     </div>
 
     <!-- 차트 -->
@@ -393,11 +709,61 @@ tr:hover td{background:rgba(88,166,255,.03);}
       </div>
     </div>
 
+    <!-- 📋 DAILY REVIEW 복기 탭 -->
+    <div id="tab-review" style="display:none;padding:4px 0">
+
+      <!-- 헤더 -->
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px;">
+        <span style="font-size:.95rem;font-weight:700;">📋 일일 복기 (DAILY_REVIEW)</span>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <select id="review-market-sel"
+            style="padding:4px 8px;background:var(--surface2);border:1px solid var(--border);border-radius:5px;color:var(--text);font-size:.78rem;">
+            <option value="ALL">전체</option>
+            <option value="KR">KR 한국</option>
+            <option value="US">US 미국</option>
+          </select>
+          <select id="review-limit-sel"
+            style="padding:4px 8px;background:var(--surface2);border:1px solid var(--border);border-radius:5px;color:var(--text);font-size:.78rem;">
+            <option value="10">최근 10일</option>
+            <option value="30" selected>최근 30일</option>
+            <option value="60">최근 60일</option>
+            <option value="100">최근 100일</option>
+          </select>
+          <button onclick="loadDailyReview()"
+            style="padding:5px 12px;background:var(--surface2);border:1px solid var(--blue);border-radius:5px;color:var(--blue);cursor:pointer;font-size:.78rem;font-weight:600;">
+            🔄 새로고침
+          </button>
+        </div>
+      </div>
+
+      <!-- 최신 요약 카드 (KR / US) -->
+      <div id="review-latest-cards" style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px;"></div>
+
+      <!-- 히스토리 목록 -->
+      <div id="review-list" style="display:flex;flex-direction:column;gap:10px;"></div>
+      <div id="review-empty" style="display:none;text-align:center;color:var(--muted);padding:40px;font-size:.85rem;">
+        복기 데이터가 없습니다. 장 종료 후 자동 생성됩니다.
+      </div>
+    </div>
+
     <!-- 로그 -->
     <div id="tab-logs" style="display:none">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-        <span style="font-size:.76rem;color:var(--muted)">실시간 매매 로그</span>
-        <button onclick="document.getElementById('log-area').innerHTML=''" style="padding:3px 9px;background:var(--surface2);border:1px solid var(--border);border-radius:4px;color:var(--muted);cursor:pointer;font-size:.72rem">지우기</button>
+      <!-- 로그 탭 헤더 -->
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:6px;">
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span style="font-size:.76rem;color:var(--muted)">📡 V1+V2 통합 로그</span>
+          <span id="log-src-badge" style="font-size:.68rem;padding:1px 6px;border-radius:3px;background:rgba(63,185,80,.15);color:#3fb950;border:1px solid rgba(63,185,80,.3);">●LIVE</span>
+        </div>
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+          <!-- 필터 버튼 -->
+          <button onclick="setLogFilter('ALL')"  id="logf-all"  class="log-filter-btn active">전체</button>
+          <button onclick="setLogFilter('V2')"   id="logf-v2"   class="log-filter-btn">V2만</button>
+          <button onclick="setLogFilter('BUY')"  id="logf-buy"  class="log-filter-btn">매수</button>
+          <button onclick="setLogFilter('SELL')" id="logf-sell" class="log-filter-btn">매도</button>
+          <button onclick="setLogFilter('ERR')"  id="logf-err"  class="log-filter-btn">오류</button>
+          <button onclick="fetchMergedLogs()" style="padding:3px 9px;background:var(--surface2);border:1px solid var(--blue);border-radius:4px;color:var(--blue);cursor:pointer;font-size:.72rem;">🔄 새로고침</button>
+          <button onclick="clearLogArea()" style="padding:3px 9px;background:var(--surface2);border:1px solid var(--border);border-radius:4px;color:var(--muted);cursor:pointer;font-size:.72rem;">지우기</button>
+        </div>
       </div>
       <div class="log-area" id="log-area"></div>
     </div>
@@ -432,8 +798,25 @@ function applySession(s){
   }
   const sec=s.check_sec||300;
   setTxt('sess-chk', `점검: ${sec>=60?Math.round(sec/60)+'분':sec+'초'}마다`);
-  setTxt('stat-session', (s.icon||'')+(s.session||''));
-  setTxt('stat-interval', `${sec>=60?Math.round(sec/60)+'분':sec+'초'}마다 점검`);
+  // 상단 세션 카드: 미국 정규장 중이면 미국장 정보 우선 표시
+  (async ()=>{
+    try{
+      const us=await fetch('/api/us/session').then(r=>r.json());
+      const el=document.getElementById('stat-session');
+      const el2=document.getElementById('stat-interval');
+      if(us&&us.tradeable){
+        if(el) el.innerHTML=`<span style="font-size:.75rem;color:var(--muted);display:block">🇰🇷 ${s.icon||''}${s.session||''}</span>`
+                           +`<span style="color:var(--green)">🇺🇸 미국정규장</span>`;
+        if(el2) el2.textContent=`ET ${us.time_et||''} · 5분마다 점검`;
+      } else {
+        if(el) el.textContent=(s.icon||'')+(s.session||'');
+        if(el2) el2.textContent=`${sec>=60?Math.round(sec/60)+'분':sec+'초'}마다 점검`;
+      }
+    } catch(e){
+      setTxt('stat-session', (s.icon||'')+(s.session||''));
+      setTxt('stat-interval', `${sec>=60?Math.round(sec/60)+'분':sec+'초'}마다 점검`);
+    }
+  })();
   // 프로그레스바
   const fill=document.getElementById('sess-fill');
   if(fill){
@@ -467,20 +850,82 @@ function updateBotUI(){
 }
 
 // ── 잔고 ───────────────────────────────────────────────────
+// ── 잔고 (balance-card) ────────────────────────────────────
 async function loadBalance(){
   try{
     const d=await fetch('/api/balance').then(r=>r.json());
     if(d.error) return;
+    // 총평가금액 (MTS 총자산 = tot_evlu_amt)
     document.getElementById('total-eval').textContent=(d.total_eval||0).toLocaleString()+'원';
+    // 평가손익
     const p=d.total_profit||0;
     const pe=document.getElementById('total-profit');
-    pe.textContent=(p>=0?'+':'')+p.toLocaleString()+'원';
+    pe.textContent=(p>=0?'+':'')+p.toLocaleString()+'원 (평가손익)';
     pe.className=p>=0?'v-green':'v-red';
+    // 보유평가 / 예수금 / 전일정산 / 보유종목수
+    const se=document.getElementById('scts-eval');
+    if(se) se.textContent=(d.scts_eval||0).toLocaleString()+'원';
     document.getElementById('cash').textContent=(d.cash||0).toLocaleString()+'원';
+    const ps=document.getElementById('prev-settle');
+    if(ps) ps.textContent=(d.prev_sell_settle||0).toLocaleString()+'원';
     document.getElementById('hold-cnt').textContent=(d.holdings||[]).length+'종목';
   }catch(e){}
 }
 setInterval(loadBalance,30000); loadBalance();
+
+// ── 손익현황 (pnl-card) ──────────────────────────────────
+function fmtPnl(v){
+  const n=Math.round(v||0);
+  return (n>=0?'+':'')+n.toLocaleString()+'원';
+}
+function fmtPct(v){
+  const n=(v||0);
+  return (n>=0?'+':'')+n.toFixed(2)+'%';
+}
+function pnlCls(v){ return (v||0)>=0?'up':'dn'; }
+
+async function loadAssetSummary(){
+  try{
+    const d=await fetch('/api/asset-summary').then(r=>r.json());
+    if(d.error) return;
+
+    // 누적복리수익률 (핵심 지표)
+    const cr=d.cumulative_ret||0;
+    const crEl=document.getElementById('pnl-cumulative-ret');
+    if(crEl){
+      crEl.textContent=fmtPct(cr);
+      crEl.className='pnl-main pv '+(cr>=0?'up':'dn');
+    }
+
+    // 초기자산 / 현재총자산
+    setTxtClass('pnl-initial-asset', (d.initial_asset||0).toLocaleString()+'원', '');
+    setTxtClass('pnl-total-eval',    (d.total_eval||0).toLocaleString()+'원', '');
+
+    // 실현손익 (매도완료 기준, 절대 평가손익과 혼합 금지)
+    setTxtClass('pnl-realized',   fmtPnl(d.realized_pnl),  pnlCls(d.realized_pnl));
+    // 평가손익 (보유종목 기준)
+    setTxtClass('pnl-unrealized', fmtPnl(d.unrealized_pnl), pnlCls(d.unrealized_pnl));
+    // 일일손익
+    setTxtClass('pnl-daily',      fmtPnl(d.daily_pnl),     pnlCls(d.daily_pnl));
+    // 총수익률
+    setTxtClass('pnl-total-return', fmtPct(d.total_return), pnlCls(d.total_return));
+
+    // 상단 stat 카드 → 오늘 실현손익 동기화
+    const pe=document.getElementById('stat-today-profit');
+    if(pe){
+      const rp=d.realized_pnl||0;
+      pe.textContent=(rp>=0?'+':'')+Math.round(rp).toLocaleString()+'원';
+      pe.className='val '+(rp>=0?'v-green':'v-red');
+    }
+  }catch(e){}
+}
+function setTxtClass(id,txt,cls){
+  const el=document.getElementById(id);
+  if(!el)return;
+  el.textContent=txt;
+  if(cls) el.className='pv '+cls;
+}
+setInterval(loadAssetSummary, 30000); loadAssetSummary();
 
 // 복리풀
 async function loadCompound(){
@@ -492,24 +937,339 @@ async function loadCompound(){
   }catch(e){}
 }
 setInterval(loadCompound,15000); loadCompound();
-socket.on('balance_update', ()=>loadBalance());
 
-// ── 로그 ───────────────────────────────────────────────────
-socket.on('log',e=>addLog(e));
-socket.on('log_history',ls=>ls.forEach(l=>addLog(l)));
-function addLog(e){
+// ── 빌드 배지 (시작 시 1회 조회) ────────────────────────────
+(async function loadBuildInfo(){
+  try{
+    const b = await fetch('/api/build').then(r=>r.json());
+    document.getElementById('bb-commit').textContent = b.commit || '?';
+    document.getElementById('bb-pid').textContent    = b.pid    || '?';
+    // started: "2026-06-11 07:59:35" → "07:59" 만 표시
+    const t = (b.started||'').split(' ')[1]||b.started||'?';
+    document.getElementById('bb-time').textContent   = t.substring(0,5);
+    document.getElementById('build-badge').title =
+      `Build=${b.commit}  PID=${b.pid}  Started=${b.started}`;
+  }catch(e){
+    document.getElementById('bb-commit').textContent='err';
+  }
+})();
+socket.on('balance_update', ()=>{ loadBalance(); loadAssetSummary(); });
+
+// ★ 스크리닝 완료 → 관심종목 + 국면 실시간 갱신
+socket.on('watchlist_updated', d=>{
+  renderWatchList();
+  // 국면 변경 시 즉시 배지 업데이트
+  if(d && d.regime){
+    const rc=d.regime==='BULL'?'var(--green)':d.regime==='BEAR'?'var(--red)':'var(--yellow)';
+    const rt={'BULL':'📈 BULL (상승장)','BEAR':'📉 BEAR (하락장)','LATERAL':'➡️ LATERAL (횡보장)'}[d.regime]||d.regime;
+    const sb=document.getElementById('sb-regime-badge');
+    if(sb){sb.textContent=rt;sb.style.color=rc;}
+  }
+});
+socket.on('screen_done', d=>{
+  const cnt=d.summary?.buy_candidate||0;
+  const ecnt=d.summary?.etf_buy_candidate||0;
+  const regime=d.regime||'';
+  addLog({time:new Date().toLocaleTimeString('ko-KR'),
+    msg:`📊 스크리닝 완료 — 주식후보 ${cnt}개 / ETF후보 ${ecnt}개 / 국면:${regime}`,level:'info'});
+  renderWatchList();
+});
+
+// ── 🇺🇸 미국 증시 분석 ────────────────────────────────────
+function _renderUSData(data){
+  if(!data || data.error) return;
+  const s   = data.summary   || {};
+  const ki  = data.korea_impact || {};
+  const now = data.analyzed_at || '—';
+
+  // 분석 시각
+  document.getElementById('us-analyzed-at').textContent = now + ' 기준';
+
+  // 국면 배지
+  const rb = document.getElementById('us-regime-badge');
+  const regime = s.regime || '—';
+  const regColor = regime==='BULL'?'rgba(63,185,80,.2)':regime==='BEAR'?'rgba(248,81,73,.2)':'rgba(210,153,34,.2)';
+  const regBorder= regime==='BULL'?'var(--green)':regime==='BEAR'?'var(--red)':'var(--yellow)';
+  const regText  = regime==='BULL'?'var(--green)':regime==='BEAR'?'var(--red)':'var(--yellow)';
+  rb.style.cssText=`padding:4px 12px;border-radius:20px;font-size:.75rem;font-weight:700;background:${regColor};border:1px solid ${regBorder};color:${regText}`;
+  rb.textContent = {'BULL':'📈 BULL (상승장)','BEAR':'📉 BEAR (하락장)','LATERAL':'➡️ LATERAL (횡보장)'}[regime]||regime;
+
+  // 한국 시장 영향
+  const kSec = document.getElementById('us-korea-impact');
+  kSec.style.display='block';
+  const dirColor = ki.emoji==='🟢'?'var(--green)':ki.emoji==='🔴'?'var(--red)':'var(--yellow)';
+  document.getElementById('us-korea-text').innerHTML =
+    `<span style="color:${dirColor}">${ki.emoji||''} ${ki.direction||''}</span>` +
+    (ki.kospi_est!=null ? ` <span style="color:var(--muted);font-size:.8rem;font-weight:400">| 코스피 예상 ${ki.kospi_est>=0?'+':''}${ki.kospi_est}%</span>` : '');
+  document.getElementById('us-korea-reason').textContent  = ki.reason  || '';
+  document.getElementById('us-semicon-note').textContent  = ki.semicon_note || '';
+
+  // 주요 지수
+  const indDiv = document.getElementById('us-indices');
+  const indices = data.indices || {};
+  indDiv.innerHTML = Object.entries(indices).map(([sym,v])=>{
+    const up = v.pct_1d >= 0;
+    const c  = up ? 'var(--red)' : 'var(--blue)';
+    return `<div style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:10px;">
+      <div style="font-size:.7rem;color:var(--muted)">${v.emoji||''} ${v.name}</div>
+      <div style="font-size:1rem;font-weight:700;margin:3px 0">${(v.price||0).toLocaleString()}</div>
+      <div style="font-size:.8rem;color:${c};font-weight:700">${up?'+':''}${(v.pct_1d||0).toFixed(2)}%</div>
+    </div>`;
+  }).join('');
+
+  // 섹터 강도
+  const secDiv = document.getElementById('us-sectors');
+  const sectors = Object.values(data.sectors||{}).sort((a,b)=>b.pct_1d-a.pct_1d);
+  secDiv.innerHTML = sectors.map(v=>{
+    const up = v.pct_1d >= 0;
+    const c  = up ? 'var(--red)' : 'var(--blue)';
+    const bw = Math.min(100, Math.abs(v.pct_1d) * 30);
+    return `<div style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 10px;display:flex;align-items:center;gap:8px;">
+      <div style="flex:1;font-size:.78rem;">${v.name}</div>
+      <div style="width:40px;height:6px;background:var(--surface3);border-radius:3px;overflow:hidden">
+        <div style="width:${bw}%;height:100%;background:${c};border-radius:3px;"></div>
+      </div>
+      <div style="font-size:.8rem;font-weight:700;color:${c};width:52px;text-align:right">${up?'+':''}${(v.pct_1d||0).toFixed(2)}%</div>
+    </div>`;
+  }).join('');
+
+  // TOP10 매수후보
+  const topTb = document.getElementById('us-top-tbody');
+  const tops  = data.top_buy || [];
+  if(!tops.length){
+    topTb.innerHTML='<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:16px">매수 신호 종목 없음</td></tr>';
+  } else {
+    topTb.innerHTML = tops.map(t=>{
+      const up  = t.pct_1d >= 0;
+      const pc  = up ? 'var(--red)' : 'var(--blue)';
+      const sig = t.signal==='BUY'?'🟢 BUY':t.signal==='SELL'?'🔴 SELL':'⚪ HOLD';
+      return `<tr style="border-bottom:1px solid var(--border);">
+        <td style="padding:8px 6px;"><b>${t.name}</b><span style="color:var(--muted);font-size:.7rem;margin-left:4px">${t.symbol}</span></td>
+        <td style="padding:8px 6px;text-align:right">$${(t.cur_price||0).toFixed(2)}</td>
+        <td style="padding:8px 6px;text-align:right;color:${pc}">${up?'+':''}${(t.pct_1d||0).toFixed(2)}%</td>
+        <td style="padding:8px 6px;text-align:right;color:var(--yellow);font-weight:700">${t.score||0}</td>
+        <td style="padding:8px 6px;text-align:right;color:${t.rsi>70?'var(--red)':t.rsi<30?'var(--blue)':'var(--text)'}">${t.rsi||'—'}</td>
+        <td style="padding:8px 6px;text-align:right;font-size:.72rem">${t.macd||'—'}</td>
+        <td style="padding:8px 6px;text-align:right;color:var(--muted)">${t.from_high52||0}%</td>
+        <td style="padding:8px 6px;text-align:center;font-size:.78rem">${sig}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  // 전체 종목
+  const allTb = document.getElementById('us-all-tbody');
+  const allStocks = Object.values(data.stocks||{}).sort((a,b)=>b.score-a.score);
+  allTb.innerHTML = allStocks.map(t=>{
+    const up  = (t.pct_1d||0) >= 0;
+    const pc  = up ? 'var(--red)' : 'var(--blue)';
+    const sig = t.signal==='BUY'?'🟢':t.signal==='SELL'?'🔴':'⚪';
+    return `<tr style="border-bottom:1px solid var(--surface3);">
+      <td style="padding:6px;"><b>${t.name||t.symbol}</b><span style="color:var(--muted);font-size:.68rem;margin-left:4px">${t.symbol||''}</span></td>
+      <td style="padding:6px;text-align:right">$${(t.cur_price||0).toFixed(2)}</td>
+      <td style="padding:6px;text-align:right;color:${pc}">${up?'+':''}${(t.pct_1d||0).toFixed(2)}%</td>
+      <td style="padding:6px;text-align:right;color:var(--yellow)">${t.score||0}</td>
+      <td style="padding:6px;text-align:right">${t.rsi||'—'}</td>
+      <td style="padding:6px;text-align:center">${sig}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function loadUSMarket(){
+  try{
+    const data = await fetch('/api/us/status').then(r=>r.json());
+    _renderUSData(data);
+    if(!data || !data.analyzed_at){
+      document.getElementById('us-analyzed-at').textContent='분석 데이터 없음 — ▶ 즉시 분석 클릭';
+    }
+  }catch(e){
+    document.getElementById('us-analyzed-at').textContent='로드 실패';
+  }
+}
+
+async function runUSMarket(){
+  const btn = document.getElementById('btn-us-run');
+  btn.textContent='분석 중...'; btn.disabled=true;
+  try{
+    await fetch('/api/us/run',{method:'POST'});
+    // us_screen_done 소켓 이벤트로 결과 수신
+  }catch(e){
+    btn.textContent='▶ 즉시 분석'; btn.disabled=false;
+  }
+}
+
+// 소켓: 미국 분석 완료 실시간 수신
+socket.on('us_screen_done', d=>{
+  const btn=document.getElementById('btn-us-run');
+  if(btn){btn.textContent='▶ 즉시 분석'; btn.disabled=false;}
+
+  // 기본 로그
+  addLog({time:new Date().toLocaleTimeString('ko-KR'),
+    msg:`🇺🇸 미국 분석 완료 — ${d.summary?.regime} | S&P500 ${d.summary?.sp500_pct>=0?'+':''}${(d.summary?.sp500_pct||0).toFixed(2)}%`,level:'info'});
+
+  // ★ 관심종목 자동 갱신 알림
+  const diff = d.wl_diff||{};
+  const added   = diff.added||[];
+  const removed = diff.removed||[];
+  const kept    = diff.kept||[];
+  if(added.length||removed.length){
+    addLog({time:new Date().toLocaleTimeString('ko-KR'),
+      msg:`🇺🇸 [관심종목 자동 갱신] ➕${added.join(',')||'없음'} ➖${removed.join(',')||'없음'} | 총${(d.watch_list||[]).length}개`,
+      level:'info'});
+    // 토스트 알림
+    const toast=document.createElement('div');
+    toast.style.cssText='position:fixed;bottom:24px;right:24px;background:#238636;color:#fff;'+
+      'padding:12px 18px;border-radius:8px;font-size:.82rem;z-index:9999;max-width:320px;line-height:1.5;'+
+      'box-shadow:0 4px 16px rgba(0,0,0,.4);';
+    toast.innerHTML=`🇺🇸 <b>미국 관심종목 자동 갱신</b><br>`+
+      `➕ 추가: <b>${added.join(', ')||'없음'}</b><br>`+
+      `➖ 제거: <b>${removed.join(', ')||'없음'}</b><br>`+
+      (kept.length?`📌 포지션 유지: ${kept.join(', ')}<br>`:'')+
+      `📋 총 ${(d.watch_list||[]).length}개`;
+    document.body.appendChild(toast);
+    setTimeout(()=>toast.remove(), 8000);
+    // 해외주식 섹션 즉시 갱신
+    fetch('/api/status').then(r=>r.json()).then(st=>renderUSSection(st)).catch(()=>{});
+  }
+  loadUSMarket();  // 미국증시 탭 결과 새로고침
+});
+
+// ── 로그 시스템 ─────────────────────────────────────────────
+// 전체 로그 캐시 (필터링용)
+let _logCache = [];
+let _logFilter = 'ALL';
+let _logPolling = null;
+
+socket.on('log',e=>{ _logCache.push(e); _renderLog(e); });
+socket.on('log_history',ls=>ls.forEach(l=>{ _logCache.push(l); _renderLog(l); }));
+
+// V2 로그 키워드 → CSS 클래스 매핑
+function _v2LogClass(msg){
+  if(!msg) return 'log-v2';
+  const m = msg;
+  if(m.includes('BUY_US')||m.includes('BUY_KR')||m.includes('💰')||m.includes('[US BUY 판정]')||m.includes('[KR BUY 판정]')) return 'log-v2-buy';
+  if(m.includes('SELL_US')||m.includes('SELL_KR')) return 'log-v2-sell';
+  if(m.includes('[US OPEN]')||m.includes('[KR OPEN]')||m.includes('🔔')) return 'log-v2-open';
+  if(m.includes('PROFIT LOCK')||m.includes('🎯')) return 'log-v2-profit';
+  if(m.includes('CLOSE')||m.includes('🏁')) return 'log-v2-close';
+  if(m.includes('[US STATUS]')||m.includes('[KR STATUS]')) return 'log-v2-status';
+  return 'log-v2';
+}
+
+// 필터 통과 여부
+function _passFilter(e){
+  const src = e.src||'V1';
+  const msg = e.msg||'';
+  const lvl = e.level||'info';
+  if(_logFilter==='ALL') return true;
+  if(_logFilter==='V2') return src==='V2';
+  if(_logFilter==='BUY') return msg.includes('BUY')||msg.includes('매수')||msg.includes('💰');
+  if(_logFilter==='SELL') return msg.includes('SELL')||msg.includes('매도');
+  if(_logFilter==='ERR') return lvl==='error'||lvl==='warning';
+  return true;
+}
+
+function _renderLog(e){
+  if(!_passFilter(e)) return;
   const a=document.getElementById('log-area');
+  if(!a) return;
   const d=document.createElement('div');
-  d.className=`log-entry log-${e.level||'info'}`;
-  d.innerHTML=`<span class="t">[${e.time}]</span> ${e.msg}`;
+  const lvl=e.level||'info';
+  const src=e.src||'V1';
+  const isV2 = src==='V2';
+  
+  // V2 로그는 v2 전용 CSS 클래스, V1은 기존
+  if(isV2){
+    d.className=`log-entry ${_v2LogClass(e.msg)}`;
+  } else {
+    d.className=`log-entry log-${lvl}`;
+  }
+
+  // V2 배지
+  const badge = isV2 ? `<span class="log-v2-badge">V2</span>` : '';
+
+  // \n 구분: 첫 줄이 제목, 나머지가 상세
+  const lines=(e.msg||'').split('\n');
+  const firstLine=lines[0];
+  const detailLines=lines.slice(1).join('\n').trim();
+
+  if(lvl==='error' && detailLines){
+    const uid='log_'+Date.now()+'_'+Math.random().toString(36).slice(2,6);
+    d.innerHTML=
+      `<span class="t">[${e.time}]</span> ${badge}${firstLine}`+
+      `<span class="log-fail-toggle" onclick="toggleDetail('${uid}')">[상세보기 ▼]</span>`+
+      `<div id="${uid}" class="log-detail-block">${escHtml(detailLines)}</div>`;
+  } else {
+    d.innerHTML=`<span class="t">[${e.time}]</span> ${badge}${firstLine}`;
+  }
   a.appendChild(d); a.scrollTop=a.scrollHeight;
+}
+
+function addLog(e){ _logCache.push(e); _renderLog(e); }
+
+// 필터 변경
+function setLogFilter(f){
+  _logFilter=f;
+  document.querySelectorAll('.log-filter-btn').forEach(b=>b.classList.remove('active'));
+  const btnMap={ALL:'logf-all',V2:'logf-v2',BUY:'logf-buy',SELL:'logf-sell',ERR:'logf-err'};
+  const btn=document.getElementById(btnMap[f]);
+  if(btn) btn.classList.add('active');
+  // 캐시 전체 재렌더링
+  const a=document.getElementById('log-area');
+  if(a){ a.innerHTML=''; _logCache.slice(-200).filter(_passFilter).forEach(_renderLog); }
+}
+
+// 로그 지우기
+function clearLogArea(){
+  _logCache=[];
+  const a=document.getElementById('log-area');
+  if(a) a.innerHTML='';
+}
+
+// V1+V2 통합 로그 폴링
+let _lastLogCount = 0;
+async function fetchMergedLogs(){
+  try {
+    const logs = await fetch('/api/logs/merged').then(r=>r.json());
+    // 신규 로그만 추가 (중복 방지)
+    if(logs.length !== _lastLogCount){
+      // 전체 갱신 (시간순 보장)
+      const a=document.getElementById('log-area');
+      if(a){
+        a.innerHTML='';
+        _logCache = logs;
+        logs.filter(_passFilter).forEach(_renderLog);
+        _lastLogCount = logs.length;
+      }
+    }
+    // LIVE 배지 갱신
+    const badge=document.getElementById('log-src-badge');
+    if(badge){ badge.textContent='●LIVE'; badge.style.color='#3fb950'; }
+  } catch(e) {
+    const badge=document.getElementById('log-src-badge');
+    if(badge){ badge.textContent='⚠오류'; badge.style.color='#f85149'; }
+  }
+}
+function toggleDetail(id){
+  const el=document.getElementById(id);
+  if(!el) return;
+  const tog=el.previousElementSibling;
+  if(el.style.display==='none'||el.style.display===''){
+    el.style.display='block';
+    if(tog) tog.textContent='[상세접기 ▲]';
+  } else {
+    el.style.display='none';
+    if(tog) tog.textContent='[상세보기 ▼]';
+  }
+}
+function escHtml(s){
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
 // ── 탭 ─────────────────────────────────────────────────────
 function showTab(id,el){
   document.querySelectorAll('.tabs .tab').forEach(t=>t.classList.remove('active'));
   el.classList.add('active');
-  ['tab-chart','tab-indicator','tab-trades','tab-backtest','tab-logs'].forEach(tid=>{
+  ['tab-chart','tab-us','tab-indicator','tab-trades','tab-backtest','tab-review','tab-logs'].forEach(tid=>{
     document.getElementById(tid).style.display=tid===id?'block':'none';
   });
   if(id==='tab-trades') loadTrades();
@@ -592,7 +1352,54 @@ async function analyzeIndicators(){
   }).join('');
 }
 
-// ── 피라미딩 포지션 렌더링 ─────────────────────────────────
+// ── 실제 KIS 계좌 보유현황 렌더링 ─────────────────────────
+async function loadHoldings(){
+  const grid=document.getElementById('kis-holdings-grid');
+  const upd=document.getElementById('holdings-updated');
+  try{
+    const bal=await fetch('/api/balance').then(r=>r.json());
+    if(bal.error){
+      grid.innerHTML=`<div style="color:var(--muted);padding:20px;text-align:center;grid-column:1/-1">
+        ⚠️ ${bal.error}</div>`;
+      upd.textContent='조회 실패';
+      return;
+    }
+    const holdings=bal.holdings||[];
+    const now=new Date().toLocaleTimeString('ko-KR');
+    upd.textContent=now+' 기준';
+
+    if(!holdings.length){
+      grid.innerHTML='<div style="color:var(--muted);padding:20px;text-align:center;grid-column:1/-1">보유 종목 없음 (실제 계좌에 보유 중인 종목이 없습니다)</div>';
+      return;
+    }
+    grid.innerHTML=holdings.map(h=>{
+      const pct=h.pnl_pct||0;
+      const pnlColor=pct>=0?'var(--red)':'var(--blue)';
+      const pnlAmt=h.pnl_amt||0;
+      return `<div style="background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:8px;">
+        <div style="display:flex;align-items:center;justify-content:space-between;">
+          <div>
+            <span style="font-weight:700;font-size:.95rem;">${h.name||h.code}</span>
+            <span style="font-size:.72rem;color:var(--muted);margin-left:6px;">${h.code}</span>
+          </div>
+          <span style="font-size:.9rem;font-weight:800;color:${pnlColor}">${pct>=0?'+':''}${(+pct).toFixed(2)}%</span>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:.78rem;">
+          <div style="color:var(--muted)">보유수량</div><div style="text-align:right;">${(h.qty||0).toLocaleString()}주</div>
+          <div style="color:var(--muted)">평균단가</div><div style="text-align:right;">${Math.round(h.avg_price||0).toLocaleString()}원</div>
+          <div style="color:var(--muted)">현재가</div><div style="text-align:right;">${Math.round(h.cur_price||0).toLocaleString()}원</div>
+          <div style="color:var(--muted)">평가손익</div><div style="text-align:right;color:${pnlColor}">${pnlAmt>=0?'+':''}${Math.round(pnlAmt).toLocaleString()}원</div>
+        </div>
+      </div>`;
+    }).join('');
+  }catch(e){
+    grid.innerHTML=`<div style="color:var(--muted);padding:20px;text-align:center;grid-column:1/-1">⚠️ 잔고 조회 오류</div>`;
+    upd.textContent='오류';
+  }
+}
+setInterval(loadHoldings, 30000);
+
+// ── 피라미딩 포지션 렌더링 (봇이 직접 관리하는 포지션) ──────
 async function renderPyramid(){
   const status=await fetch('/api/status').then(r=>r.json());
   const positions=status.positions||{};
@@ -602,7 +1409,7 @@ async function renderPyramid(){
 
   const entries=Object.entries(positions);
   if(!entries.length){
-    grid.innerHTML='<div style="color:var(--muted);padding:30px;text-align:center;grid-column:1/-1">보유 포지션 없음</div>';
+    grid.innerHTML='<div style="color:var(--muted);padding:30px;text-align:center;grid-column:1/-1">봇이 매수한 포지션이 없습니다<br><small style="font-size:.72rem;color:var(--muted)">봇이 매수 신호 후 자동 진입하면 여기에 표시됩니다</small></div>';
     document.getElementById('stat-max-level').textContent='없음';
     return;
   }
@@ -670,28 +1477,170 @@ async function loadTrades(){
       <td>${t.ind_score!=null?t.ind_score+'/6':'—'}</td>
     </tr>`;
   }).join('');
-  const pe=document.getElementById('stat-today-profit');
-  pe.textContent=(todayPnl>=0?'+':'')+todayPnl.toLocaleString()+'원';
-  pe.className='val '+(todayPnl>=0?'v-green':'v-red');
+  // stat-today-profit은 /api/asset-summary의 realized_pnl로 동기화 (loadAssetSummary 담당)
+  // 여기서는 거래 테이블 렌더링만 수행
+}
+
+// ── 시장 국면 배지/배분 패널 업데이트 ────────────────────────
+function applyRegime(status){
+  const regime = status.regime || 'LATERAL';
+  const tw     = status.target_weights || {};
+
+  // 색상
+  const rc = regime==='BULL'?'var(--green)':regime==='BEAR'?'var(--red)':'var(--yellow)';
+  const rtx= {'BULL':'📈 BULL (상승장)','BEAR':'📉 BEAR (하락장)','LATERAL':'➡️ LATERAL (횡보장)'}[regime]||regime;
+
+  // 상단 stat 카드
+  const sr = document.getElementById('stat-regime');
+  if(sr){ sr.textContent=rtx; sr.style.color=rc; }
+  const ss = document.getElementById('stat-regime-sub');
+  if(ss){ ss.textContent=regime==='BULL'?'레버리지ETF 허용':regime==='BEAR'?'인버스ETF 우선':'일반ETF 우선'; }
+
+  // ETF 관심종목 수
+  const ew = document.getElementById('stat-etf-watch');
+  if(ew){ ew.textContent=(status.etf_watch_count||0)+'개'; }
+  const es = document.getElementById('stat-etf-sub');
+  if(es){
+    const names=(status.etf_watch||[]).map(e=>e.name).slice(0,3).join(', ');
+    es.textContent=names||'ETF 없음';
+  }
+
+  // 사이드바 국면 배지
+  const sb=document.getElementById('sb-regime-badge');
+  if(sb){ sb.textContent=rtx; sb.style.color=rc; }
+
+  // 사이드바 타겟 비중
+  const swEl=document.getElementById('sb-regime-weights');
+  if(swEl){
+    const labels={'STOCK_KOSPI':'코스피주식','STOCK_KOSDAQ':'코스닥주식',
+                  'ETF_GENERAL':'일반ETF','ETF_LEVERAGE':'레버리지','ETF_INVERSE':'인버스'};
+    swEl.innerHTML=Object.entries(tw)
+      .filter(([k,v])=>v>0)
+      .map(([k,v])=>{
+        const lc=k==='ETF_LEVERAGE'?'var(--orange)':k==='ETF_INVERSE'?'var(--red)':k.startsWith('ETF')?'var(--green)':'var(--text)';
+        return `<span style="color:${lc}">${labels[k]||k}: ${v}%</span>`;
+      })
+      .join(' · ');
+  }
+
+  // 관심종목 카운트 배지
+  const wlC=document.getElementById('sb-wl-counts');
+  if(wlC){
+    const sc=status.stock_watch_count||0;
+    const ec=status.etf_watch_count||0;
+    wlC.textContent=`주식 ${sc} · ETF ${ec}`;
+  }
+
+  // 자산배분 패널
+  const panel=document.getElementById('allocation-panel');
+  const grid =document.getElementById('allocation-grid');
+  if(!panel||!grid) return;
+
+  if(Object.keys(tw).length>0){
+    panel.style.display='';
+    const rb=document.getElementById('alloc-regime-badge');
+    if(rb){ rb.textContent=rtx; rb.style.color=rc;
+            rb.style.background=regime==='BULL'?'rgba(63,185,80,.15)':regime==='BEAR'?'rgba(248,81,73,.15)':'rgba(210,153,34,.15)'; }
+
+    const assetInfo={
+      'STOCK_KOSPI': {icon:'📈',label:'코스피 주식',color:'var(--blue)'},
+      'STOCK_KOSDAQ':{icon:'📊',label:'코스닥 주식',color:'var(--cyan)'},
+      'ETF_GENERAL': {icon:'📦',label:'일반 ETF',   color:'var(--green)'},
+      'ETF_LEVERAGE':{icon:'🔶',label:'레버리지 ETF',color:'var(--orange)'},
+      'ETF_INVERSE': {icon:'🔴',label:'인버스 ETF',  color:'var(--red)'},
+    };
+    grid.innerHTML=Object.entries(assetInfo).map(([k,info])=>{
+      const wt=tw[k]||0;
+      if(wt===0) return `<div style="padding:12px;background:var(--surface2);border-radius:8px;border:1px solid var(--border);opacity:.4">
+        <div style="font-size:.72rem;color:var(--muted)">${info.icon} ${info.label}</div>
+        <div style="font-size:1.2rem;font-weight:700;color:var(--muted);margin-top:4px">0%</div>
+        <div style="font-size:.65rem;color:var(--muted);margin-top:2px">${k==='ETF_LEVERAGE'?'BULL 국면에서만':k==='ETF_INVERSE'?'BULL 국면 비활성':'비활성'}</div>
+      </div>`;
+      return `<div style="padding:12px;background:var(--surface2);border-radius:8px;border:1px solid ${info.color};box-shadow:0 0 8px ${info.color}33">
+        <div style="font-size:.72rem;color:${info.color}">${info.icon} ${info.label}</div>
+        <div style="font-size:1.3rem;font-weight:700;color:${info.color};margin-top:4px">${wt}%</div>
+        <div style="margin-top:6px;height:4px;background:var(--border);border-radius:2px">
+          <div style="width:${Math.min(wt,50)*2}%;height:100%;background:${info.color};border-radius:2px"></div>
+        </div>
+      </div>`;
+    }).join('');
+
+    // ETF 관심종목 목록
+    const etfSec=document.getElementById('etf-watchlist-section');
+    const etfList=status.etf_watch||[];
+    if(etfSec && etfList.length>0){
+      etfSec.innerHTML=`<div style="font-size:.75rem;color:var(--muted);margin-bottom:6px">📦 ETF 관심종목 (${etfList.length}개)</div>`+
+        `<div style="display:flex;flex-wrap:wrap;gap:6px">`+
+        etfList.map(e=>{
+          const ac=e.asset_type==='ETF_LEVERAGE'?'var(--orange)':e.asset_type==='ETF_INVERSE'?'var(--red)':'var(--green)';
+          const lb=e.asset_type==='ETF_LEVERAGE'?'레버리지':e.asset_type==='ETF_INVERSE'?'인버스':'일반ETF';
+          return `<span style="padding:3px 8px;background:var(--surface2);border:1px solid ${ac};border-radius:12px;font-size:.7rem;color:${ac};cursor:pointer"
+            onclick="selectStock('${e.code}','${e.name}')">${e.name} <span style="opacity:.7">[${lb}]</span></span>`;
+        }).join('')+`</div>`;
+    } else if(etfSec){
+      etfSec.innerHTML='';
+    }
+  } else {
+    panel.style.display='none';
+  }
 }
 
 // ── 관심종목 사이드바 ──────────────────────────────────────
 async function renderWatchList(){
-  const [status,signals]=await Promise.all([
+  const [status,signals,holdings]=await Promise.all([
     fetch('/api/status').then(r=>r.json()),
     fetch('/api/signals').then(r=>r.json()),
+    fetch('/api/holdings').then(r=>r.json()).catch(()=>({holdings:[]})),
   ]);
   const wl=status.watch_list||[];
   const positions=status.positions||{};
-  document.getElementById('wl-container').innerHTML=wl.map(s=>{
+
+  // 국면/ETF 배분 업데이트
+  applyRegime(status);
+
+  // ★ 해외주식 섹션 업데이트
+  renderUSSection(status).catch(()=>{});
+
+  // 고아 종목 감지 (보유 중이지만 관심목록 미등록)
+  const watchCodes=new Set(wl.map(s=>s.code));
+  const holdList=(holdings.holdings||[]);
+  const orphans=holdList.filter(h=>!watchCodes.has(h.code)&&parseInt(h.qty||0)>0);
+
+  // 고아 종목 경고 배너
+  let orphanHtml='';
+  if(orphans.length>0){
+    orphanHtml=`<div style="background:rgba(248,81,73,.12);border:1px solid rgba(248,81,73,.4);
+      border-radius:8px;padding:8px 10px;margin-bottom:8px;font-size:.73rem;">
+      <div style="font-weight:700;color:#f85149;margin-bottom:4px">⚠️ 관심목록 미등록 보유종목 (${orphans.length}개)</div>
+      ${orphans.map(h=>{
+        const pnl=h.avg_price>0?((h.cur_price-h.avg_price)/h.avg_price*100):0;
+        const color=pnl>=0?'var(--green)':'#f85149';
+        return `<div style="display:flex;justify-content:space-between;margin:2px 0;">
+          <span>${h.name||h.code}</span>
+          <span style="color:${color};font-weight:700">${pnl.toFixed(1)}%</span>
+        </div>`;
+      }).join('')}
+      <div style="color:var(--muted);margin-top:4px;font-size:.68rem">손절선(${status.stop_loss_pct||10}%) 도달 시 자동 손절</div>
+    </div>`;
+  }
+
+  document.getElementById('wl-container').innerHTML=orphanHtml+wl.map(s=>{
     const pos=positions[s.code];
     const lvl=pos?pos.current_level:0;
     const act=(signals[s.code]||{}).action||'HOLD';
+    const isEtf=s.asset_type&&s.asset_type.startsWith('ETF');
+    const etfColor=s.asset_type==='ETF_LEVERAGE'?'var(--orange)':s.asset_type==='ETF_INVERSE'?'var(--red)':'var(--green)';
+    const etfLabel=s.asset_type==='ETF_LEVERAGE'?'🔶레버리지':s.asset_type==='ETF_INVERSE'?'🔴인버스':s.asset_type==='ETF_GENERAL'?'📦ETF':'';
+    const autoFill=s.auto_fill?`<span style="color:var(--muted);font-size:.6rem">자동</span>`:'';
     return `<div class="wl-item" onclick="selectStock('${s.code}','${s.name}')">
-      <div><div class="nm">${s.name}</div><div class="cd">${s.code}</div></div>
+      <div style="flex:1;min-width:0;">
+        <div class="nm">${s.name} ${autoFill}</div>
+        <div class="cd">${s.code}${isEtf?` <span style="color:${etfColor};font-size:.6rem">${etfLabel}</span>`:''}</div>
+      </div>
       <div style="display:flex;flex-direction:column;align-items:flex-end;gap:3px">
         ${lvl?`<span class="lvl">🔺${lvl}단계</span>`:''}
-        <span style="font-size:.68rem;color:${act==='BUY'?'var(--green)':act==='SELL'?'var(--red)':'var(--muted)'};font-weight:700">${act}</span>
+        <span style="font-size:.68rem;color:${act==='BUY'?'var(--green)':act==='SELL'||act==='BUY_FAIL'?'var(--red)':'var(--muted)'};font-weight:700">${act==='BUY_FAIL'?'⚠️FAIL':act}</span>
+        <button onclick="event.stopPropagation();removeStock('${s.code}')" style="margin-top:2px;padding:2px 7px;font-size:.65rem;background:rgba(248,81,73,.18);border:1px solid rgba(248,81,73,.5);border-radius:4px;color:#f85149;cursor:pointer;line-height:1.4;">✕ 삭제</button>
       </div>
     </div>`;
   }).join('');
@@ -709,6 +1658,165 @@ async function addStock(){
   document.getElementById('add-code').value='';
   document.getElementById('add-name').value='';
   renderWatchList();
+}
+async function removeStock(code){
+  if(!confirm(`관심종목 ${code}을(를) 삭제하시겠습니까?`)) return;
+  await fetch('/api/watchlist/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code})});
+  renderWatchList();
+}
+
+// ── ★ 해외주식 함수들 ───────────────────────────────────────
+
+async function loadUSBalance(){
+  try{
+    const bal=await fetch('/api/us/balance').then(r=>r.json());
+    const rate=bal.exchange_rate||1300;
+    document.getElementById('us-cash').textContent=`$${(bal.cash_usd||0).toLocaleString(undefined,{minimumFractionDigits:0,maximumFractionDigits:0})}`;
+    document.getElementById('us-eval').textContent=`$${(bal.total_eval||0).toLocaleString(undefined,{minimumFractionDigits:0,maximumFractionDigits:0})}`;
+    const pnl=bal.total_profit||0;
+    const pnlEl=document.getElementById('us-pnl');
+    pnlEl.textContent=`${pnl>=0?'+':''}$${pnl.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}`;
+    pnlEl.style.color=pnl>=0?'var(--green)':'var(--red)';
+    document.getElementById('us-rate').textContent=`₩${Math.round(rate).toLocaleString()}`;
+
+    const grid=document.getElementById('us-holdings-grid');
+    const holdings=bal.holdings||[];
+    if(!holdings.length){
+      grid.innerHTML='<div style="color:var(--muted);font-size:.82rem;padding:12px">보유 해외주식 없음</div>';
+    } else {
+      grid.innerHTML=holdings.map(h=>{
+        const pct=h.pnl_pct||0;
+        const col=pct>=0?'var(--green)':'var(--red)';
+        return `<div style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:12px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+            <span style="font-weight:700;font-size:.9rem;">${h.name||h.symbol} <span style="font-size:.7rem;color:var(--muted)">${h.symbol}</span></span>
+            <span style="font-size:.75rem;color:var(--muted)">${h.excd||'NASD'}</span>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:.78rem;">
+            <div>보유: <b>${h.qty}주</b></div>
+            <div>현재가: <b>$${(h.cur_price||0).toFixed(2)}</b></div>
+            <div>평균: <b>$${(h.avg_price||0).toFixed(2)}</b></div>
+            <div>손익: <b style="color:${col}">${pct>=0?'+':''}${pct.toFixed(1)}%</b></div>
+            <div style="grid-column:1/-1;color:var(--muted);">≈ ₩${(h.cur_price_krw||0).toLocaleString()}/주</div>
+          </div>
+        </div>`;
+      }).join('');
+    }
+  } catch(e){ console.error('US잔고 오류',e); }
+}
+
+async function renderUSSection(status){
+  // 세션 뱃지
+  const usSess=status.us_session||{};
+  const badge=document.getElementById('us-session-badge');
+  if(badge){
+    const tradeable=usSess.tradeable;
+    badge.textContent=usSess.session||'—';
+    badge.style.background=tradeable?'rgba(46,160,67,.2)':'rgba(139,148,158,.15)';
+    badge.style.color=tradeable?'var(--green)':'var(--muted)';
+    badge.title=usSess.time_et||'';
+  }
+
+  // US 봇 포지션
+  const usPos=status.us_positions||{};
+  const grid=document.getElementById('us-pyramid-grid');
+  if(grid){
+    const entries=Object.entries(usPos);
+    if(!entries.length){
+      grid.innerHTML='<div style="color:var(--muted);font-size:.82rem;padding:12px">US 봇 포지션 없음</div>';
+    } else {
+      grid.innerHTML=entries.map(([sym,p])=>{
+        const pct=p.avg_price>0?((p.cur_price||p.avg_price)-p.avg_price)/p.avg_price*100:0;
+        const col=pct>=0?'var(--green)':'var(--red)';
+        return `<div class="pyramid-card">
+          <div class="stock-name">🇺🇸 ${p.name||sym} <span style="font-size:.7rem;color:var(--muted)">${sym}</span></div>
+          <div style="font-size:.78rem;display:grid;grid-template-columns:1fr 1fr;gap:4px;">
+            <div>L${p.current_level||1}단계</div>
+            <div>$${(p.avg_price||0).toFixed(2)}</div>
+            <div>${p.qty||0}주</div>
+            <div style="color:${col};font-weight:700">${pct>=0?'+':''}${pct.toFixed(1)}%</div>
+          </div>
+        </div>`;
+      }).join('');
+    }
+  }
+
+  // US 관심종목
+  const uwl=status.us_watch_list||[];
+  const uSig=await fetch('/api/us/signals').then(r=>r.json()).catch(()=>({}));
+  const uwlContainer=document.getElementById('us-watchlist-container');
+  if(uwlContainer){
+    uwlContainer.innerHTML=uwl.length?uwl.map(s=>{
+      const act=(uSig[s.symbol]||{}).action||'—';
+      const actColor=act==='BUY'?'var(--green)':act==='SELL'||act==='BUY_FAIL'?'var(--red)':'var(--muted)';
+      return `<div class="wl-item">
+        <div style="flex:1">
+          <div class="nm">🇺🇸 ${s.name}</div>
+          <div class="cd">${s.symbol} · ${s.excd||'NASD'}</div>
+        </div>
+        <div style="display:flex;flex-direction:column;align-items:flex-end;gap:3px">
+          <span style="font-size:.7rem;color:${actColor};font-weight:700">${act==='BUY_FAIL'?'⚠️FAIL':act}</span>
+          <button onclick="removeUSStock('${s.symbol}')" style="padding:2px 7px;font-size:.65rem;background:rgba(248,81,73,.18);border:1px solid rgba(248,81,73,.5);border-radius:4px;color:#f85149;cursor:pointer">✕</button>
+        </div>
+      </div>`;
+    }).join(''):'<div style="color:var(--muted);font-size:.8rem">해외 관심종목 없음</div>';
+  }
+
+  // US 신호
+  const sigGrid=document.getElementById('us-signals-grid');
+  if(sigGrid){
+    const entries=Object.entries(uSig);
+    if(entries.length){
+      sigGrid.innerHTML=entries.map(([sym,sig])=>{
+        const act=sig.action||'HOLD';
+        const col=act==='BUY'?'var(--green)':act==='SELL'?'var(--red)':act==='BUY_FAIL'?'#f85149':'var(--muted)';
+        const pnl=sig.net_pct;
+        return `<div style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:10px;font-size:.78rem;">
+          <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+            <b>${sig.name||sym} <span style="font-weight:400;color:var(--muted)">${sym}</span></b>
+            <span style="color:${col};font-weight:700">${act==='BUY_FAIL'?'⚠️FAIL':act}</span>
+          </div>
+          <div style="color:var(--muted)">
+            $${(sig.price||0).toFixed(2)}
+            ${pnl!==undefined?`| <span style="color:${pnl>=0?'var(--green)':'var(--red)'}">${pnl>=0?'+':''}${pnl.toFixed(1)}%</span>`:''}
+            | BUY지표 ${sig.ind_score||0}/6
+            | 추세 ${(sig.trend_score||0).toFixed(0)}
+          </div>
+          <div style="color:var(--muted);font-size:.7rem;margin-top:2px">${sig.reason||''}</div>
+        </div>`;
+      }).join('');
+    } else {
+      // 신호 없음: 실제 세션 기반으로 메시지 구분
+      const isTradeable = usSess.tradeable;
+      const sessionName = usSess.session || '미국휴장';
+      const etTime = usSess.time_et || '';
+      if(isTradeable){
+        // 정규장 중인데 신호 없음 = 아직 첫 루프 미실행 (5분 이내)
+        sigGrid.innerHTML=`<div style="color:var(--muted);font-size:.8rem;padding:8px 0">
+          ⏳ 신호 점검 중... (${etTime} · 5분마다 갱신)
+        </div>`;
+      } else {
+        sigGrid.innerHTML=`<div style="color:var(--muted);font-size:.8rem;padding:8px 0">
+          😴 신호 없음 (${sessionName})
+        </div>`;
+      }
+    }
+  }
+}
+
+async function addUSStock(){
+  const symbol=document.getElementById('us-symbol-input').value.trim().toUpperCase();
+  const name=document.getElementById('us-name-input').value.trim()||symbol;
+  const excd=document.getElementById('us-excd-input').value;
+  if(!symbol) return;
+  const r=await fetch('/api/us/watchlist/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol,name,excd})}).then(r=>r.json());
+  if(!r.ok){alert(r.error||'추가 실패');return;}
+  document.getElementById('us-symbol-input').value='';
+  document.getElementById('us-name-input').value='';
+}
+async function removeUSStock(symbol){
+  if(!confirm(`${symbol} 해외 관심종목 삭제?`)) return;
+  await fetch('/api/us/watchlist/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol})});
 }
 
 // ── 백테스트 ───────────────────────────────────────────────
@@ -743,15 +1851,18 @@ async function runBacktest(){
 
 // ── 초기화 ─────────────────────────────────────────────────
 (async()=>{
-  await renderWatchList();
+  await renderWatchList();  // 관심종목 + 국면 배분 패널 + US 섹션
+  await loadHoldings();     // ★ 실제 KIS 계좌 보유현황 먼저 로드
+  await renderPyramid();    // 봇 피라미딩 포지션
   await loadChart();
-  await renderPyramid();
+  loadUSBalance();           // ★ 해외주식 잔고 초기 로드
   const status=await fetch('/api/status').then(r=>r.json());
   botRunning=status.bot_running||false;
   updateBotUI();
+  applyRegime(status);      // ★ 국면/ETF 배분 패널 초기 렌더링
   if(status.session) applySession(status.session);
-  const logs=await fetch('/api/logs').then(r=>r.json());
-  logs.forEach(l=>addLog(l));
+  // 초기 통합 로그 로드 (V1+V2)
+  await fetchMergedLogs();
   setInterval(async()=>{
     const s=await fetch('/api/session').then(r=>r.json()).catch(()=>{});
     if(s) applySession(s);
@@ -760,7 +1871,236 @@ async function runBacktest(){
 
 setInterval(renderWatchList, 30000);
 setInterval(renderPyramid,   20000);
+setInterval(loadHoldings,    30000);  // ★ 실제 계좌 보유현황 30초마다 갱신
 setInterval(loadCompound,    15000);
+setInterval(loadUSBalance,   60000);  // ★ 해외잔고 1분마다 갱신
+setInterval(fetchMergedLogs, 30000);  // ★ V1+V2 통합 로그 30초마다 갱신
+
+// ── V2 LIVE 상태 패널 갱신 ──────────────────────────────────
+async function loadV2Status() {
+  try {
+    const d = await fetch('/api/v2/status').then(r => r.json());
+    const fmt = n => Number(n||0).toLocaleString('ko-KR') + '원';
+    const pnlColor = n => n >= 0 ? '#3fb950' : '#f85149';
+
+    // 모드 표시
+    const modeEl = document.getElementById('v2-mode');
+    if (d.mode === 'V2_LIVE') {
+      modeEl.textContent = '🟢 V2 LIVE';
+      modeEl.style.color = '#3fb950';
+    } else if (d.mode === 'V2_LOCK_STALE') {
+      modeEl.textContent = '🟡 V2 LOCK(PID사망)';
+      modeEl.style.color = '#d29922';
+    } else {
+      modeEl.textContent = '🔴 V1 ACTIVE';
+      modeEl.style.color = '#f85149';
+    }
+
+    // V1/V2 루프 상태
+    const v1El = document.getElementById('v2-v1loop');
+    v1El.textContent = d.v1_order_loop || '-';
+    v1El.style.color = d.v1_order_loop === 'STOPPED' ? '#3fb950' : '#f85149';
+
+    const v2El = document.getElementById('v2-v2loop');
+    v2El.textContent = d.v2_order_loop || '-';
+    v2El.style.color = d.v2_order_loop === 'RUNNING' ? '#3fb950' : '#8b949e';
+
+    document.getElementById('v2-pid').textContent    = d.v2_pid || '-';
+    document.getElementById('v2-commit').textContent = d.v2_commit ? d.v2_commit.substring(0,7) : '-';
+    document.getElementById('v2-start').textContent  = d.v2_start_time ? d.v2_start_time.substring(11,19) : '-';
+
+    const assetEl = document.getElementById('v2-asset');
+    assetEl.textContent = d.total_asset ? fmt(d.total_asset) : '-';
+    assetEl.style.color = '#3fb950';
+
+    // ★ 세부 자산 항목 (KR+US 분리)
+    document.getElementById('v2-kr-cash').textContent  = d.kr_cash      ? fmt(d.kr_cash)      : '-';
+    document.getElementById('v2-kr-eval').textContent  = d.kr_eval      ? fmt(d.kr_eval)      : '-';
+    document.getElementById('v2-us-cash').textContent  = d.us_cash_krw  ? fmt(d.us_cash_krw)  : '-';
+    document.getElementById('v2-us-eval').textContent  = d.us_eval_krw  ? fmt(d.us_eval_krw)  : '-';
+
+    document.getElementById('v2-orderable').textContent = d.orderable_cash ? fmt(d.orderable_cash) : '-';
+
+    const krEl = document.getElementById('v2-pnl-kr');
+    krEl.textContent = d.pnl_kr_today !== undefined ? fmt(d.pnl_kr_today) : '-';
+    krEl.style.color = pnlColor(d.pnl_kr_today);
+
+    const usEl = document.getElementById('v2-pnl-us');
+    usEl.textContent = d.pnl_us_today !== undefined ? fmt(d.pnl_us_today) : '-';
+    usEl.style.color = pnlColor(d.pnl_us_today);
+
+    document.getElementById('v2-trades').textContent = d.trade_count_today || 0;
+  } catch(e) {
+    document.getElementById('v2-mode').textContent = '⚠ API오류';
+  }
+}
+setInterval(loadV2Status, 15000);
+loadV2Status();
+
+// ── DAILY_REVIEW 복기 탭 ────────────────────────────────────
+async function loadDailyReview(){
+  const market = document.getElementById('review-market-sel')?.value || 'ALL';
+  const limit  = document.getElementById('review-limit-sel')?.value  || 30;
+
+  // 최신 요약 카드 로드
+  try {
+    const lat = await fetch('/api/v2/daily-review/latest').then(r=>r.json());
+    renderReviewLatestCards(lat);
+  } catch(e) { console.warn('daily-review/latest error', e); }
+
+  // 히스토리 목록 로드
+  try {
+    const res = await fetch(`/api/v2/daily-review?market=${market}&limit=${limit}`).then(r=>r.json());
+    const list = res.history || [];
+    const listEl  = document.getElementById('review-list');
+    const emptyEl = document.getElementById('review-empty');
+    listEl.innerHTML = '';
+    if(!list.length){
+      emptyEl.style.display = 'block';
+      return;
+    }
+    emptyEl.style.display = 'none';
+    list.forEach(r => listEl.appendChild(buildReviewCard(r)));
+  } catch(e) {
+    console.warn('daily-review list error', e);
+  }
+}
+
+function renderReviewLatestCards(lat){
+  const el = document.getElementById('review-latest-cards');
+  if(!el) return;
+  el.innerHTML = '';
+  ['KR','US'].forEach(mkt => {
+    const r = lat[mkt];
+    const card = document.createElement('div');
+    card.style.cssText = 'flex:1;min-width:220px;background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:14px;';
+    if(!r){
+      card.innerHTML = `<div style="font-size:.78rem;color:var(--muted);font-weight:700;">${mkt === 'KR' ? '🇰🇷 KR 한국' : '🇺🇸 US 미국'}</div>
+        <div style="color:var(--muted);font-size:.75rem;margin-top:8px;">복기 데이터 없음</div>`;
+    } else {
+      // flat 구조: r.win_rate, r.avg_pct, r.time_exit.count 등
+      const wr = r.win_rate  != null ? (r.win_rate*100).toFixed(1)+'%' : '-';
+      const ep = r.avg_pct   != null ? (r.avg_pct>=0?'+':'')+r.avg_pct.toFixed(2)+'%' : '-';
+      const ep_color = (r.avg_pct||0) >= 0 ? '#3fb950' : '#f85149';
+      card.innerHTML = `
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+          <span style="font-size:.8rem;font-weight:700;">${mkt === 'KR' ? '🇰🇷 KR 한국' : '🇺🇸 US 미국'}</span>
+          <span style="font-size:.68rem;color:var(--muted);">${r.date || r.key || ''}</span>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px 10px;font-size:.75rem;">
+          <div style="color:var(--muted);">총거래</div><div style="text-align:right;font-weight:600;">${r.trade_count || 0}건</div>
+          <div style="color:var(--muted);">승률</div><div style="text-align:right;font-weight:600;">${wr}</div>
+          <div style="color:var(--muted);">평균손익</div><div style="text-align:right;font-weight:600;color:${ep_color};">${ep}</div>
+          <div style="color:var(--muted);">TIME_EXIT</div><div style="text-align:right;">${(r.time_exit||{}).count || 0}건</div>
+          <div style="color:var(--muted);">PROFIT_PROTECT</div><div style="text-align:right;">${(r.profit_protect||{}).count || 0}건</div>
+          <div style="color:var(--muted);">WEAK_ENTRY</div><div style="text-align:right;">${(r.weak_entry_exit||{}).count || 0}건</div>
+        </div>`;
+    }
+    el.appendChild(card);
+  });
+}
+
+function buildReviewCard(r){
+  // flat 구조: r.win_rate / r.avg_pct / r.avg_win_pct / r.avg_loss_pct / r.profit_factor / r.avg_hold_min 직접 참조
+  const mkt = r.market || '';
+  const mktLabel = mkt==='KR' ? '🇰🇷 KR' : mkt==='US' ? '🇺🇸 US' : mkt;
+  const wr  = r.win_rate  != null ? (r.win_rate*100).toFixed(1)+'%' : '-';
+  const awp = r.avg_win_pct  != null ? '+'+r.avg_win_pct.toFixed(2)+'%'  : '-';
+  const alp = r.avg_loss_pct != null ? r.avg_loss_pct.toFixed(2)+'%' : '-';
+  const ep  = r.avg_pct != null ? (r.avg_pct>=0?'+':'')+r.avg_pct.toFixed(2)+'%' : '-';
+  const ep_color = (r.avg_pct||0) >= 0 ? '#3fb950' : '#f85149';
+  const ah  = r.avg_hold_min != null ? r.avg_hold_min.toFixed(0)+'분' : '-';
+  const pf  = r.profit_factor != null ? r.profit_factor.toFixed(2) : '-';
+
+  // generated_at → KST 간단 표시
+  let genStr = '-';
+  if(r.generated_at){ try{ genStr = r.generated_at.replace('T',' ').slice(0,16); }catch(e){} }
+
+  // 손절사유 분포 (reason_stats: {사유: {count,avg_pct,total}})
+  const sc = r.reason_stats || {};
+  const scHtml = Object.entries(sc)
+    .filter(([,v])=>(v.count||0)>0)
+    .map(([k,v])=>`<span style="background:var(--surface3,#30363d);padding:1px 7px;border-radius:4px;font-size:.7rem;margin:2px;">${k}:${v.count}</span>`)
+    .join('') || '<span style="color:var(--muted);font-size:.7rem;">-</span>';
+
+  // BUY_SCORE 분포 (buy_score_dist: {버킷: {count,win_rate,avg_pct}})
+  const bs = r.buy_score_dist || {};
+  const bsHtml = Object.entries(bs)
+    .filter(([,v])=>(v.count||0)>0)
+    .map(([k,v])=>`<span style="background:var(--surface3,#30363d);padding:1px 7px;border-radius:4px;font-size:.7rem;margin:2px;">${k}:${v.count}</span>`)
+    .join('') || '<span style="color:var(--muted);font-size:.7rem;">-</span>';
+
+  // max_pct 상위 5건 (top_maxpct)
+  const top5 = (r.top_maxpct || []).map(t=>{
+    const mp = t.max_pct!=null ? (t.max_pct>=0?'+':'')+t.max_pct.toFixed(2)+'%' : '-';
+    return `<span style="font-size:.72rem;">${t.name||t.code||'?'}(${mp})</span>`;
+  }).join(' · ') || '-';
+
+  // 손실 상위 5건 (top_losses)
+  const bot5 = (r.top_losses || []).map(t=>{
+    const ep2 = t.exit_pct!=null ? (t.exit_pct>=0?'+':'')+t.exit_pct.toFixed(2)+'%' : '-';
+    return `<span style="font-size:.72rem;color:#f85149;">${t.name||t.code||'?'}(${ep2})</span>`;
+  }).join(' · ') || '-';
+
+  const wrap = document.createElement('div');
+  wrap.style.cssText = 'background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:14px;';
+  wrap.innerHTML = `
+    <!-- 타이틀 행 -->
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:6px;">
+      <div style="display:flex;align-items:center;gap:8px;">
+        <span style="font-size:.85rem;font-weight:700;">${mktLabel}</span>
+        <span style="font-size:.78rem;color:var(--muted);">${r.date || r.key || ''}</span>
+        ${((r.cumulative||{}).ready_for_adaptive)
+          ? '<span style="font-size:.68rem;padding:1px 7px;border-radius:4px;background:rgba(63,185,80,.15);color:#3fb950;border:1px solid rgba(63,185,80,.3);">Adaptive 준비</span>'
+          : ''}
+      </div>
+      <div style="font-size:.75rem;color:var(--muted);">생성: ${genStr}</div>
+    </div>
+
+    <!-- 기본 통계 그리드 -->
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:6px 12px;font-size:.76rem;margin-bottom:10px;">
+      <div><span style="color:var(--muted);">총거래:</span> <b>${r.trade_count||0}건</b></div>
+      <div><span style="color:var(--muted);">승률:</span> <b>${wr}</b></div>
+      <div><span style="color:var(--muted);">평균손익:</span> <b style="color:${ep_color};">${ep}</b></div>
+      <div><span style="color:var(--muted);">평균수익:</span> <b style="color:#3fb950;">${awp}</b></div>
+      <div><span style="color:var(--muted);">평균손실:</span> <b style="color:#f85149;">${alp}</b></div>
+      <div><span style="color:var(--muted);">PF:</span> <b>${pf}</b></div>
+      <div><span style="color:var(--muted);">평균보유:</span> <b>${ah}</b></div>
+      <div><span style="color:var(--muted);">TIME_EXIT:</span> <b>${(r.time_exit||{}).count||0}건</b></div>
+      <div><span style="color:var(--muted);">PROFIT_P:</span> <b>${(r.profit_protect||{}).count||0}건</b></div>
+      <div><span style="color:var(--muted);">WEAK_ENT:</span> <b>${(r.weak_entry_exit||{}).count||0}건</b></div>
+    </div>
+
+    <!-- 손절사유 -->
+    <div style="margin-bottom:7px;font-size:.74rem;">
+      <span style="color:var(--muted);margin-right:6px;">청산사유:</span>${scHtml}
+    </div>
+
+    <!-- BUY_SCORE 분포 -->
+    <div style="margin-bottom:7px;font-size:.74rem;">
+      <span style="color:var(--muted);margin-right:6px;">BUY_SCORE:</span>${bsHtml}
+    </div>
+
+    <!-- max_pct 상위 -->
+    <div style="margin-bottom:4px;font-size:.74rem;">
+      <span style="color:var(--muted);margin-right:6px;">max_pct 상위:</span>${top5}
+    </div>
+
+    <!-- 손실 상위 -->
+    <div style="font-size:.74rem;">
+      <span style="color:var(--muted);margin-right:6px;">손실 상위:</span>${bot5}
+    </div>
+  `;
+  return wrap;
+}
+
+// market/limit 변경 시 자동 새로고침
+document.addEventListener('DOMContentLoaded', ()=>{
+  ['review-market-sel','review-limit-sel'].forEach(id=>{
+    const el = document.getElementById(id);
+    if(el) el.addEventListener('change', loadDailyReview);
+  });
+});
 </script>
 </body>
 </html>

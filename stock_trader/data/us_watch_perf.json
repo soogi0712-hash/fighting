@@ -1,0 +1,90 @@
+{
+  "RXRX": {
+    "symbol": "RXRX",
+    "entered_at": "2026-06-05T15:22:15.992102",
+    "entry_price": 0.0,
+    "source": "unknown",
+    "trade_count": 2,
+    "total_pnl": -59.33700000000002,
+    "last_trade": "2026-06-08T13:30:32.795940",
+    "last_pnl": -56.35200000000002,
+    "last_profit": false
+  },
+  "BEAM": {
+    "symbol": "BEAM",
+    "entered_at": "2026-06-08T13:30:29.082145",
+    "entry_price": 0.0,
+    "source": "unknown",
+    "trade_count": 1,
+    "total_pnl": -6.020000000000003,
+    "last_trade": "2026-06-08T13:30:29.082145",
+    "last_pnl": -6.020000000000003,
+    "last_profit": false
+  },
+  "CRSP": {
+    "symbol": "CRSP",
+    "entered_at": "2026-06-08T13:30:30.342443",
+    "entry_price": 0.0,
+    "source": "unknown",
+    "trade_count": 1,
+    "total_pnl": -27.840000000000003,
+    "last_trade": "2026-06-08T13:30:30.342443",
+    "last_pnl": -27.840000000000003,
+    "last_profit": false
+  },
+  "EVGO": {
+    "symbol": "EVGO",
+    "entered_at": "2026-06-08T13:30:31.564006",
+    "entry_price": 0.0,
+    "source": "unknown",
+    "trade_count": 1,
+    "total_pnl": -1.4400000000000013,
+    "last_trade": "2026-06-08T13:30:31.564006",
+    "last_pnl": -1.4400000000000013,
+    "last_profit": false
+  },
+  "WOLF": {
+    "symbol": "WOLF",
+    "entered_at": "2026-06-08T13:30:34.001949",
+    "entry_price": 0.0,
+    "source": "unknown",
+    "trade_count": 2,
+    "total_pnl": -64.26,
+    "last_trade": "2026-06-09T15:08:36.573968",
+    "last_pnl": -45.510000000000005,
+    "last_profit": false
+  },
+  "WULF": {
+    "symbol": "WULF",
+    "entered_at": "2026-06-10T13:48:38.069029",
+    "entry_price": 25.459999084472656,
+    "source": "trade",
+    "trade_count": 2,
+    "total_pnl": -26.55,
+    "last_trade": "2026-06-10T13:55:15.887845",
+    "last_pnl": -6.45,
+    "last_profit": false
+  },
+  "HOOD": {
+    "symbol": "HOOD",
+    "entered_at": "2026-06-11T15:13:54.699213",
+    "entry_price": 88.75,
+    "source": "trade",
+    "trade_count": 1,
+    "total_pnl": 4.4,
+    "last_trade": "2026-06-11T15:13:51.637339",
+    "last_pnl": 4.4,
+    "last_profit": true
+  },
+  "BROS": {
+    "symbol": "BROS",
+    "entered_at": "2026-06-11T13:49:56.995248",
+    "entry_price": 61.65999984741211,
+    "source": "trade",
+    "trade_count": 1,
+    "total_pnl": -1.76,
+    "last_trade": "2026-06-11T15:13:54.872040",
+    "last_pnl": -1.76,
+    "last_profit": false
+  }
+}

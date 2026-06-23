@@ -7,40 +7,66 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Config:
-    # ── KIS API ──────────────────────────────────────────────
+    # ── KIS API (실전 전용) ───────────────────────────────────
     KIS_APP_KEY    = os.getenv("KIS_APP_KEY", "")
     KIS_APP_SECRET = os.getenv("KIS_APP_SECRET", "")
     KIS_ACCOUNT_NO = os.getenv("KIS_ACCOUNT_NO", "")
-    KIS_IS_REAL    = os.getenv("KIS_IS_REAL", "false").lower() == "true"
 
-    BASE_URL = (
-        "https://openapi.koreainvestment.com:9443"
-        if KIS_IS_REAL else
-        "https://openapivts.koreainvestment.com:29443"
-    )
+    # ★ 실전 투자 전용 — 모의투자 없음
+    KIS_IS_REAL = True
+    BASE_URL    = "https://openapi.koreainvestment.com:9443"
 
     # ── 텔레그램 ─────────────────────────────────────────────
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
     # ── 리스크 설정 ───────────────────────────────────────────
-    MAX_INVESTMENT_PER_STOCK = float(os.getenv("MAX_INVESTMENT_PER_STOCK", 1_000_000))
-    MAX_TOTAL_INVESTMENT     = float(os.getenv("MAX_TOTAL_INVESTMENT",     5_000_000))
-    STOP_LOSS_PERCENT        = float(os.getenv("STOP_LOSS_PERCENT",  3.0))
-    TAKE_PROFIT_PERCENT      = float(os.getenv("TAKE_PROFIT_PERCENT", 5.0))
+    # ★ 총 투자금 500만원 — 복리로 불어나는 기준 금액
+    # ★ 종목당 한도 없음 — AI 강도 점수에 따라 자동 배분
+    #   (기본 10%, 고점수 20%, 엘리트 25% — trade_decision.py 기준)
+    MAX_INVESTMENT_PER_STOCK = float(os.getenv("MAX_INVESTMENT_PER_STOCK", 5_000_000))  # 총자산과 동일 = 한도 없음
+    MAX_TOTAL_INVESTMENT     = float(os.getenv("MAX_TOTAL_INVESTMENT",     5_000_000))  # 총 투자금 500만원
+
+    # ── 초기기준자산 (누적복리수익률 분모) ──────────────────────
+    # .env 에서 INITIAL_ASSET=5000000 으로 지정하면 실제 시작 시점 총자산으로 계산
+    # 미설정 시 MAX_TOTAL_INVESTMENT 와 동일값 사용
+    INITIAL_ASSET = float(os.getenv("INITIAL_ASSET", os.getenv("MAX_TOTAL_INVESTMENT", 5_000_000)))
+
+    # ── 손절/트레일링스탑 (실질수익률 기준) ────────────────────
+    STOP_LOSS_PERCENT        = float(os.getenv("STOP_LOSS_PERCENT",       10.0))  # 실질손익 -10% 손절
+    USE_TAKE_PROFIT          = os.getenv("USE_TAKE_PROFIT", "false").lower() == "true"  # 고정 익절 OFF 권장
+    TAKE_PROFIT_PERCENT      = float(os.getenv("TAKE_PROFIT_PERCENT",     15.0))  # 고정 익절 % (USE_TAKE_PROFIT=true 시)
+    TRAILING_STOP_PCT        = float(os.getenv("TRAILING_STOP_PCT",       15.0))  # 트레일링 하락률 %
+    TRAILING_ACTIVATE_PCT    = float(os.getenv("TRAILING_ACTIVATE_PCT",    5.0))  # 트레일링 활성화 수익률 %
+
+    # ── 피라미딩 추가매수 단계 ────────────────────────────────
+    ADD_BUY_PROFIT           = os.getenv("ADD_BUY_PROFIT", "true").lower() == "true"   # 수익 종목 추가매수
+    ADD_BUY_LOSS             = os.getenv("ADD_BUY_LOSS",  "false").lower() == "true"   # 손실 종목 추가매수 (물타기 금지)
+    PYRAMID_STEP_1           = float(os.getenv("PYRAMID_STEP_1", 10.0))  # 1차 추가매수 수익률 %
+    PYRAMID_STEP_2           = float(os.getenv("PYRAMID_STEP_2", 20.0))  # 2차 추가매수 수익률 %
+    PYRAMID_STEP_3           = float(os.getenv("PYRAMID_STEP_3", 35.0))  # 3차 추가매수 수익률 %
+
+    # ── 실험 전략 (Strategy Lab) ──────────────────────────────
+    USE_LAB                  = os.getenv("USE_LAB", "true").lower() == "true"
+    LAB_TRAILING_LIST        = os.getenv("LAB_TRAILING_LIST", "10,12,15,18,20,25")   # 트레일링 실험값
+    LAB_STOPLOSS_LIST        = os.getenv("LAB_STOPLOSS_LIST", "5,7,10,12")            # 손절 실험값
+    LAB_PYRAMID_LIST         = os.getenv("LAB_PYRAMID_LIST",  "10-20-35,15-30-50,20-40-60")  # 피라미딩 실험값
+
+    # ── 전략 평가 기준 우선순위 (승률 마지막) ────────────────────
+    # 1. CAGR(연복리수익률)  2. MDD(최대낙폭)  3. 샤프비율
+    # 4. 총수익률            5. 승률 (마지막)
+    EVAL_PRIORITY = ["cagr", "mdd", "sharpe", "total_return", "win_rate"]
 
     # ── 대시보드 ─────────────────────────────────────────────
     FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY", "changeme_secret")
     DASHBOARD_PORT   = int(os.getenv("DASHBOARD_PORT", 5000))
 
     # ── 관심 종목 기본값 ──────────────────────────────────────
-    WATCH_LIST = [
-        {"code": "005930", "name": "삼성전자"},
-        {"code": "000660", "name": "SK하이닉스"},
-        {"code": "035420", "name": "NAVER"},
-        {"code": "035720", "name": "카카오"},
-        {"code": "373220", "name": "LG에너지솔루션"},
-    ]
+    # ★ 기본 빈 리스트 — 스크리너가 자동으로 종목을 발굴합니다
+    # 수동으로 추가하려면 대시보드 우측 '관심종목 추가' 기능을 사용하거나
+    # .env 에 WATCH_LIST_CODES=005930,000660 형식으로 지정하세요
+    _watch_codes = [c.strip() for c in os.getenv("WATCH_LIST_CODES", "").split(",") if c.strip()]
+    WATCH_LIST: list = []  # 런타임에 app.py 에서 채워짐 (아래 참조)
 
     # ── 전략 파라미터 ─────────────────────────────────────────
     MA_SHORT    = 5

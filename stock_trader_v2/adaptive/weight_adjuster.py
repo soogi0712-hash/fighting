@@ -1,0 +1,253 @@
+"""
+adaptive/weight_adjuster.py — EV 기반 전략 가중치 자동 조정
+============================================================
+strategy_stats.json의 EV를 읽어 각 signal_type의 가중치를 조정.
+strategy_weights.json에 저장 → KRStrategy / USStrategy가 참조.
+
+★ 절대 변경 금지 항목 (안전장치):
+  - 거래시간 (09:00~14:30)
+  - 장마감 규칙 (15:20 강제청산)
+  - 재진입 제한 (72h)
+  - 수익 목표 (V2_PROFIT_LOCK_KRW)
+  - 총 노출한도 / 주문가능금액 / 손실한도
+  위 항목들은 이 모듈의 조정 대상이 아님.
+  Adaptive Engine은 진입 신호 가중치만 조정함.
+
+가중치 조정 알고리즘:
+  EV > +0.5%  → weight += STEP_UP   (저장 상한 MAX_WEIGHT)
+  EV > 0%     → weight += STEP_SMALL
+  EV ≤ -0.3%  → weight -= STEP_DOWN (저장 하한 MIN_WEIGHT)
+  EV ≤ -0.5%  → weight = 0.0 (DISABLED)
+  거래 수 < MIN_TRADES → 조정 없음 (데이터 부족)
+
+실전 적용 클램핑 (get_effective_weight):
+  실제 매매에 사용되는 가중치는 LIVE_MIN ~ LIVE_MAX 범위로 제한.
+  어떤 전략이 좋아도 +20% 이상 강화 금지.
+  어떤 전략이 나빠도 -20% 이상 약화 금지.
+  WARNING 상태이면 추가로 50% 축소.
+"""
+
+import os
+import json
+from datetime import datetime
+from typing import Optional
+
+from utils.v2_logger import get_logger
+from adaptive.strategy_analyzer import StrategyAnalyzer, _DATA_DIR
+
+logger = get_logger("WeightAdjuster")
+
+_WEIGHTS_FILE = os.path.join(_DATA_DIR, "strategy_weights.json")
+
+# ── 내부 저장 가중치 범위 (장기 학습 누적용) ──────────────────
+MIN_WEIGHT  = 0.1
+MAX_WEIGHT  = 2.0
+DEFAULT_W   = 1.0
+
+# ── 실전 적용 클램핑 범위 (첫 실전 적용 안전 제한) ───────────
+LIVE_MIN_WEIGHT = 0.80   # 어떤 전략이 나빠도 -20% 이상 약화 금지
+LIVE_MAX_WEIGHT = 1.20   # 어떤 전략이 좋아도 +20% 이상 강화 금지
+
+# WARNING 상태 가중치 축소 비율
+WARNING_SCALE = 0.50     # WARNING 전략은 가중치 50% 축소
+
+# 조정 스텝
+STEP_UP     = 0.10    # EV > +0.5% 시 +10%
+STEP_SMALL  = 0.05    # EV > 0%   시 +5%
+STEP_DOWN   = 0.10    # EV ≤ -0.3% 시 -10%
+
+# 조정 발동 최소 거래 수
+MIN_TRADES  = 20
+
+
+class WeightAdjuster:
+    """
+    StrategyAnalyzer 결과를 기반으로 전략 가중치를 자동 조정.
+
+    사용법:
+        adjuster = WeightAdjuster(analyzer)
+        report   = adjuster.adjust()   # 조정 실행 + 보고서 반환
+
+        # 전략 매수 시 실전 적용 가중치 조회 (클램핑 + WARNING 축소 적용)
+        w = adjuster.get_effective_weight("KR", "폭발돌파")
+
+        # 신호 허용 여부 + 상태 조회
+        allowed, status = adjuster.check_signal("KR", "폭발돌파")
+    """
+
+    def __init__(self, analyzer: StrategyAnalyzer):
+        self.analyzer = analyzer
+        self._weights: dict = self._load_weights()
+
+    # ── 메인 조정 실행 ────────────────────────────────────────
+
+    def adjust(self, market: Optional[str] = None) -> list[dict]:
+        """
+        전체 또는 특정 시장 전략 가중치 자동 조정.
+        Returns: 조정 내역 리스트 [{signal_type, old_w, new_w, ev, reason}]
+        """
+        # 최신 분석 실행
+        self.analyzer.run(market=market)
+        stats = self.analyzer.get_signal_stats(market)
+
+        report = []
+        for key, s in stats.items():
+            mkt = s.get("market", "KR")
+            sig = s.get("signal_type", key)
+            ev  = s.get("ev", 0.0)
+            n   = s.get("trade_count", 0)
+            status = s.get("status", "ACTIVE")
+
+            old_w = self._weights.get(key, DEFAULT_W)
+            new_w = old_w
+            reason = "변동없음"
+
+            # DISABLED → 가중치 0
+            if status == "DISABLED":
+                new_w  = 0.0
+                reason = f"DISABLED (EV={ev:+.3f}%, n={n})"
+
+            elif n < MIN_TRADES:
+                reason = f"데이터부족 (n={n} < {MIN_TRADES})"
+
+            elif ev > 0.5:
+                new_w  = min(old_w + STEP_UP, MAX_WEIGHT)
+                reason = f"EV={ev:+.3f}% 우수 → +{STEP_UP*100:.0f}%"
+
+            elif ev > 0:
+                new_w  = min(old_w + STEP_SMALL, MAX_WEIGHT)
+                reason = f"EV={ev:+.3f}% 양호 → +{STEP_SMALL*100:.0f}%"
+
+            elif ev <= -0.5 and n >= 50:
+                new_w  = max(old_w - STEP_DOWN * 2, MIN_WEIGHT)
+                reason = f"EV={ev:+.3f}% 매우 나쁨 → -{STEP_DOWN*200:.0f}%"
+
+            elif ev <= -0.3:
+                new_w  = max(old_w - STEP_DOWN, MIN_WEIGHT)
+                reason = f"EV={ev:+.3f}% 부진 → -{STEP_DOWN*100:.0f}%"
+
+            new_w = round(new_w, 3)
+
+            # 변동이 있을 때만 기록
+            if abs(new_w - old_w) > 0.001 or status == "DISABLED":
+                self._weights[key] = new_w
+                # 실전 적용 가중치도 함께 계산해서 로그
+                live_w = self._apply_live_clamp(new_w, status)
+                report.append({
+                    "market":        mkt,
+                    "signal_type":   sig,
+                    "old_weight":    round(old_w, 3),
+                    "new_weight":    new_w,
+                    "live_weight":   live_w,
+                    "ev":            ev,
+                    "win_rate":      s.get("win_rate", 0),
+                    "trade_count":   n,
+                    "status":        status,
+                    "reason":        reason,
+                    "adjusted_at":   datetime.now().isoformat(),
+                })
+                logger.info(
+                    f"[WeightAdjuster] {mkt}:{sig} "
+                    f"저장가중치 {old_w:.2f} → {new_w:.2f} "
+                    f"| 실전가중치 {live_w:.2f} | {reason}"
+                )
+
+        self._save_weights()
+        return report
+
+    # ── 실전 가중치 조회 (핵심 API) ──────────────────────────
+
+    def get_effective_weight(self, market: str, signal_type: str) -> float:
+        """
+        실전 매매에 사용하는 유효 가중치 반환.
+
+        적용 규칙 (순서):
+          1. DISABLED → 0.0  (진입 불가, 호출 전 check_signal()로 사전 차단 권장)
+          2. 저장 가중치를 LIVE_MIN~LIVE_MAX 범위로 클램핑
+          3. WARNING 상태이면 클램핑 후 값에 WARNING_SCALE(0.5) 추가 적용
+             단, 클램핑 하한(LIVE_MIN) 아래로는 내려가지 않음
+
+        Returns: float (0.0 또는 LIVE_MIN ~ LIVE_MAX 범위)
+        """
+        key    = f"{market}:{signal_type}"
+        status = self.analyzer.get_status(market, signal_type)
+
+        if status == "DISABLED":
+            return 0.0
+
+        raw_w  = self._weights.get(key, DEFAULT_W)
+        return self._apply_live_clamp(raw_w, status)
+
+    def check_signal(self, market: str, signal_type: str) -> tuple:
+        """
+        신호 허용 여부와 상태를 동시에 반환.
+
+        Returns:
+            (allowed: bool, status: str)
+            allowed = False  → DISABLED, 진입 금지
+            allowed = True   → ACTIVE 또는 WARNING (가중치만 축소)
+        """
+        status  = self.analyzer.get_status(market, signal_type)
+        allowed = (status != "DISABLED")
+        return allowed, status
+
+    # ── 레거시 호환 API ───────────────────────────────────────
+
+    def get_weight(self, market: str, signal_type: str) -> float:
+        """
+        [레거시] 저장 가중치 반환. DISABLED=0.0, 미등록=1.0.
+        실전 매매에는 get_effective_weight()를 사용할 것.
+        """
+        key    = f"{market}:{signal_type}"
+        status = self.analyzer.get_status(market, signal_type)
+        if status == "DISABLED":
+            return 0.0
+        return self._weights.get(key, DEFAULT_W)
+
+    def is_signal_allowed(self, market: str, signal_type: str) -> bool:
+        """DISABLED 전략 진입 차단 여부."""
+        return self.analyzer.is_active(market, signal_type)
+
+    def get_all_weights(self) -> dict:
+        return dict(self._weights)
+
+    # ── 내부 클램핑 헬퍼 ─────────────────────────────────────
+
+    @staticmethod
+    def _apply_live_clamp(raw_w: float, status: str) -> float:
+        """
+        저장 가중치 → 실전 가중치 변환.
+          1) LIVE_MIN ~ LIVE_MAX 클램핑
+          2) WARNING이면 × WARNING_SCALE
+          3) 클램핑 하한 재적용 (WARNING 축소 후 LIVE_MIN 보장)
+        """
+        # 1) 클램핑
+        clamped = max(LIVE_MIN_WEIGHT, min(raw_w, LIVE_MAX_WEIGHT))
+        # 2) WARNING 축소
+        if status == "WARNING":
+            clamped = clamped * WARNING_SCALE
+        # 3) 최소값 보장 (DISABLED가 아닌 한 LIVE_MIN 이상)
+        if status != "DISABLED":
+            clamped = max(clamped, LIVE_MIN_WEIGHT * WARNING_SCALE
+                          if status == "WARNING" else LIVE_MIN_WEIGHT)
+        return round(clamped, 3)
+
+    # ── 파일 I/O ─────────────────────────────────────────────
+
+    def _load_weights(self) -> dict:
+        try:
+            if os.path.exists(_WEIGHTS_FILE):
+                with open(_WEIGHTS_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {}
+
+    def _save_weights(self):
+        data = dict(self._weights)
+        data["_updated_at"]    = datetime.now().isoformat()
+        data["_live_min"]      = LIVE_MIN_WEIGHT
+        data["_live_max"]      = LIVE_MAX_WEIGHT
+        data["_warning_scale"] = WARNING_SCALE
+        with open(_WEIGHTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)

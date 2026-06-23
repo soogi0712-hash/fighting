@@ -1,0 +1,28 @@
+{
+  "date": "2026-06-13",
+  "market": "US",
+  "generated_at": "2026-06-13T21:31:47.028224",
+  "summary": {
+    "trade_count": 0,
+    "win_count": 0,
+    "loss_count": 0,
+    "win_rate": 0.0,
+    "avg_win_pct": 0.0,
+    "avg_loss_pct": 0.0,
+    "ev": 0.0,
+    "profit_factor": 0.0,
+    "max_consec_loss": 0,
+    "avg_hold_min": 0.0,
+    "total_pnl_krw": 0.0
+  },
+  "by_signal": {},
+  "weight_adjustments": [],
+  "account": {
+    "total_asset": 1842272.0,
+    "initial_asset": 5000000.0,
+    "compound_ratio": -63.15455999999999
+  },
+  "best_signal": null,
+  "worst_signal": null,
+  "monthly": {}
+}

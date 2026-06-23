@@ -1,0 +1,31 @@
+{
+  "updated": "2026-06-16T01:55:24.293685+09:00",
+  "positions": {
+    "CIFR": {
+      "code": "CIFR",
+      "name": "사이퍼 마이닝",
+      "avg_price": 24.83,
+      "qty": 3,
+      "entry_time": "2026-06-13T00:55:45.244875+09:00",
+      "breakout_low": 24.3334
+    },
+    "MARA": {
+      "code": "MARA",
+      "name": "MARA",
+      "avg_price": 14.905,
+      "qty": 10,
+      "entry_time": "2026-06-16T01:12:56.884316+09:00",
+      "breakout_low": 14.83
+    }
+  },
+  "entry_stages": {
+    "TSLA": "FULL",
+    "APP": "FULL",
+    "NVDA": "FULL",
+    "CRWD": "FULL",
+    "ARM": "FULL",
+    "AMD": "FULL",
+    "MARA": "EARLY"
+  },
+  "trail_state": {}
+}
