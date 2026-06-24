@@ -48,6 +48,7 @@ from engine.execution_engine import ExecutionEngine
 from utils.v2_logger     import get_logger
 from adaptive.trade_recorder import TradeRecorder, classify_signal
 from adaptive.weight_adjuster import WeightAdjuster
+from adaptive.trial_manager  import get_trial_manager
 
 logger = get_logger("KRStrategy")
 KST    = pytz.timezone("Asia/Seoul")
@@ -304,22 +305,27 @@ class KRStrategy:
         if stage == "FULL":
             return self._skip(code, name, "이미 Full Entry 완료")
 
+        # ── 실험 qty_scale 적용 (TrialPlanManager) ──────────────
+        _trial_mgr  = get_trial_manager()
+        _qty_scale  = _trial_mgr.get_param("qty_scale", 1.0)
+        _trial_note = f" [TRIAL×{_qty_scale:.0%}]" if _qty_scale < 1.0 else ""
+
         if buy_score >= BUY_SCORE_FULL and stage != "EARLY":
-            # Full Entry: 100%
-            qty    = max_qty
-            reason = f"[A]Full진입 BUY_SCORE={buy_score:.2f} signal={signal_type}"
+            # Full Entry: 100% (× qty_scale)
+            qty    = max(1, int(max_qty * _qty_scale))
+            reason = f"[A]Full진입 BUY_SCORE={buy_score:.2f} signal={signal_type}{_trial_note}"
             stage_next = "FULL"
         elif buy_score >= BUY_SCORE_EARLY and not stage:
-            # Early Entry: 30%
-            qty    = max(1, int(max_qty * 0.30))
-            reason = f"[A]Early진입 BUY_SCORE={buy_score:.2f} signal={signal_type}"
+            # Early Entry: 30% (× qty_scale)
+            qty    = max(1, int(max_qty * 0.30 * _qty_scale))
+            reason = f"[A]Early진입 BUY_SCORE={buy_score:.2f} signal={signal_type}{_trial_note}"
             stage_next = "EARLY"
         elif buy_score >= BUY_SCORE_FULL and stage == "EARLY":
-            # Early → 나머지 70% 추가
-            total_qty   = max_qty
+            # Early → 나머지 70% 추가 (× qty_scale)
+            total_qty   = max(1, int(max_qty * _qty_scale))
             current_qty = self._get_held_qty_internal(code)
             qty         = max(1, total_qty - current_qty)
-            reason      = f"[A]Early→Full 추가진입 BUY_SCORE={buy_score:.2f} signal={signal_type}"
+            reason      = f"[A]Early→Full 추가진입 BUY_SCORE={buy_score:.2f} signal={signal_type}{_trial_note}"
             stage_next  = "FULL"
         else:
             return self._skip(code, name,
@@ -632,6 +638,20 @@ class KRStrategy:
                         )
                     except Exception as _re:
                         logger.debug(f"[KRStrategy] 청산 기록 실패: {_re}")
+                # ★ TrialPlanManager: 거래 완료 통보 (롤백 조건 자동 체크)
+                try:
+                    _tm_result = get_trial_manager().on_trade_closed(
+                        pnl_krw  = float(profit_amt),
+                        exit_pct = float(pct),
+                    )
+                    if _tm_result.get("rollback"):
+                        logger.warning(
+                            f"[ACTIVE_PLAN] 🔴 롤백 발동 | "
+                            f"종목={name}({code}) | "
+                            f"사유={_tm_result.get('reason','')}" 
+                        )
+                except Exception as _te:
+                    logger.debug(f"[KRStrategy] TrialManager 통보 실패: {_te}")
                 # 포지션 제거
                 self._positions.pop(code, None)
                 self._entry_stage.pop(code, None)

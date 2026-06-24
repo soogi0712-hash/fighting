@@ -1690,6 +1690,61 @@ class StrategyEvolutionEngine:
             logger.info(line)
 
     # ────────────────────────────────────────────────────────────
+    # 공격안 즉시 활성화 (TrialPlanManager 연동)
+    # ────────────────────────────────────────────────────────────
+
+    def apply_aggressive_plan(
+        self,
+        max_trades:   int   = 7,
+        max_loss_krw: int   = -10_000,
+        qty_scale:    float = 0.30,
+    ) -> dict:
+        """
+        가장 최근 run() 결과의 공격안을 TrialPlanManager로 즉시 활성화.
+
+        Args:
+            max_trades:   적용 최대 거래수 (기본 7)
+            max_loss_krw: 누적 손실 한도 (기본 -10,000원)
+            qty_scale:    진입 수량 배율 (기본 0.30 = 30%)
+
+        Returns:
+            활성화된 active_plan dict
+
+        사용법:
+            engine = StrategyEvolutionEngine()
+            engine.run('KR')                    # 분석 후
+            engine.apply_aggressive_plan()      # 공격안 자동 활성화
+        """
+        from adaptive.trial_manager import get_trial_manager
+
+        # 최신 evolution_report 에서 공격안 파라미터 조회
+        aggressive_params = {
+            "qty_scale":            qty_scale,
+            "breakout_tolerance":   0.003,   # 돌파봉저가 0.3% 허용폭
+            "weak_entry_cut_pct":  -1.0,     # WEAK_ENTRY 기준 -0.7% → -1.0% 완화
+            "weak_entry_max_min":   7.0,     # WEAK_ENTRY 적용 시간 5분 → 7분 완화
+        }
+
+        plan_dict = {
+            "plan_name":    "공격안",
+            "source":       "AUTO_APPLIED",
+            "max_trades":   max_trades,
+            "max_loss_krw": max_loss_krw,
+            "params":       aggressive_params,
+        }
+
+        tm = get_trial_manager()
+        result = tm.activate(plan_dict)
+
+        logger.info(
+            f"[ACTIVE_PLAN] 공격안 AUTO_APPLIED 완료 | "
+            f"qty_scale={qty_scale:.0%} | "
+            f"적용기간={max_trades}거래 | "
+            f"손실한도={max_loss_krw:,}원"
+        )
+        return result
+
+    # ────────────────────────────────────────────────────────────
     # DB 조회
     # ────────────────────────────────────────────────────────────
 

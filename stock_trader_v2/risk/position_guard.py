@@ -22,11 +22,27 @@ risk/position_guard.py — 포지션 리스크 관리 (V2)
                 PROFIT_PROTECT / TRADE_REVIEW max_pct 기록 추가
   - 2026-06-19: PROFIT_PROTECT 활성 조건 완화
                 (HWM>=1.0% AND 2000원) → (HWM>=0.45% OR 1000원) AND cur_pnl>0
+  - 2026-06-24: TrialPlanManager 연동 — 실험 파라미터 동적 오버라이드 지원
+                breakout_tolerance (돌파봉저가 허용폭)
+                weak_entry_cut_pct / weak_entry_max_min (WEAK_ENTRY 완화)
 """
 
 from datetime import time as dtime, datetime
 import pytz
 from utils.v2_logger import get_logger
+
+# TrialPlanManager 지연 임포트 (순환참조 방지)
+def _get_trial_params() -> dict:
+    """현재 활성 실험 파라미터 반환. 없으면 기본값."""
+    try:
+        from adaptive.trial_manager import get_trial_manager
+        tm = get_trial_manager()
+        plan = tm.get_active_plan()
+        if plan:
+            return plan.get("params", {})
+    except Exception:
+        pass
+    return {}
 
 logger = get_logger("PositionGuard")
 KST    = pytz.timezone("Asia/Seoul")
@@ -86,14 +102,20 @@ class PositionGuard:
         self.entry_time   = entry_time
         self.breakout_low = breakout_low
 
+        # ── 실험 파라미터 적용 (TrialPlanManager 연동) ───────────
+        trial = _get_trial_params()
+        tolerance = trial.get("breakout_tolerance", 0.0)  # e.g. 0.003 = 0.3% 여유
+
         # ── 손절선 결정 (플로어 적용) ──────────────────────────
         # breakout_low가 있으면 max(breakout_low, floor_price) 로 실제 손절선 결정
         # → 손절선이 진입가 대비 0.8%보다 좁으면 0.8% 플로어로 상향
+        # → tolerance > 0 이면 손절선을 tolerance만큼 아래로 낮춤 (완화)
         if avg_price > 0 and breakout_low > 0:
-            floor_price = avg_price * (1.0 - STOP_FLOOR_PCT / 100.0)
-            self.effective_stop = max(breakout_low, floor_price)
+            floor_price  = avg_price * (1.0 - STOP_FLOOR_PCT / 100.0)
+            raw_stop     = max(breakout_low, floor_price)
+            self.effective_stop = raw_stop * (1.0 - tolerance)
         elif breakout_low > 0:
-            self.effective_stop = breakout_low
+            self.effective_stop = breakout_low * (1.0 - tolerance)
         else:
             self.effective_stop = 0.0
 
@@ -106,6 +128,11 @@ class PositionGuard:
                     f"돌파저가={breakout_low:,.0f}원 < 플로어={floor_price:,.0f}원 "
                     f"(진입가 -{STOP_FLOOR_PCT}%) → 손절선={self.effective_stop:,.0f}원으로 상향"
                 )
+        if tolerance > 0 and self.effective_stop > 0:
+            logger.info(
+                f"[TRIAL] {name}({code}) 돌파봉 허용폭 +{tolerance*100:.1f}% 적용 "
+                f"→ 손절선={self.effective_stop:,.0f}원 (완화)"
+            )
 
         # ── HWM (최고수익률) 내부 추적 ─────────────────────────
         # PROFIT_PROTECT / WEAK_ENTRY_EXIT / TIME_EXIT 에서 사용
@@ -213,13 +240,22 @@ class PositionGuard:
 
         # ── 5. WEAK_ENTRY_EXIT ───────────────────────────────────
         # 진입 5분 이내 + HWM < +0.3% + 현재손익 <= -0.7% → 즉시 청산
-        if (elapsed_min <= WEAK_ENTRY_MAX_MIN
+        # TrialPlanManager 실험 중이면 weak_entry_cut_pct / weak_entry_max_min 완화
+        _trial2        = _get_trial_params()
+        _we_cut        = _trial2.get("weak_entry_cut_pct",  WEAK_ENTRY_CUT_PCT)
+        _we_max_min    = _trial2.get("weak_entry_max_min",  WEAK_ENTRY_MAX_MIN)
+        if _trial2:
+            _we_label  = f"[TRIAL] cut={_we_cut:+.1f}% max_min={_we_max_min:.0f}분"
+        else:
+            _we_label  = ""
+        if (elapsed_min <= _we_max_min
                 and hwm < WEAK_ENTRY_MAX_PCT
-                and pct <= WEAK_ENTRY_CUT_PCT):
+                and pct <= _we_cut):
             reason = (
                 f"[WEAK_ENTRY_EXIT] {elapsed_min:.1f}분경과 | "
                 f"HWM={hwm:+.2f}%(<{WEAK_ENTRY_MAX_PCT}%) | "
-                f"net={pct:+.2f}%(≤{WEAK_ENTRY_CUT_PCT}%)"
+                f"net={pct:+.2f}%(≤{_we_cut:+.1f}%)"
+                + (f" {_we_label}" if _we_label else "")
             )
             logger.warning(f"[PositionGuard] {name}({code}) {reason}")
             return {"action": "SELL_STOP", "reason": reason, "pct": pct}
