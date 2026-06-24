@@ -305,27 +305,44 @@ class KRStrategy:
         if stage == "FULL":
             return self._skip(code, name, "이미 Full Entry 완료")
 
-        # ── 실험 qty_scale 적용 (TrialPlanManager) ──────────────
-        _trial_mgr  = get_trial_manager()
-        _qty_scale  = _trial_mgr.get_param("qty_scale", 1.0)
-        _trial_note = f" [TRIAL×{_qty_scale:.0%}]" if _qty_scale < 1.0 else ""
+        # ── qty_scale 결정: Adaptive 상태 × TrialPlanManager 중 더 작은 값 ──
+        #   우선순위: TrialPlanManager(실험) > Adaptive(상태) > 기본값 1.0
+        _trial_mgr = get_trial_manager()
+        _trial_qs  = _trial_mgr.get_param("qty_scale", 1.0)   # 실험 파라미터
+
+        # Adaptive 상태별 qty_scale
+        _adap_qs   = 1.0
+        if self.adjuster is not None:
+            _adap_qs = self.adjuster.get_adaptive_qty_scale("KR", signal_type)
+
+        # 둘 중 더 작은(보수적인) 값 채택
+        _qty_scale = min(_trial_qs, _adap_qs)
+
+        # 로그 노트
+        _note_parts = []
+        if _adap_qs < 1.0:
+            _adap_status = self.adjuster.analyzer.get_status("KR", signal_type) if self.adjuster else "ACTIVE"
+            _note_parts.append(f"ADAPTIVE({_adap_status})×{_adap_qs:.0%}")
+        if _trial_qs < 1.0:
+            _note_parts.append(f"TRIAL×{_trial_qs:.0%}")
+        _qty_note = f" [{'+'.join(_note_parts)}]" if _note_parts else ""
 
         if buy_score >= BUY_SCORE_FULL and stage != "EARLY":
-            # Full Entry: 100% (× qty_scale)
+            # Full Entry: 100% × qty_scale
             qty    = max(1, int(max_qty * _qty_scale))
-            reason = f"[A]Full진입 BUY_SCORE={buy_score:.2f} signal={signal_type}{_trial_note}"
+            reason = f"[A]Full진입 BUY_SCORE={buy_score:.2f} signal={signal_type}{_qty_note}"
             stage_next = "FULL"
         elif buy_score >= BUY_SCORE_EARLY and not stage:
-            # Early Entry: 30% (× qty_scale)
+            # Early Entry: 30% × qty_scale
             qty    = max(1, int(max_qty * 0.30 * _qty_scale))
-            reason = f"[A]Early진입 BUY_SCORE={buy_score:.2f} signal={signal_type}{_trial_note}"
+            reason = f"[A]Early진입 BUY_SCORE={buy_score:.2f} signal={signal_type}{_qty_note}"
             stage_next = "EARLY"
         elif buy_score >= BUY_SCORE_FULL and stage == "EARLY":
-            # Early → 나머지 70% 추가 (× qty_scale)
+            # Early → 나머지 70% 추가 × qty_scale
             total_qty   = max(1, int(max_qty * _qty_scale))
             current_qty = self._get_held_qty_internal(code)
             qty         = max(1, total_qty - current_qty)
-            reason      = f"[A]Early→Full 추가진입 BUY_SCORE={buy_score:.2f} signal={signal_type}{_trial_note}"
+            reason      = f"[A]Early→Full 추가진입 BUY_SCORE={buy_score:.2f} signal={signal_type}{_qty_note}"
             stage_next  = "FULL"
         else:
             return self._skip(code, name,
@@ -452,9 +469,16 @@ class KRStrategy:
         allowed, status = self.adjuster.check_signal("KR", signal_type)
 
         # [ADAPTIVE SIGNAL FILTER] 로그
-        filter_result = "ALLOW" if allowed else "BLOCK"
-        if allowed and status == "WARNING":
-            filter_result = "REDUCE"
+        # 설계 원칙: BUY_SCORE는 차감하지 않음 — 진입 수량(qty_scale)만 축소
+        #   ACTIVE  → qty_scale=1.0  (정상)
+        #   WARNING → qty_scale=0.3  (학습/검증 유지, 수량만 30%)
+        #   BLOCK   → qty_scale=0.0  (진입 완전 차단)
+        if status in ("BLOCK", "DISABLED"):
+            filter_result = "BLOCK"
+        elif status == "WARNING":
+            filter_result = "QTY_REDUCE"   # BUY_SCORE 유지, qty만 축소
+        else:
+            filter_result = "ALLOW"
         logger.info(
             f"[ADAPTIVE SIGNAL FILTER] "
             f"종목={name}({code}) | 시장=KR | 전략={signal_type} | "
@@ -462,54 +486,18 @@ class KRStrategy:
         )
 
         if not allowed:
-            return None  # DISABLED → 진입 차단
+            return None  # BLOCK → 진입 차단
 
-        # ② 유효 가중치 조회 (0.80~1.20, WARNING이면 ×0.5)
-        live_w = self.adjuster.get_effective_weight("KR", signal_type)
-
-        # ③ BUY_SCORE 구성요소별 가중치 적용
-        #    base_score = 지표점수 합산 (score 변수 기준)
-        #    각 구성요소 점수를 live_w로 보정
-        bp = iv.get("breakout_bonus", 0.0)
-        vol_surge    = iv.get("vol_surge",    False) if "vol_surge" in iv else (
-            iv.get("vol_increase", False)  # fallback
-        )
-        vol_increase = iv.get("vol_increase", False)
-
-        # 원본 score에서 적용 가능한 구성요소 추출 (정규화 전 기준)
-        # 거래량 보너스: vol_surge→3점, vol_increase→2점
-        if vol_surge and iv.get("vol_surge", False):
-            vol_bonus_raw = 3.0
-        elif vol_increase:
-            vol_bonus_raw = 2.0
-        else:
-            vol_bonus_raw = 0.0
-
-        # 돌파 보너스: breakout_bonus * 10
-        breakout_bonus_raw = bp * 10.0
-
-        # VWAP/RSI/OBV 시그널 보너스 (나머지 기반 지표 점수)
-        # 전체 점수 중 거래량/돌파 제외한 기본 지표 점수
-        total_raw = base_buy_score * 14.0  # 역정규화 (max 14점)
-        signal_bonus_raw = max(0.0, total_raw - vol_bonus_raw - breakout_bonus_raw)
-
-        # 가중치 적용: 각 보너스에 live_w 곱셈 후 재합산
-        adjusted_raw = (
-            signal_bonus_raw             # VWAP/RSI/OBV — 기본 지표 그대로
-            + vol_bonus_raw      * live_w  # 거래량 보너스 × 학습가중치
-            + breakout_bonus_raw * live_w  # 돌파 보너스   × 학습가중치
-        )
-        adjusted_score = round(min(adjusted_raw / 14.0, 1.0), 3)
-
-        # [ADAPTIVE WEIGHT APPLIED] 로그
+        # ② BUY_SCORE는 그대로 반환 — 점수 차감 없음
+        #    (qty_scale은 _eval_entry에서 별도 적용)
         logger.info(
-            f"[ADAPTIVE WEIGHT APPLIED] "
-            f"종목={name}({code}) | 시장=KR | 전략={signal_type} | "
-            f"기본가중치=1.00 | 학습가중치={live_w:.3f} | "
-            f"적용전BUY={base_buy_score:.3f} | 적용후BUY={adjusted_score:.3f}"
+            f"[ADAPTIVE SCORE] "
+            f"종목={name}({code}) | 전략={signal_type} | "
+            f"상태={status} | BUY={base_buy_score:.3f} (차감없음) | "
+            f"qty_scale={self.adjuster.get_adaptive_qty_scale('KR', signal_type):.2f}"
         )
 
-        return adjusted_score
+        return base_buy_score
 
     # ════════════════════════════════════════════════════════════
     # ■ 보유 중 — 청산 판단

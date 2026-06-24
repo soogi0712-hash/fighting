@@ -29,10 +29,14 @@ _STATS_FILE = os.path.join(_DATA_DIR, "strategy_stats.json")
 _DAILY_FILE = os.path.join(_DATA_DIR, "daily_stats.json")
 
 # 전략 상태 전이 기준
-_WARN_THRESHOLD      = -0.3    # EV ≤ -0.3% → WARNING
-_DISABLE_THRESHOLD   = -0.5    # EV ≤ -0.5% + 거래 ≥ 50건 → DISABLED
-_DISABLE_MIN_TRADES  = 50      # DISABLED 판단 최소 거래 수
+_WARN_THRESHOLD      = -0.3    # EV ≤ -0.3% → WARNING (qty 30%로 축소, 학습 유지)
+_BLOCK_THRESHOLD     = -0.5    # EV ≤ -0.5% + 거래 ≥ 50건 → BLOCK (진입 완전 차단)
+_BLOCK_MIN_TRADES    = 50      # BLOCK 판단 최소 거래 수
 _WARN_MIN_TRADES     = 20      # WARNING 판단 최소 거래 수
+
+# 하위 호환 alias (기존 코드에서 DISABLED 참조 시)
+_DISABLE_THRESHOLD  = _BLOCK_THRESHOLD
+_DISABLE_MIN_TRADES = _BLOCK_MIN_TRADES
 
 # 가중치 조정에 사용할 최근 거래 윈도우
 RECENT_WINDOW = 200
@@ -115,22 +119,27 @@ def _judge_status(stats: dict, current_status: str = "ACTIVE") -> str:
     """
     EV + 거래 수 기반 상태 판정.
     안전장치(거래시간/재진입 등)는 절대 변경 안 함.
+
+    상태 전이표:
+      ACTIVE  : EV > 0%            → 정상 진입 (qty_scale=1.0)
+      WARNING : EV ≤ -0.3%         → qty 30% 축소, BUY_SCORE 차감 없음 (학습 유지)
+      BLOCK   : EV ≤ -0.5% ≥ 50건 → 진입 완전 차단 (BLOCK 후 EV>0 회복 시 WARNING 거쳐 복원)
     """
     n  = stats["trade_count"]
     ev = stats["ev"]
 
-    # DISABLED → 개선 없으면 유지 (수동 복원만 가능)
-    if current_status == "DISABLED":
+    # BLOCK → 개선 없으면 유지 (수동 복원만 가능)
+    if current_status in ("BLOCK", "DISABLED"):  # DISABLED 하위호환
         if ev > 0 and n >= 10:
             return "WARNING"    # 소폭 회복 → WARNING으로 완화
-        return "DISABLED"
+        return "BLOCK"
 
     # 거래 수 부족 → 판단 보류
     if n < _WARN_MIN_TRADES:
         return current_status
 
-    if ev <= _DISABLE_THRESHOLD and n >= _DISABLE_MIN_TRADES:
-        return "DISABLED"
+    if ev <= _BLOCK_THRESHOLD and n >= _BLOCK_MIN_TRADES:
+        return "BLOCK"
     if ev <= _WARN_THRESHOLD:
         return "WARNING"
     if ev > 0:
@@ -281,13 +290,15 @@ class StrategyAnalyzer:
         return self._stats
 
     def get_status(self, market: str, signal_type: str) -> str:
-        """특정 전략 상태 반환 (ACTIVE / WARNING / DISABLED)."""
-        return self._stats.get(
+        """특정 전략 상태 반환 (ACTIVE / WARNING / BLOCK)."""
+        raw = self._stats.get(
             f"{market}:{signal_type}", {}
         ).get("status", "ACTIVE")
+        # 구버전 DISABLED → BLOCK 하위호환
+        return "BLOCK" if raw == "DISABLED" else raw
 
     def is_active(self, market: str, signal_type: str) -> bool:
-        return self.get_status(market, signal_type) != "DISABLED"
+        return self.get_status(market, signal_type) not in ("BLOCK", "DISABLED")
 
     # ── 파일 I/O ─────────────────────────────────────────────
 

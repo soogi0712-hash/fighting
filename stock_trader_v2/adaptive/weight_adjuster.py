@@ -17,14 +17,21 @@ strategy_weights.json에 저장 → KRStrategy / USStrategy가 참조.
   EV > +0.5%  → weight += STEP_UP   (저장 상한 MAX_WEIGHT)
   EV > 0%     → weight += STEP_SMALL
   EV ≤ -0.3%  → weight -= STEP_DOWN (저장 하한 MIN_WEIGHT)
-  EV ≤ -0.5%  → weight = 0.0 (DISABLED)
+  EV ≤ -0.5%  → weight = 0.0 (BLOCK)
   거래 수 < MIN_TRADES → 조정 없음 (데이터 부족)
 
-실전 적용 클램핑 (get_effective_weight):
-  실제 매매에 사용되는 가중치는 LIVE_MIN ~ LIVE_MAX 범위로 제한.
-  어떤 전략이 좋아도 +20% 이상 강화 금지.
-  어떤 전략이 나빠도 -20% 이상 약화 금지.
-  WARNING 상태이면 추가로 50% 축소.
+실전 적용 설계 (Adaptive = 위험 축소 시스템):
+  BUY_SCORE 차감 금지 — 진입 점수는 그대로 유지.
+  대신 진입 수량(qty_scale)만 축소 → 학습/검증 거래는 계속 진행.
+
+  NORMAL  → qty_scale = 1.0  (full size)
+  WARNING → qty_scale = 0.3  (30%  축소, 학습 유지)
+  BLOCK   → qty_scale = 0.0  (진입 완전 차단)
+
+변경 이력:
+  2026-06-24: WARNING_SCALE(BUY_SCORE 차감) 제거
+              → get_adaptive_qty_scale() 추가 (qty_scale 반환)
+              → DISABLED 상태명 → BLOCK으로 변경
 """
 
 import os
@@ -48,8 +55,9 @@ DEFAULT_W   = 1.0
 LIVE_MIN_WEIGHT = 0.80   # 어떤 전략이 나빠도 -20% 이상 약화 금지
 LIVE_MAX_WEIGHT = 1.20   # 어떤 전략이 좋아도 +20% 이상 강화 금지
 
-# WARNING 상태 가중치 축소 비율
-WARNING_SCALE = 0.50     # WARNING 전략은 가중치 50% 축소
+# WARNING / BLOCK qty_scale 상수
+WARNING_QTY_SCALE = 0.30   # WARNING 전략: 진입금액 30%로 축소 (학습 유지)
+BLOCK_QTY_SCALE   = 0.0    # BLOCK 전략:   진입 완전 차단
 
 # 조정 스텝
 STEP_UP     = 0.10    # EV > +0.5% 시 +10%
@@ -161,22 +169,41 @@ class WeightAdjuster:
         """
         실전 매매에 사용하는 유효 가중치 반환.
 
-        적용 규칙 (순서):
-          1. DISABLED → 0.0  (진입 불가, 호출 전 check_signal()로 사전 차단 권장)
+        적용 규칙:
+          1. BLOCK → 0.0  (진입 불가)
           2. 저장 가중치를 LIVE_MIN~LIVE_MAX 범위로 클램핑
-          3. WARNING 상태이면 클램핑 후 값에 WARNING_SCALE(0.5) 추가 적용
-             단, 클램핑 하한(LIVE_MIN) 아래로는 내려가지 않음
+          3. WARNING/NORMAL 모두 BUY_SCORE 차감 없음 (qty_scale로 대체)
 
         Returns: float (0.0 또는 LIVE_MIN ~ LIVE_MAX 범위)
         """
         key    = f"{market}:{signal_type}"
         status = self.analyzer.get_status(market, signal_type)
 
-        if status == "DISABLED":
+        if status in ("BLOCK", "DISABLED"):   # DISABLED 하위호환 유지
             return 0.0
 
         raw_w  = self._weights.get(key, DEFAULT_W)
         return self._apply_live_clamp(raw_w, status)
+
+    def get_adaptive_qty_scale(self, market: str, signal_type: str) -> float:
+        """
+        Adaptive 상태에 따른 진입 수량 배율 반환.
+
+        설계 원칙 — Adaptive = 위험 축소 시스템:
+          BUY_SCORE는 차감하지 않음. 진입 여부는 원래 기준 그대로.
+          단, 상태에 따라 진입 수량만 줄여서 위험을 통제.
+
+        Returns:
+          NORMAL  → 1.0  (full size)
+          WARNING → 0.3  (30% 축소, 학습/검증 거래 유지)
+          BLOCK   → 0.0  (진입 금지)
+        """
+        status = self.analyzer.get_status(market, signal_type)
+        if status in ("BLOCK", "DISABLED"):
+            return BLOCK_QTY_SCALE
+        if status == "WARNING":
+            return WARNING_QTY_SCALE
+        return 1.0  # ACTIVE
 
     def check_signal(self, market: str, signal_type: str) -> tuple:
         """
@@ -184,11 +211,11 @@ class WeightAdjuster:
 
         Returns:
             (allowed: bool, status: str)
-            allowed = False  → DISABLED, 진입 금지
-            allowed = True   → ACTIVE 또는 WARNING (가중치만 축소)
+            allowed = False  → BLOCK, 진입 금지
+            allowed = True   → ACTIVE 또는 WARNING (qty_scale 축소, BUY_SCORE 그대로)
         """
         status  = self.analyzer.get_status(market, signal_type)
-        allowed = (status != "DISABLED")
+        allowed = status not in ("BLOCK", "DISABLED")
         return allowed, status
 
     # ── 레거시 호환 API ───────────────────────────────────────
@@ -218,18 +245,10 @@ class WeightAdjuster:
         """
         저장 가중치 → 실전 가중치 변환.
           1) LIVE_MIN ~ LIVE_MAX 클램핑
-          2) WARNING이면 × WARNING_SCALE
-          3) 클램핑 하한 재적용 (WARNING 축소 후 LIVE_MIN 보장)
+          2) WARNING/NORMAL 모두 BUY_SCORE 차감 없음 (qty_scale로 위험 관리)
         """
-        # 1) 클램핑
+        # LIVE 클램핑만 적용 — WARNING이어도 BUY_SCORE 차감 없음
         clamped = max(LIVE_MIN_WEIGHT, min(raw_w, LIVE_MAX_WEIGHT))
-        # 2) WARNING 축소
-        if status == "WARNING":
-            clamped = clamped * WARNING_SCALE
-        # 3) 최소값 보장 (DISABLED가 아닌 한 LIVE_MIN 이상)
-        if status != "DISABLED":
-            clamped = max(clamped, LIVE_MIN_WEIGHT * WARNING_SCALE
-                          if status == "WARNING" else LIVE_MIN_WEIGHT)
         return round(clamped, 3)
 
     # ── 파일 I/O ─────────────────────────────────────────────
@@ -245,9 +264,10 @@ class WeightAdjuster:
 
     def _save_weights(self):
         data = dict(self._weights)
-        data["_updated_at"]    = datetime.now().isoformat()
-        data["_live_min"]      = LIVE_MIN_WEIGHT
-        data["_live_max"]      = LIVE_MAX_WEIGHT
-        data["_warning_scale"] = WARNING_SCALE
+        data["_updated_at"]         = datetime.now().isoformat()
+        data["_live_min"]            = LIVE_MIN_WEIGHT
+        data["_live_max"]            = LIVE_MAX_WEIGHT
+        data["_warning_qty_scale"]   = WARNING_QTY_SCALE
+        data["_block_qty_scale"]     = BLOCK_QTY_SCALE
         with open(_WEIGHTS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
