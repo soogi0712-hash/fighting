@@ -1290,6 +1290,32 @@ class USStrategy:
         if force_action:
             is_sl = "STOP" in force_action or "STOPLOSS" in force_action
             is_pe = "TAKE" in force_action or "익절" in (sell_reason or "") or "트레일" in (sell_reason or "")
+            # ★ [필수 로그 태그] 대시보드 식별용 표준 태그 출력
+            if force_action in ("TAKE_PROFIT_HARD_CAP", "TAKE_PROFIT_TRAIL", "SELL_TAKE_PG"):
+                logger.info(
+                    f"[TAKE_PROFIT] 종목={name}({code}) | "
+                    f"수익률={pnl_pct:+.2f}% | 트리거={force_action} | 사유={sell_reason}"
+                )
+            elif force_action in ("STOPLOSS_HARD", "SELL_STOP", "SELL_FORCE"):
+                logger.warning(
+                    f"[STOP_LOSS] 종목={name}({code}) | "
+                    f"수익률={pnl_pct:+.2f}% | 트리거={force_action} | 사유={sell_reason}"
+                )
+            elif force_action == "TAKE_PROFIT_PROTECT":
+                logger.info(
+                    f"[PROFIT_PROTECT] 종목={name}({code}) | "
+                    f"수익률={pnl_pct:+.2f}% | 트리거={force_action} | 사유={sell_reason}"
+                )
+            elif force_action in ("FORCE_CLOSE", "OVERNIGHT_PREVENT"):
+                logger.info(
+                    f"[TIME_EXIT] 종목={name}({code}) | "
+                    f"수익률={pnl_pct:+.2f}% | 트리거={force_action} | 사유={sell_reason}"
+                )
+            else:
+                logger.info(
+                    f"[SELL_TRIGGER] 종목={name}({code}) | "
+                    f"수익률={pnl_pct:+.2f}% | 트리거={force_action} | 사유={sell_reason}"
+                )
             return self._do_sell(
                 code=code, name=name, exch_cd=exch_cd,
                 qty=held_qty, cur_price=cur_price,

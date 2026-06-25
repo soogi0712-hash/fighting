@@ -220,6 +220,21 @@ class StrategyAnalyzer:
         current_status = prev.get("status", "ACTIVE")
         new_status = _judge_status(new_stats, current_status)
 
+        # ★ [긴급 안정화] READONLY 모드: status 자동 변경 차단
+        # weight_adjuster.ADAPTIVE_READONLY 를 동적으로 참조
+        try:
+            from adaptive.weight_adjuster import ADAPTIVE_READONLY as _READONLY
+        except ImportError:
+            _READONLY = False
+
+        if _READONLY and new_status != current_status:
+            logger.info(
+                f"[StrategyAnalyzer][READONLY] 상태 변경 억제 {signal_type} "
+                f"{current_status} → {new_status} (READONLY 모드 — 변경 차단) "
+                f"(EV={new_stats['ev']:+.3f}%, n={new_stats['trade_count']})"
+            )
+            new_status = current_status  # 상태 변경 차단, 기존 유지
+
         # 기존 가중치 유지 (WeightAdjuster가 별도 관리)
         weight = prev.get("weight", 1.0)
 

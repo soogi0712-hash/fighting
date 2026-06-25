@@ -28,10 +28,17 @@ strategy_weights.json에 저장 → KRStrategy / USStrategy가 참조.
   WARNING → qty_scale = 0.3  (30%  축소, 학습 유지)
   BLOCK   → qty_scale = 0.0  (진입 완전 차단)
 
+★ ADAPTIVE_READONLY 모드 (긴급 안정화):
+  True 로 설정하면 adjust()가 분석·로그만 하고 파일 저장·가중치 변경 없음.
+  live_w / BUY_SCORE / 진입조건 자동 변경 완전 차단.
+  get_effective_weight(), get_adaptive_qty_scale() 은 그대로 동작.
+
 변경 이력:
   2026-06-24: WARNING_SCALE(BUY_SCORE 차감) 제거
               → get_adaptive_qty_scale() 추가 (qty_scale 반환)
               → DISABLED 상태명 → BLOCK으로 변경
+  2026-06-25: ADAPTIVE_READONLY 플래그 추가
+              → adjust() 에서 가중치 파일 저장 완전 차단
 """
 
 import os
@@ -45,6 +52,11 @@ from adaptive.strategy_analyzer import StrategyAnalyzer, _DATA_DIR
 logger = get_logger("WeightAdjuster")
 
 _WEIGHTS_FILE = os.path.join(_DATA_DIR, "strategy_weights.json")
+
+# ★ [긴급 안정화] Adaptive 읽기전용 모드
+# True: adjust()가 분석/로그만 하고 가중치 파일 저장·변경 완전 차단
+# False: 정상 모드 (EV 기반 가중치 자동 조정 + 저장)
+ADAPTIVE_READONLY: bool = True
 
 # ── 내부 저장 가중치 범위 (장기 학습 누적용) ──────────────────
 MIN_WEIGHT  = 0.1
@@ -93,7 +105,16 @@ class WeightAdjuster:
         """
         전체 또는 특정 시장 전략 가중치 자동 조정.
         Returns: 조정 내역 리스트 [{signal_type, old_w, new_w, ev, reason}]
+
+        ★ ADAPTIVE_READONLY=True 이면 분석·로그만 하고 가중치 저장 없음.
         """
+        # ★ [긴급 안정화] 읽기전용 모드 체크
+        if ADAPTIVE_READONLY:
+            logger.info(
+                "[WeightAdjuster] ADAPTIVE_READONLY=True — "
+                "분석/로그만 실행, 가중치 저장·변경 차단"
+            )
+
         # 최신 분석 실행
         self.analyzer.run(market=market)
         stats = self.analyzer.get_signal_stats(market)
@@ -136,6 +157,18 @@ class WeightAdjuster:
 
             new_w = round(new_w, 3)
 
+            # ★ READONLY: 가중치 메모리 반영/파일 저장 차단 (로그만 출력)
+            if ADAPTIVE_READONLY:
+                if abs(new_w - old_w) > 0.001 or status == "DISABLED":
+                    live_w = self._apply_live_clamp(new_w, status)
+                    logger.info(
+                        f"[WeightAdjuster][READONLY] {mkt}:{sig} "
+                        f"저장가중치 유지={old_w:.2f} (조정 억제: {old_w:.2f}→{new_w:.2f}) "
+                        f"| 실전가중치 유지={self._apply_live_clamp(old_w, status):.2f} "
+                        f"| {reason} | READONLY모드"
+                    )
+                continue  # 저장·메모리 반영 없이 다음 항목으로
+
             # 변동이 있을 때만 기록
             if abs(new_w - old_w) > 0.001 or status == "DISABLED":
                 self._weights[key] = new_w
@@ -160,7 +193,13 @@ class WeightAdjuster:
                     f"| 실전가중치 {live_w:.2f} | {reason}"
                 )
 
-        self._save_weights()
+        # ★ READONLY: 파일 저장 차단
+        if not ADAPTIVE_READONLY:
+            self._save_weights()
+        else:
+            logger.info(
+                "[WeightAdjuster] READONLY — strategy_weights.json 저장 차단 완료"
+            )
         return report
 
     # ── 실전 가중치 조회 (핵심 API) ──────────────────────────

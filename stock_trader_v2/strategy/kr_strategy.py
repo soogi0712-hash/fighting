@@ -564,6 +564,28 @@ class KRStrategy:
         if action in ("SELL_TAKE", "SELL_STOP", "SELL_FORCE"):
             is_sl = action == "SELL_STOP"
             is_pe = action == "SELL_TAKE"
+            # ★ [필수 로그 태그] 대시보드 식별용 표준 태그 출력
+            if action == "SELL_TAKE":
+                logger.info(
+                    f"[TAKE_PROFIT] 종목={name}({code}) | 시장=KR | "
+                    f"수익률={pct:+.2f}% | 사유={reason}"
+                )
+            elif action == "SELL_STOP":
+                logger.warning(
+                    f"[STOP_LOSS] 종목={name}({code}) | 시장=KR | "
+                    f"수익률={pct:+.2f}% | 사유={reason}"
+                )
+            elif action == "SELL_FORCE":
+                if "시간" in reason or "강제" in reason or "15:20" in reason or "15:10" in reason:
+                    logger.info(
+                        f"[TIME_EXIT] 종목={name}({code}) | 시장=KR | "
+                        f"수익률={pct:+.2f}% | 사유={reason}"
+                    )
+                else:
+                    logger.warning(
+                        f"[STOP_LOSS] 종목={name}({code}) | 시장=KR | "
+                        f"수익률={pct:+.2f}% | 트리거=SELL_FORCE | 사유={reason}"
+                    )
             result = self.executor.execute_sell(
                 code           = code,
                 name           = name,

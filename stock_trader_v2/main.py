@@ -1104,6 +1104,31 @@ def main():
                         f"최종감시={len(us_watch_list)}"
                     )
 
+            # ★ [WATCHLIST_HOLD] 보유 포지션 강제 감시목록 포함 (장중/장외 무관)
+            # 이유: us_watch_list는 환경변수+스크리너만 포함 → 보유종목 미포함 시
+            #       run()이 호출되지 않아 TAKE_PROFIT/STOP_LOSS/TIME_EXIT 전부 무효
+            if strategy_us and strategy_us._positions:
+                _wl_codes_now = {s["code"] for s in us_watch_list}
+                _held_added   = []
+                for _hc, _hpg in list(strategy_us._positions.items()):
+                    if _hc not in _wl_codes_now:
+                        _hname    = getattr(_hpg, "name", _hc)
+                        _hexch    = getattr(_hpg, "exch_cd", "NASD")
+                        us_watch_list.append({
+                            "code":    _hc,
+                            "name":    _hname,
+                            "exch_cd": _hexch,
+                        })
+                        _wl_codes_now.add(_hc)
+                        _held_added.append(_hc)
+                if _held_added:
+                    logger.warning(
+                        f"[WATCHLIST_HOLD] 보유 포지션 감시목록 강제 추가 | "
+                        f"종목={_held_added} | "
+                        f"최종감시={len(us_watch_list)} | "
+                        f"사유=보유종목은_항상_SELL_루프_대상"
+                    )
+
 
             # ★ US 스크리너 결과 파일 읽기 → us_watch_list 갱신 (매 루프 체크)
             # v1-dashboard의 screener가 작성하는 us_intraday.json 공유
