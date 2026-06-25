@@ -171,6 +171,12 @@ class USStrategy:
         #   active   : True = 트레일링 모드 진행 중
         self._trail_state: dict = {}
 
+        # ★ [BUG2 FIX] SELL_OK 직후 KIS 캐시 지연 재등록 방지
+        # SELL_OK 성공 시점으로부터 60초간 해당 코드를 KIS 기준 재등록 차단
+        # {code: timestamp_float}
+        self._sold_grace: dict = {}          # SELL_OK 후 60초 재등록 차단
+        _SOLD_GRACE_SEC = 60.0               # 60초 (KIS 체결 반영 대기)
+
         _DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
         self._pos_file = os.path.join(_DATA_DIR, "v2_us_positions.json")
         os.makedirs(_DATA_DIR, exist_ok=True)
@@ -303,22 +309,34 @@ class USStrategy:
                     )
             else:
                 # 내부 포지션 없음 → KIS 기준으로 즉시 등록
-                breakout_low = round(kis_avg * 0.98, 4)
-                self._positions[code] = PositionGuard(
-                    code         = code,
-                    name         = name,
-                    avg_price    = kis_avg,
-                    qty          = kis_qty,
-                    entry_time   = datetime.now(KST),
-                    breakout_low = breakout_low,
-                )
-                self._save_positions()
-                logger.warning(
-                    f"[KIS-POS 동기화] 종목={name}({code}) | "
-                    f"KIS수량={kis_qty} 내부수량=0 | "
-                    f"KIS평균단가=${kis_avg:.4f} 내부평균단가=없음 | "
-                    f"처리결과=KIS기준신규등록(breakout=${breakout_low:.4f})"
-                )
+                # ★ [BUG2 FIX] SELL_OK 직후 grace period 내이면 재등록 차단
+                _grace_ts = self._sold_grace.get(code, 0.0)
+                _now_ts   = time.time()
+                _SOLD_GRACE_SEC = 60.0
+                if _grace_ts > 0 and (_now_ts - _grace_ts) < _SOLD_GRACE_SEC:
+                    logger.info(
+                        f"[KIS-POS 동기화] 종목={name}({code}) | "
+                        f"KIS수량={kis_qty} 내부수량=0 | "
+                        f"처리결과=SELL_OK grace period 내 재등록 차단 "
+                        f"(경과={_now_ts - _grace_ts:.0f}초 < {_SOLD_GRACE_SEC:.0f}초)"
+                    )
+                else:
+                    breakout_low = round(kis_avg * 0.98, 4)
+                    self._positions[code] = PositionGuard(
+                        code         = code,
+                        name         = name,
+                        avg_price    = kis_avg,
+                        qty          = kis_qty,
+                        entry_time   = datetime.now(KST),
+                        breakout_low = breakout_low,
+                    )
+                    self._save_positions()
+                    logger.warning(
+                        f"[KIS-POS 동기화] 종목={name}({code}) | "
+                        f"KIS수량={kis_qty} 내부수량=0 | "
+                        f"KIS평균단가=${kis_avg:.4f} 내부평균단가=없음 | "
+                        f"처리결과=KIS기준신규등록(breakout=${breakout_low:.4f})"
+                    )
 
         # ★ KIS API 캐시 유효 여부 플래그 (_kis_cache_valid_early와 동일 값, 가독성용 별칭)
         _kis_cache_valid = _kis_cache_valid_early
@@ -1594,6 +1612,38 @@ class USStrategy:
         # ★ KIS 미국 매도: 시장가(01) 불가 → 지정가(00) + 현재가로 즉시 체결
         # cur_price는 USD float ($93.05 등) → round 2자리 유지
         sell_price_usd = round(cur_price, 2) if cur_price > 0 else 0.0
+
+        # ★ [BUG1 FIX] 미체결 SELL 주문 사전 확인 및 취소
+        # rt_cd=7 원인: 이전 루프의 SELL 주문이 미체결 상태로 남아 주문가능수량=0
+        # → 매도 전 미체결 SELL 주문 자동 취소로 rt_cd=7 무한반복 방지
+        try:
+            pending = self.broker.get_pending_orders()
+            sell_pending = [
+                o for o in pending
+                if o.get("code", "").upper() == code.upper()
+                and o.get("side") == "02"  # 02=매도
+            ]
+            if sell_pending:
+                logger.warning(
+                    f"[DO_SELL] {name}({code}) 미체결 SELL 주문 {len(sell_pending)}건 발견 "
+                    f"→ 취소 후 재주문 (rt_cd=7 방지)"
+                )
+                for po in sell_pending:
+                    cancelled = self.broker.cancel_order(
+                        ord_no=po["ord_no"],
+                        code=code,
+                        exch_cd=po.get("exch_cd", exch_cd),
+                        qty=po["remaining"],
+                    )
+                    logger.warning(
+                        f"[DO_SELL] {name}({code}) 미체결SELL취소 "
+                        f"ord_no={po['ord_no']} remaining={po['remaining']} "
+                        f"→ {'성공' if cancelled else '실패'}"
+                    )
+                time.sleep(1.0)  # KIS 처리 대기
+        except Exception as _pe:
+            logger.debug(f"[DO_SELL] {name}({code}) 미체결주문 조회 실패(무시): {_pe}")
+
         result = self.executor.execute_sell(
             code=code, name=name,
             qty=qty, price=sell_price_usd,   # USD 지정가 (소수점 2자리)
@@ -1615,6 +1665,8 @@ class USStrategy:
             _trail_snap = self._trail_state.get(code, {}).copy()
             self._trail_state.pop(code, None)   # ★ 트레일링 상태 초기화
             self._save_positions()
+            # ★ [BUG2 FIX] SELL_OK 시점 기록 → KIS 캐시 재등록 grace period 시작
+            self._sold_grace[code] = time.time()
 
             if pg:
                 pnl_usd  = (cur_price - pg.avg_price) * qty
@@ -1677,6 +1729,29 @@ class USStrategy:
                 f"❌ [US SELL FAIL] {name}({code}) {qty}주 "
                 f"msg={result.get('msg')} | {reason}"
             )
+            # ★ [BUG3 FIX] SELL_FAIL도 학습 기록 — 실패한 매도 시도를 EV에 반영
+            # KIS 주문 오류로 청산 안됨 → 실제 손실은 포지션에 누적됨
+            # recorder에 '미청산' 사유로 기록하여 전략 학습 데이터 유지
+            _pg_fail = self._positions.get(code)
+            if _pg_fail and self.recorder:
+                _fail_exit_pct = (cur_price - _pg_fail.avg_price) / _pg_fail.avg_price * 100 \
+                                 if _pg_fail.avg_price > 0 else 0.0
+                _fail_pnl_krw  = (_fail_exit_pct / 100) * _pg_fail.avg_price * qty * self.usd_krw
+                try:
+                    self.recorder.record_exit(
+                        code        = code,
+                        exit_price  = float(cur_price),
+                        exit_qty    = qty,
+                        exit_reason = f"SELL_FAIL(미청산)|{reason}",
+                        exit_pct    = float(_fail_exit_pct),
+                        pnl_krw     = float(_fail_pnl_krw),
+                    )
+                    logger.info(
+                        f"[SELL_FAIL_RECORD] {name}({code}) 학습 기록 "
+                        f"pct={_fail_exit_pct:+.2f}% pnl={_fail_pnl_krw:+,.0f}원"
+                    )
+                except Exception as _rfe:
+                    logger.debug(f"[USStrategy] SELL_FAIL 학습 기록 실패: {_rfe}")
 
         return {
             "action":  action,

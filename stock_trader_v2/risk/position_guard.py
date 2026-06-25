@@ -53,7 +53,7 @@ T_FORCE_CLOSE      = dtime(15, 20)   # 전량 강제 청산
 T_CANCEL_BUY       = dtime(15, 20)   # 미체결 매수 취소
 
 # ── 손절 파라미터 ────────────────────────────────────────────────
-STOPLOSS_HARD_PCT    = -5.0    # 최종 에어백 -5%
+STOPLOSS_HARD_PCT    = -3.0    # 최종 에어백 -3% (기존 -5% → 조기 대응으로 강화)
 STOPLOSS_SOFT_PCT    = -1.5    # 돌파 실패 청산 -1.5%
 OVERNIGHT_PROFIT_MIN = 1.0     # 오버나이트 검토 기준 수익률 +1.0%
 
