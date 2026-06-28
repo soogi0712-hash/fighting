@@ -1846,7 +1846,15 @@ class USStrategy:
         bb_lower  = bb_mean - 2 * bb_std
 
         # 거래량 증가 / 폭증
-        vol_ok    = cur_vol > prev_vol
+        # [개선 2026-06-28] vol_ok: 직전봉 비교 OR avg_vol4 대비 0.8x 이상
+        # yfinance/KIS 5분봉에서 cur_vol=0 리턴 시 false negative 방지
+        # 거래량비=0.0x 표시는 cur_vol/avg_vol4 계산 로그용 (별도)
+        if cur_vol > 0 and prev_vol > 0:
+            vol_ok = cur_vol > prev_vol or cur_vol > avg_vol4 * 0.8
+        elif cur_vol > 0:
+            vol_ok = cur_vol > avg_vol4 * 0.8
+        else:
+            vol_ok = False  # 거래량 데이터 자체가 없음
         vol_surge = cur_vol > avg_vol4 * 2.0
 
         # VWAP 위 여부

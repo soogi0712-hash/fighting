@@ -28,7 +28,7 @@ logger = get_logger("ReentryGuard")
 
 # ── 쿨다운 상수 ─────────────────────────────────────────────────
 COOLDOWN_PROFIT_H     = 1    # ① 익절: 60분
-COOLDOWN_SOFT_H       = 4    # ② 약손절/이탈: 4시간
+COOLDOWN_SOFT_H       = 3    # ② [개선 2026-06-28] 약손절/이탈: 4h→3h (오전 손절 후 오후 재진입 허용)
 COOLDOWN_EOD_H        = 24   # ③④ 당일 자정 (실제는 다음날 00:00으로 cap)
 MAX_COOLDOWN_DAYS     = 1    # 최대 1거래일 (다음날 자정)
 
@@ -187,14 +187,25 @@ class ReentryGuard:
             cooldown_until = now + timedelta(hours=COOLDOWN_SOFT_H)
             tag = f"약손절/이탈({COOLDOWN_SOFT_H}h)"
         else:
-            # hard_loss / 큰 손실 / 2회 이상 손실 → 당일 자정
-            cooldown_until = midnight
-            if loss_count_today >= 2:
-                tag = f"당일2회이상손실(당일자정)"
-            elif pnl_pct <= BIG_LOSS_PCT:
-                tag = f"큰손실{pnl_pct:.1f}%(당일자정)"
+            # hard_loss / 큰 손실 / 2회 이상 손실
+            # [개선 2026-06-28] 19개 동시 손절→당일자정 차단→오후진입 전면불가 구조 개선
+            # 당일 2회 이상 손실이고 pnl≤-3%인 경우만 자정까지 차단
+            # 그 외 hard_loss는 3시간 차단 (오전 손절 후 오후 재진입 가능)
+            if loss_count_today >= 2 and pnl_pct <= BIG_LOSS_PCT:
+                cooldown_until = midnight
+                tag = f"중대손실{pnl_pct:.1f}%+{loss_count_today}회(당일자정)"
+            elif loss_count_today >= 3:
+                cooldown_until = midnight
+                tag = f"당일{loss_count_today}회이상손실(당일자정)"
             else:
-                tag = "손절(당일자정)"
+                # 첫 번째 hard_loss 또는 2회지만 손실 작음 → 3시간
+                cooldown_until = now + timedelta(hours=COOLDOWN_SOFT_H)
+                if loss_count_today >= 2:
+                    tag = f"당일{loss_count_today}회손실({COOLDOWN_SOFT_H}h)"
+                elif pnl_pct <= BIG_LOSS_PCT:
+                    tag = f"큰손실{pnl_pct:.1f}%({COOLDOWN_SOFT_H}h)"
+                else:
+                    tag = f"손절({COOLDOWN_SOFT_H}h)"
 
         # ★ 최대 1거래일 상한 적용 (다음날 자정 초과 불가)
         cooldown_until = _max_cooldown_cap(cooldown_until)

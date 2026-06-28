@@ -65,7 +65,7 @@ US_BUY_CUT_BEFORE_CLOSE_MIN = 30
 _PRICE_TTL      = 20.0   # 현재가 20초 캐시 (배치 prefetch 후 루프 내내 유효)
 _CANDLE_TTL     = 120.0  # 봉 120초 캐시
 _BALANCE_TTL    = 60.0   # 잔고 60초 캐시
-_ORDERABLE_TTL  = 60.0   # 주문가능금액 60초 캐시 (매 종목 API호출 방지)
+_ORDERABLE_TTL  = 300.0  # [개선 2026-06-28] 주문가능금액 5분 캐시 (60초→300초: last_ok 장시간 유효 유지)
 
 
 def _is_dst_kst(dt_kst: datetime) -> bool:

@@ -54,7 +54,10 @@ logger = get_logger("KRStrategy")
 KST    = pytz.timezone("Asia/Seoul")
 
 # ── BUY SCORE 임계 ─────────────────────────────────────────────
-BUY_SCORE_EARLY = 0.40
+# [개선 2026-06-28] EARLY 임계 0.40→0.35: BUY_SCORE=0.429 고정구조에서
+# RSI=100(오프닝 갭업)인 경우 점수 미달로 인한 기회 손실 방지
+# 단, WARNING 상태이므로 qty_scale=0.30 적용 유지 (수량 자동 제한)
+BUY_SCORE_EARLY = 0.35
 BUY_SCORE_FULL  = 0.55
 
 # ── 추격매수 금지 기준 ─────────────────────────────────────────
@@ -792,13 +795,18 @@ class KRStrategy:
             if obv_up >= 3:
                 score += 1.0
 
-        # RSI 중립~상승 (40~70) — iv["rsi"]는 위에서 이미 설정됨
+        # RSI 중립~상승 (40~80) — 오프닝 갭업(RSI≥70) 모멘텀 인정
+        # [개선 2026-06-28] 상한 70→80: 오프닝 9시 초기봉 RSI=100은 여전히 제외하되
+        # 오전 모멘텀 구간(RSI=70~80)도 점수 부여
         rsi_val = iv.get("rsi", 0.0)
         if rsi_val == 0.0 and len(closes) >= 14:
             rsi_val = self._calc_rsi(closes, 14)
             iv["rsi"] = rsi_val
-        if 40 <= rsi_val <= 70:
+        if 40 <= rsi_val <= 80:
             score += 1.0
+        elif rsi_val > 80:
+            # RSI 과열(>80) 이지만 오프닝 갭업 강도 반영 — 0.5점
+            score += 0.5
 
         # 볼린저밴드 중심선 위
         if ma20 > 0 and cur_close > ma20:
