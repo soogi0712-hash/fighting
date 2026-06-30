@@ -469,12 +469,16 @@ class USBroker(KISBase):
         return candles
 
     def _get_1min_candles_yfinance(self, code: str, exch_cd: str, now_ts: float) -> list:
-        """yfinance 1분봉 폴백 (KIS OPSQ2001 / 빈응답 시 사용). 최근 30개 반환.
+        """yfinance 1분봉 폴백 (KIS OPSQ2001 / 빈응답 시 사용). 최근 75개 반환.
 
         ★ period='5d' 사용 이유:
            period='1d'는 개장 직후(09:30 ET 직후 18분 이내 등)에 데이터가
            극소수(4개 이하)만 반환되어 _CANDLE_MIN=5 조건 미달 → 전종목 SKIP.
-           period='5d'로 넉넉히 가져와 최신 30봉만 사용.
+           period='5d'로 넉넉히 가져와 최신 75봉만 사용.
+
+        ★ 75봉 이유 [개선 2026-06-30]:
+           1분봉 30개 → 5분봉 6개 → RSI 계산 불가(period+1=15봉 미만) → RSI=50.0 고정
+           1분봉 75개 → 5분봉 15개 → RSI(14기간) 정상 계산 가능
         """
         try:
             import yfinance as yf
@@ -482,7 +486,7 @@ class USBroker(KISBase):
             if hist.empty:
                 return []
             candles = []
-            for ts_idx, row in hist.iloc[::-1].head(30).iterrows():
+            for ts_idx, row in hist.iloc[::-1].head(75).iterrows():  # 30→75
                 candles.append({
                     "time":   ts_idx.strftime("%Y%m%d%H%M%S"),
                     "open":   float(row["Open"]),
@@ -511,7 +515,7 @@ class USBroker(KISBase):
         미국 주식 5분봉 (1분봉 5개 집계).
         KIS 해외주식 API는 1분봉만 지원하므로 직접 집계.
 
-        Returns: 최신봉 [0] 기준, 최대 12개 (약 60분)
+        Returns: 최신봉 [0] 기준, 최대 15개 (약 75분)
             [{
               "open":   float,
               "high":   float,

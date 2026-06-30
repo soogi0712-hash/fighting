@@ -1914,6 +1914,9 @@ class USStrategy:
         # 정규화
         buy_score = max(0.0, min(score_raw / 10.0, 1.0))
 
+        # 거래량비 (로그용)
+        vol_ratio = (cur_vol / avg_vol4) if avg_vol4 > 0 else 0.0
+
         return {
             "buy_score":     buy_score,
             "sell_score":    sell_score,
@@ -1931,6 +1934,7 @@ class USStrategy:
             "chase_reason":  chase_reason,
             "cur_vol":       cur_vol,
             "avg_vol4":      avg_vol4,
+            "vol_ratio":     vol_ratio,  # 기사 용 (cur_vol/avg_vol4)
         }
 
     def _calc_breakout_bonus(self,
