@@ -39,6 +39,9 @@ strategy_weights.json에 저장 → KRStrategy / USStrategy가 참조.
               → DISABLED 상태명 → BLOCK으로 변경
   2026-06-25: ADAPTIVE_READONLY 플래그 추가
               → adjust() 에서 가중치 파일 저장 완전 차단
+  2026-07-01: ADAPTIVE_READONLY=False — 학습 재개
+              → [ADAPTIVE_UPDATE] 로그 형식 추가 (조정 결과 매일 출력)
+              → 안전장치 유지: live_w 하한 0.80 / BLOCK 기준 불변 / WARNING qty_scale=0.30
 """
 
 import os
@@ -53,10 +56,11 @@ logger = get_logger("WeightAdjuster")
 
 _WEIGHTS_FILE = os.path.join(_DATA_DIR, "strategy_weights.json")
 
-# ★ [긴급 안정화] Adaptive 읽기전용 모드
-# True: adjust()가 분석/로그만 하고 가중치 파일 저장·변경 완전 차단
+# Adaptive 학습 모드
+# True: adjust()가 분석/로그만 하고 가중치 파일 저장·변경 완전 차단 (긴급 안정화용)
 # False: 정상 모드 (EV 기반 가중치 자동 조정 + 저장)
-ADAPTIVE_READONLY: bool = True
+# 2026-07-01: False로 변경 — 학습 재개 (긴급 안전핀 해제)
+ADAPTIVE_READONLY: bool = False
 
 # ── 내부 저장 가중치 범위 (장기 학습 누적용) ──────────────────
 MIN_WEIGHT  = 0.1
@@ -106,9 +110,9 @@ class WeightAdjuster:
         전체 또는 특정 시장 전략 가중치 자동 조정.
         Returns: 조정 내역 리스트 [{signal_type, old_w, new_w, ev, reason}]
 
-        ★ ADAPTIVE_READONLY=True 이면 분석·로그만 하고 가중치 저장 없음.
+        ADAPTIVE_READONLY=True 이면 분석·로그만 하고 가중치 저장 없음.
+        ADAPTIVE_READONLY=False(정상 모드) 이면 EV 기반 가중치 조정 + 파일 저장 실행.
         """
-        # ★ [긴급 안정화] 읽기전용 모드 체크
         if ADAPTIVE_READONLY:
             logger.info(
                 "[WeightAdjuster] ADAPTIVE_READONLY=True — "
@@ -121,14 +125,14 @@ class WeightAdjuster:
 
         report = []
         for key, s in stats.items():
-            mkt = s.get("market", "KR")
-            sig = s.get("signal_type", key)
-            ev  = s.get("ev", 0.0)
-            n   = s.get("trade_count", 0)
+            mkt    = s.get("market", "KR")
+            sig    = s.get("signal_type", key)
+            ev     = s.get("ev", 0.0)
+            n      = s.get("trade_count", 0)
             status = s.get("status", "ACTIVE")
 
-            old_w = self._weights.get(key, DEFAULT_W)
-            new_w = old_w
+            old_w  = self._weights.get(key, DEFAULT_W)
+            new_w  = old_w
             reason = "변동없음"
 
             # DISABLED → 가중치 0
@@ -155,47 +159,76 @@ class WeightAdjuster:
                 new_w  = max(old_w - STEP_DOWN, MIN_WEIGHT)
                 reason = f"EV={ev:+.3f}% 부진 → -{STEP_DOWN*100:.0f}%"
 
-            new_w = round(new_w, 3)
+            new_w  = round(new_w, 3)
+            live_w = self._apply_live_clamp(new_w, status)
 
-            # ★ READONLY: 가중치 메모리 반영/파일 저장 차단 (로그만 출력)
+            # ── READONLY 모드: 가중치 메모리/파일 반영 차단, 로그만 출력 ──
             if ADAPTIVE_READONLY:
                 if abs(new_w - old_w) > 0.001 or status == "DISABLED":
-                    live_w = self._apply_live_clamp(new_w, status)
                     logger.info(
                         f"[WeightAdjuster][READONLY] {mkt}:{sig} "
-                        f"저장가중치 유지={old_w:.2f} (조정 억제: {old_w:.2f}→{new_w:.2f}) "
-                        f"| 실전가중치 유지={self._apply_live_clamp(old_w, status):.2f} "
+                        f"저장가중치 유지={old_w:.3f} (조정 억제: {old_w:.3f}→{new_w:.3f}) "
+                        f"| 실전가중치 유지={self._apply_live_clamp(old_w, status):.3f} "
                         f"| {reason} | READONLY모드"
                     )
                 continue  # 저장·메모리 반영 없이 다음 항목으로
 
-            # 변동이 있을 때만 기록
-            if abs(new_w - old_w) > 0.001 or status == "DISABLED":
+            # ── 정상 모드: 변동 항목 반영 + [ADAPTIVE_UPDATE] 로그 출력 ──
+            changed = abs(new_w - old_w) > 0.001 or status == "DISABLED"
+            if changed:
                 self._weights[key] = new_w
-                # 실전 적용 가중치도 함께 계산해서 로그
-                live_w = self._apply_live_clamp(new_w, status)
-                report.append({
-                    "market":        mkt,
-                    "signal_type":   sig,
-                    "old_weight":    round(old_w, 3),
-                    "new_weight":    new_w,
-                    "live_weight":   live_w,
-                    "ev":            ev,
-                    "win_rate":      s.get("win_rate", 0),
-                    "trade_count":   n,
-                    "status":        status,
-                    "reason":        reason,
-                    "adjusted_at":   datetime.now().isoformat(),
-                })
-                logger.info(
-                    f"[WeightAdjuster] {mkt}:{sig} "
-                    f"저장가중치 {old_w:.2f} → {new_w:.2f} "
-                    f"| 실전가중치 {live_w:.2f} | {reason}"
-                )
 
-        # ★ READONLY: 파일 저장 차단
+            # 전략별 조정 결과를 [ADAPTIVE_UPDATE] 형식으로 항상 출력
+            if status in ("BLOCK", "DISABLED"):
+                applied = "BLOCK — 진입 차단"
+            elif not changed:
+                # 변동 없음 (데이터 부족 or EV 임계 미달 포함)
+                if status == "WARNING":
+                    applied = f"경량진입 유지 (live_w={live_w:.3f}, qty_scale={WARNING_QTY_SCALE:.0%})"
+                else:
+                    applied = f"유지 (live_w={live_w:.3f})"
+            else:
+                # 실제 가중치 변동
+                direction = "▲" if new_w > old_w else "▼"
+                if status == "WARNING":
+                    applied = f"{direction} 경량진입 (live_w={live_w:.3f}, qty_scale={WARNING_QTY_SCALE:.0%})"
+                else:
+                    applied = f"{direction} 가중치 적용 (live_w={live_w:.3f})"
+
+            logger.info(
+                f"[ADAPTIVE_UPDATE] "
+                f"전략={mkt}:{sig} | "
+                f"이전 weight={old_w:.3f} | "
+                f"변경 weight={new_w:.3f} | "
+                f"live_w={live_w:.3f} | "
+                f"EV={ev:+.3f}% | "
+                f"n={n} | "
+                f"status={status} | "
+                f"적용결과={applied}"
+            )
+
+            if changed:
+                report.append({
+                    "market":      mkt,
+                    "signal_type": sig,
+                    "old_weight":  round(old_w, 3),
+                    "new_weight":  new_w,
+                    "live_weight": live_w,
+                    "ev":          ev,
+                    "win_rate":    s.get("win_rate", 0),
+                    "trade_count": n,
+                    "status":      status,
+                    "reason":      reason,
+                    "adjusted_at": datetime.now().isoformat(),
+                })
+
+        # 파일 저장
         if not ADAPTIVE_READONLY:
             self._save_weights()
+            logger.info(
+                f"[WeightAdjuster] strategy_weights.json 저장 완료 "
+                f"(조정 {len(report)}건)"
+            )
         else:
             logger.info(
                 "[WeightAdjuster] READONLY — strategy_weights.json 저장 차단 완료"
