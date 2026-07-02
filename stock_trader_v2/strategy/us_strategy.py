@@ -68,6 +68,13 @@ CHASE_RISE_15M  = 4.0    # 최근 15분 상승률(%) 초과 시 금지
 CHASE_RISE_5M   = 2.0    # 최근 5분 상승률(%) 초과 시 금지
 CHASE_BULL_CNT  = 3      # 연속 양봉 N개 이상 시 금지
 
+# ── 장중 신호 (Midday Signal) 상수 ────────────────────────────
+# 미국장 개장(22:30 KST / EDT) 후 N분 이후를 "장중"으로 간주
+MIDDAY_START_MIN    = 60         # 개장 후 60분 = 23:30 KST(EDT) 이후
+MIDDAY_VOL_MULT     = 2.5        # 직전 4봉 평균 대비 2.5x 이상 거래량
+MIDDAY_VWAP_CROSS_MARGIN = 0.001 # VWAP 크로스 허용 오차 0.1%
+MIDDAY_SCORE_MIN    = 0.40       # 장중 면제 경로 최소 BUY_SCORE (EARLY와 동일)
+
 # ── 오버나이트 관련 ───────────────────────────────────────────
 OVERNIGHT_CHECK_MIN   = 10   # 마감 10분 전: 수익<+1% → 청산 검토
 OVERNIGHT_PROFIT_PCT  = 1.0  # 오버나이트 허용 최소 수익률(%)
@@ -329,6 +336,7 @@ class USStrategy:
                         qty          = kis_qty,
                         entry_time   = datetime.now(KST),
                         breakout_low = breakout_low,
+                        market       = "US",
                     )
                     self._save_positions()
                     logger.warning(
@@ -560,16 +568,48 @@ class USStrategy:
         # 지표 계산
         iv = self._calc_indicators(candles_5m, price_data)
 
-        # 추격매수 금지
-        if iv.get("chase_blocked"):
+        # ── 장중 신호 판단 (개장 후 MIDDAY_START_MIN 이상 경과 시 chase_block 면제) ──
+        _midday_sig = iv.get("midday_signal", False)
+        _midday_tags = []
+        if iv.get("vwap_cross_up"):    _midday_tags.append("VWAP크로스")
+        if iv.get("bb_upper_cross"):   _midday_tags.append("BB상단돌파")
+        if iv.get("midday_vol_surge"): _midday_tags.append("장중거래량급증")
+        _midday_str = "+".join(_midday_tags) if _midday_tags else "없음"
+
+        _midday_chase_exempt = False
+        if iv.get("chase_blocked") and _midday_sig:
+            # 미국장 개장 시각 계산 (EDT=22:30 KST, EST=23:30 KST)
+            from broker.us_broker import _is_dst_kst as _dst_fn3
+            _is_dst = _dst_fn3(now_kst)
+            _open_h, _open_m = (22, 30) if _is_dst else (23, 30)
+            _market_open_kst = now_kst.replace(
+                hour=_open_h, minute=_open_m, second=0, microsecond=0
+            )
+            # 자정을 넘긴 경우 (EST 23:30 이후 KST 다음날) 조정 없이 직접 계산
+            if now_kst < _market_open_kst:
+                # 아직 개장 전 (이론상 이 경로는 is_buy_allowed()에서 걸림)
+                _elapsed_open = 0.0
+            else:
+                _elapsed_open = (now_kst - _market_open_kst).total_seconds() / 60
+            if _elapsed_open >= MIDDAY_START_MIN:
+                _midday_chase_exempt = True
+                logger.info(
+                    f"[MIDDAY_EXEMPT] {name}({code}) | 시장=US | "
+                    f"추격차단 면제 — 장중신호({_midday_str}) | "
+                    f"개장후={_elapsed_open:.0f}분 | "
+                    f"chase_reason={iv.get('chase_reason', '')}"
+                )
+
+        # 추격매수 금지 (장중 신호 면제 경로 제외)
+        if iv.get("chase_blocked") and not _midday_chase_exempt:
             return self._skip(code, name,
                 f"추격매수 금지: {iv.get('chase_reason', '')}")
 
-        # 거래량 필터
-        if not iv.get("vol_ok"):
+        # 거래량 필터 (장중 거래량급증 신호면 면제)
+        if not iv.get("vol_ok") and not iv.get("midday_vol_surge"):
             return self._skip(code, name, "거래량 부족")
 
-        # VWAP 위 필터
+        # VWAP 위 필터 (VWAP 크로스 업이면 현재봉은 VWAP 위이므로 자연히 통과)
         if not iv.get("above_vwap"):
             return self._skip(code, name, "VWAP 하방")
 
@@ -582,10 +622,13 @@ class USStrategy:
         stage = self._entry_stage.get(code, "NONE")
 
         # ── ★ Adaptive Signal Filter + Weight 실전 반영 ──
-        # signal_type 분류 (진입 전 미리 판별)
+        # signal_type 분류 (진입 전 미리 판별) — 장중 면제 경로는 US_MIDDAY
         from adaptive.trade_recorder import classify_signal
         stage_for_classify = "FULL" if buy_score >= BUY_SCORE_FULL else "EARLY"
-        signal_type = classify_signal("US", iv, stage=stage_for_classify)
+        signal_type = classify_signal(
+            "US", iv, stage=stage_for_classify,
+            midday_exempt=_midday_chase_exempt
+        )
         adapted_buy_score = self._apply_adaptive_weight(
             code, name, signal_type, iv, buy_score
         )
@@ -595,15 +638,24 @@ class USStrategy:
                                f"[ADAPTIVE] {signal_type} DISABLED — 진입 차단")
         buy_score = adapted_buy_score
 
+        # 장중 면제 경로는 MIDDAY_SCORE_MIN 기준 적용
+        _score_min = MIDDAY_SCORE_MIN if _midday_chase_exempt else BUY_SCORE_EARLY
+        if buy_score < _score_min and stage == "NONE":
+            return self._skip(code, name,
+                f"BUY_SCORE={buy_score:.3f} < {_score_min:.2f} (장중면제경로)" if _midday_chase_exempt
+                else f"BUY_SCORE={buy_score:.3f} < {_score_min:.2f}")
+
         # ── [US BUY 판정] 로그 — 매 스캔마다 판정 근거 출력 ──
         vwap     = iv.get("vwap", 0)
         rsi      = iv.get("rsi", 0)
         vol_ratio = iv.get("vol_ratio", 0)
         sell_score = iv.get("sell_score", 0)
+        _midday_ok = "✅" if _midday_sig else "❌"
         logger.info(
             f"[US BUY 판정] {name}({code}) | "
             f"현재가=${cur_price:.2f} | VWAP=${vwap:.2f} | "
             f"RSI={rsi:.1f} | 거래량비={vol_ratio:.1f}x | "
+            f"장중신호={_midday_ok}({_midday_str}) | "
             f"SELL={sell_score} | BUY={buy_score:.3f} | "
             f"단계={stage} | 진입기준(EARLY≥{BUY_SCORE_EARLY}/FULL≥{BUY_SCORE_FULL})"
         )
@@ -725,6 +777,7 @@ class USStrategy:
         )
 
     def _place_buy(
+                   self,
                    code: str, name: str, exch_cd: str,
                    cur_price: float, ratio: float,
                    reason: str, candles_5m: list,
@@ -887,6 +940,7 @@ class USStrategy:
                 avg_price=order_price, qty=qty,
                 entry_time=datetime.now(KST),
                 breakout_low=breakout_low,
+                market="US",
             )
             self._save_positions()
             # ★ execute_buy 반환값에서 order_no 추출
@@ -1083,6 +1137,7 @@ class USStrategy:
                 avg_price=avg_price, qty=held_qty,
                 entry_time=entry_time,
                 breakout_low=breakout_low,
+                market="US",
             )
             self._save_positions()
             logger.info(
@@ -1917,6 +1972,26 @@ class USStrategy:
         # 거래량비 (로그용)
         vol_ratio = (cur_vol / avg_vol4) if avg_vol4 > 0 else 0.0
 
+        # ── 장중 신호 계산 (Midday Signals) ──────────────────────
+        # US 5분봉은 최신봉이 인덱스 0 (내림차순)
+        # VWAP 크로스 업: 직전봉은 VWAP 아래, 현재봉은 VWAP 위
+        vwap_cross_up = False
+        if vwap > 0 and len(closes) >= 2:
+            prev_close_for_cross = closes[1]  # US: 인덱스 0=현재, 1=직전
+            vwap_cross_up = (
+                prev_close_for_cross < vwap * (1 + MIDDAY_VWAP_CROSS_MARGIN)
+                and cur_price > vwap
+            )
+
+        # 볼린저 상단 재돌파: 현재가 > BB 상단
+        bb_upper_cross = (cur_price > bb_upper) if bb_upper > 0 else False
+
+        # 장중 거래량 급증: 직전 4봉 평균 대비 2.5x 이상
+        midday_vol_surge = (cur_vol > avg_vol4 * MIDDAY_VOL_MULT) if avg_vol4 > 0 else False
+
+        # 장중 신호 종합 플래그
+        midday_signal = vwap_cross_up or bb_upper_cross or midday_vol_surge
+
         return {
             "buy_score":     buy_score,
             "sell_score":    sell_score,
@@ -1934,7 +2009,12 @@ class USStrategy:
             "chase_reason":  chase_reason,
             "cur_vol":       cur_vol,
             "avg_vol4":      avg_vol4,
-            "vol_ratio":     vol_ratio,  # 기사 용 (cur_vol/avg_vol4)
+            "vol_ratio":     vol_ratio,
+            # 장중 신호
+            "vwap_cross_up":    vwap_cross_up,
+            "bb_upper_cross":   bb_upper_cross,
+            "midday_vol_surge": midday_vol_surge,
+            "midday_signal":    midday_signal,
         }
 
     def _calc_breakout_bonus(self,
@@ -2256,6 +2336,7 @@ class USStrategy:
                     qty           = qty,
                     entry_time    = entry_dt,
                     breakout_low  = float(p.get("breakout_low", 0)),
+                    market        = "US",
                 )
             self._entry_stage  = data.get("entry_stages", {})
             # ★ 트레일링 상태 복원 — V2 재시작 후에도 HWM 유지
@@ -2374,6 +2455,7 @@ class USStrategy:
                 qty          = qty,
                 entry_time   = now_kst,
                 breakout_low = breakout_low,
+                market       = "US",
             )
             # 블랙리스트 종목이면 강제청산 필요 명시
             if code in _KIS_ORDER_BLACKLIST:

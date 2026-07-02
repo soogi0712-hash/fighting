@@ -69,6 +69,16 @@ CHASE_BULL_CNT  = 3      # 연속 양봉 수
 BUY_STOP_TIME   = dtime(14, 30)
 FORCE_CLOSE_TIME = dtime(15, 20)
 
+# ── 장중 신호 (Midday Signal) 상수 ───────────────────────────
+# 장 시작 후 N분 이후를 "장중"으로 간주 (09:00+30분 = 09:30)
+MIDDAY_START_MIN   = 30          # 장 시작 후 30분 = 09:30부터 장중 구간
+# 장중 거래량 급증 기준: 직전 4봉 평균 대비
+MIDDAY_VOL_MULT    = 2.5         # 2.5x 이상 → 새로운 세력 유입 신호
+# VWAP 크로스 판정: 직전봉 VWAP 기준 배율
+MIDDAY_VWAP_CROSS_MARGIN = 0.001 # 0.1% — VWAP 근접 크로스 허용 오차
+# 장중 신호 진입 시 BUY_SCORE 최소 임계 (EARLY와 동일)
+MIDDAY_SCORE_MIN   = 0.35        # 장중 신호도 최소 점수 통과 필요
+
 # ════════════════════════════════════════════════════════════
 # ■ 전략 B (BB하단 평균회귀) 상수
 # ════════════════════════════════════════════════════════════
@@ -244,6 +254,12 @@ class KRStrategy:
         sell_score = iv["sell_score"]
 
         # ── 항상 로그 ────────────────────────────────────────
+        _midday_sig = iv.get("midday_signal", False)
+        _midday_tags = []
+        if iv.get("vwap_cross_up"):    _midday_tags.append("VWAP크로스")
+        if iv.get("bb_upper_cross"):   _midday_tags.append("BB상단돌파")
+        if iv.get("midday_vol_surge"): _midday_tags.append("장중거래량급증")
+        _midday_str = "+".join(_midday_tags) if _midday_tags else "없음"
         logger.info(
             f"[진입평가-A] {name}({code}) | strategy={strategy} | "
             f"현재가={cur_price:,} | "
@@ -251,31 +267,57 @@ class KRStrategy:
             f"RSI={iv.get('rsi', 0):.0f} | "
             f"거래량증가={iv['vol_increase']} | "
             f"VWAP위={iv['vwap_above']} | "
-            f"추격={iv['chase_blocked']}"
+            f"추격={iv['chase_blocked']} | "
+            f"장중신호={_midday_str}"
         )
 
+        # ── 장중 신호 판단 (09:30 이후 + 장중 신호 해당 시 chase_block 면제) ──
+        # 설계 원칙: "추격"이 아닌 "새로운 모멘텀" 신호에만 면제 적용
+        #   - VWAP 크로스 업: VWAP 아래에서 위로 회복 (새 매수 세력)
+        #   - 볼린저 상단 재돌파: 장 초반 이후 새 돌파 구간 진입
+        #   - 장중 거래량 급증: 기존 흐름 대비 새로운 세력 유입
+        # 단, BUY_SCORE ≥ MIDDAY_SCORE_MIN + VWAP 위 + SELL_SCORE < 5 유지
+        _midday_chase_exempt = False
+        if iv["chase_blocked"] and _midday_sig:
+            # 장 시작 후 MIDDAY_START_MIN 분 이상 경과한 경우만 면제
+            _market_open_kst = now.replace(hour=9, minute=0, second=0, microsecond=0)
+            _elapsed_open = (now - _market_open_kst).total_seconds() / 60
+            if _elapsed_open >= MIDDAY_START_MIN:
+                _midday_chase_exempt = True
+                logger.info(
+                    f"[MIDDAY_EXEMPT] {name}({code}) | "
+                    f"추격차단 면제 — 장중신호({_midday_str}) | "
+                    f"장개시후={_elapsed_open:.0f}분 | "
+                    f"chase_reason={iv['chase_reason']}"
+                )
+
         # ── 필수 조건 체크 ───────────────────────────────────
-        if iv["chase_blocked"]:
+        if iv["chase_blocked"] and not _midday_chase_exempt:
             return self._skip(code, name,
                                f"추격매수차단({iv['chase_reason']})")
 
-        if not iv["vol_increase"]:
+        if not iv["vol_increase"] and not _midday_sig:
+            # 장중 신호는 midday_vol_surge 자체가 거래량 급증이므로 면제
             return self._skip(code, name, "거래량 증가 없음")
 
         if not iv["vwap_above"]:
+            # VWAP 위 조건은 장중에도 반드시 유지 (단, VWAP 크로스 업 시 cur_close≥vwap 이므로 충족됨)
             return self._skip(code, name, "VWAP 아래")
 
         if sell_score >= 5:
             return self._skip(code, name,
                                f"SELL_SCORE={sell_score} ≥ 5 — 진입 금지")
 
-        if buy_score < BUY_SCORE_EARLY:
+        # 장중 면제 경로는 MIDDAY_SCORE_MIN 기준 적용
+        _score_min = MIDDAY_SCORE_MIN if _midday_chase_exempt else BUY_SCORE_EARLY
+        if buy_score < _score_min:
             return self._skip(code, name,
-                               f"BUY_SCORE={buy_score:.2f} < {BUY_SCORE_EARLY}")
+                               f"BUY_SCORE={buy_score:.2f} < {_score_min}")
 
         # ── ★ Adaptive Signal Filter + Weight 실전 반영 ──────
-        # signal_type 분류 (진입 전 미리 판별)
-        signal_type = classify_signal("KR", iv)
+        # ── ★ Adaptive Signal Filter + Weight 실전 반영 ──────
+        # signal_type 분류 (진입 전 미리 판별) — 장중 신호 면제 경로는 KR_MIDDAY
+        signal_type = classify_signal("KR", iv, midday_exempt=_midday_chase_exempt)
         adapted_buy_score = self._apply_adaptive_weight(
             code, name, signal_type, iv, buy_score
         )
@@ -289,11 +331,13 @@ class KRStrategy:
         _vwap_val   = price_data.get("vwap", 0) if price_data else 0
         _vol_inc    = "✅" if iv.get("vol_increase") else "❌"
         _vwap_above = "✅" if iv.get("vwap_above")   else "❌"
+        _midday_ok  = "✅" if _midday_sig else "❌"
         logger.info(
             f"[KR BUY 판정-A] {name}({code}) | strategy={strategy} | "
             f"현재가={cur_price:,.0f}원 | VWAP={_vwap_val:,.0f} | "
             f"RSI={iv.get('rsi', 0):.0f} | "
             f"거래량={_vol_inc} | VWAP위={_vwap_above} | "
+            f"장중신호={_midday_ok}({_midday_str}) | "
             f"SELL={sell_score} | BUY={buy_score:.3f} | "
             f"단계={self._entry_stage.get(code, 'NONE')} | "
             f"진입기준(EARLY≥{BUY_SCORE_EARLY}/FULL≥{BUY_SCORE_FULL})"
@@ -704,6 +748,11 @@ class KRStrategy:
             "bb_upper":     0.0,    # ★ 전략 B용
             "ma20":         0.0,    # ★ 전략 B용
             "avg_vol20":    0.0,    # ★ 전략 B용
+            # ── 장중 신호 (Midday Signal) ─────────────────────
+            "vwap_cross_up":    False,  # VWAP 아래→위 크로스 (회복)
+            "bb_upper_cross":   False,  # 볼린저 상단 재돌파
+            "midday_vol_surge": False,  # 직전 4봉 평균 대비 2.5x 급증
+            "midday_signal":    False,  # 위 3개 중 1개 이상 해당
         }
 
         if len(candles_5m) < 4:
@@ -761,6 +810,33 @@ class KRStrategy:
             elif bull_cnt >= CHASE_BULL_CNT:
                 iv["chase_blocked"] = True
                 iv["chase_reason"]  = f"연속양봉={bull_cnt}개"
+
+        # ── 장중 신호 계산 (Midday Signals) ─────────────────────
+        # VWAP 크로스 업: 직전봉은 VWAP 아래, 현재봉은 VWAP 위 (회복 신호)
+        if vwap > 0 and len(closes) >= 2:
+            prev_close_for_cross = closes[-2]
+            vwap_cross_up = (
+                prev_close_for_cross < vwap * (1 + MIDDAY_VWAP_CROSS_MARGIN)
+                and cur_close > vwap
+            )
+            iv["vwap_cross_up"] = vwap_cross_up
+        else:
+            vwap_cross_up = False
+
+        # 볼린저 상단 재돌파: 현재 종가가 BB 상단 돌파
+        if bb_upper > 0 and cur_close > bb_upper:
+            iv["bb_upper_cross"] = True
+        else:
+            iv["bb_upper_cross"] = False
+
+        # 장중 거래량 급증: 직전 4봉 평균 대비 2.5x 이상
+        midday_vol_surge = (cur_vol > avg_vol4 * MIDDAY_VOL_MULT) if avg_vol4 > 0 else False
+        iv["midday_vol_surge"] = midday_vol_surge
+
+        # 장중 신호 종합 플래그 (1개 이상이면 True)
+        iv["midday_signal"] = (
+            iv["vwap_cross_up"] or iv["bb_upper_cross"] or iv["midday_vol_surge"]
+        )
 
         # ── BUY SCORE 계산 ────────────────────────────────────
         score = 0.0

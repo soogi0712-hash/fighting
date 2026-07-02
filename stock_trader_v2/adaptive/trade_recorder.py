@@ -46,9 +46,19 @@ _lock = threading.Lock()
 # signal_type 분류기
 # ═══════════════════════════════════════════════════════════════
 
-def classify_signal(market: str, iv: dict, stage: str = "") -> str:
-    """진입 시 iv + stage → signal_type 문자열 반환."""
+def classify_signal(market: str, iv: dict, stage: str = "",
+                    midday_exempt: bool = False) -> str:
+    """진입 시 iv + stage → signal_type 문자열 반환.
+
+    midday_exempt=True: 장중 신호로 chase_block 면제된 진입
+      → KR_MIDDAY / US_MIDDAY 반환 (Adaptive Engine 별도 추적)
+    주의: iv['midday_signal'] 플래그는 지표 계산용이며
+          signal_type 분류에는 midday_exempt 파라미터만 사용.
+    """
     if market == "KR":
+        # 장중 신호 면제 경로 — 가장 먼저 체크 (명시적 면제 플래그만)
+        if midday_exempt:
+            return "KR_MIDDAY"
         bp = iv.get("breakout_bonus", 0.0)
         if bp >= 0.30:  return "폭발돌파"
         if bp >= 0.20:  return "강한돌파"
@@ -59,6 +69,9 @@ def classify_signal(market: str, iv: dict, stage: str = "") -> str:
         if vi:          return "거래량증가"
         return "기본진입"
     else:  # US
+        # 장중 신호 면제 경로 — 가장 먼저 체크 (명시적 면제 플래그만)
+        if midday_exempt:
+            return "US_MIDDAY"
         vs = iv.get("vol_surge", False)
         if stage.upper() == "FULL":   return "US_FULL"
         if stage.upper() == "EARLY":  return "US_EARLY"
