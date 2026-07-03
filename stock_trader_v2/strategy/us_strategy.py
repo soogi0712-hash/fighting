@@ -2338,7 +2338,19 @@ class USStrategy:
                     breakout_low  = float(p.get("breakout_low", 0)),
                     market        = "US",
                 )
-            self._entry_stage  = data.get("entry_stages", {})
+            raw_stages = data.get("entry_stages", {})
+            # ★ [BUG FIX 2026-07-03] SELL 후 entry_stage 잔류 방지:
+            #   positions에 없는 종목의 stage는 복원하지 않음
+            self._entry_stage = {
+                code: stage
+                for code, stage in raw_stages.items()
+                if code in self._positions
+            }
+            orphan_stages = [c for c in raw_stages if c not in self._positions]
+            if orphan_stages:
+                logger.info(
+                    f"[USStrategy] 고아 entry_stage 정리 (포지션 없음): {orphan_stages}"
+                )
             # ★ 트레일링 상태 복원 — V2 재시작 후에도 HWM 유지
             self._trail_state  = data.get("trail_state", {})
             if self._positions:
