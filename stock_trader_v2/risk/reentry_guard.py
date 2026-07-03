@@ -96,10 +96,35 @@ def _next_midnight() -> datetime:
     return datetime(now.year, now.month, now.day) + timedelta(days=1)
 
 
-def _max_cooldown_cap(dt: datetime) -> datetime:
-    """최대 1거래일 상한 — 다음날 자정을 넘으면 다음날 자정으로 cap."""
-    cap = _next_midnight()
-    return dt if dt <= cap else cap
+def _kr_market_close(ref: datetime = None) -> datetime:
+    """
+    KR 장 마감 시각 반환 (기본: 오늘 15:30).
+    ref가 주어지면 ref 날짜 기준.
+    KR 차단 상한 cap으로 사용 — 장 마감 전 손절은 당일 15:30까지만 차단.
+    단, 이미 15:30 이후이면 자정(다음날 00:00)을 반환하지 않고 다음날 15:30 반환.
+    """
+    base = (ref or datetime.now()).replace(hour=15, minute=30,
+                                           second=0, microsecond=0)
+    return base
+
+
+def _max_cooldown_cap(dt: datetime, market: str = "") -> datetime:
+    """
+    최대 쿨다운 상한 적용.
+    - KR: 당일 15:30 KST (장 마감)까지 → 다음날 09:00 장 시작에 영향 없음
+    - US: 다음날 자정 (기존 로직 유지)
+    - 단, KR도 15:30 이후 손절 시에는 자정을 cap으로 사용
+      (오버나이트 포지션 방지 목적 차단은 당일 자정까지 유효)
+    """
+    midnight = _next_midnight()
+    if market.upper() == "KR":
+        # KR 장 마감(15:30) 이전 손절 → 당일 15:30까지만 차단
+        # KR 장 마감(15:30) 이후 → 자정까지 (당일이므로 다음날 09:00에는 해제)
+        kr_close = _kr_market_close()
+        cap = kr_close if datetime.now() < kr_close else midnight
+        return dt if dt <= cap else cap
+    # US / 기타: 기존 다음날 자정 cap
+    return dt if dt <= midnight else midnight
 
 
 def _key(market: str, code: str) -> str:
@@ -207,8 +232,8 @@ class ReentryGuard:
                 else:
                     tag = f"손절({COOLDOWN_SOFT_H}h)"
 
-        # ★ 최대 1거래일 상한 적용 (다음날 자정 초과 불가)
-        cooldown_until = _max_cooldown_cap(cooldown_until)
+        # ★ 최대 1거래일 상한 적용 (KR: 당일 장 마감 15:30 / US: 다음날 자정)
+        cooldown_until = _max_cooldown_cap(cooldown_until, market=market)
 
         # ── 등록 ────────────────────────────────────────────
         entry = {
@@ -369,7 +394,9 @@ class ReentryGuard:
     # ────────────────────────────────────────────────────────
 
     def _find_today_sell_in_tradelog(self, market: str, code: str) -> Optional[dict]:
+        """오늘 날짜 기준 SELL 이력 탐색 (폴백용). 만료된 항목은 None 반환."""
         today = date.today().isoformat()
+        now   = datetime.now()
         for fname in ("v2_trade_log.json", "trade_log.json"):
             log_file = os.path.join(_DATA_DIR, fname)
             if not os.path.exists(log_file):
@@ -382,10 +409,27 @@ class ReentryGuard:
             for entry in reversed(logs):
                 if entry.get("action") != "SELL":
                     continue
-                if not str(entry.get("timestamp", "")).startswith(today):
+                ts = str(entry.get("timestamp", ""))
+                if not ts.startswith(today):
                     continue
-                if str(entry.get("code", "")).upper() == code.upper():
-                    return entry
+                if str(entry.get("code", "")).upper() != code.upper():
+                    continue
+                # ★ 만료 여부 사전 체크: 이미 만료된 항목은 스킵
+                try:
+                    sold_at  = datetime.fromisoformat(ts[:19])
+                    category = _classify_reason(entry.get("reason", ""))
+                    pnl_pct  = float(entry.get("pnl_pct", 0.0))
+                    if category == "profit":
+                        exp = sold_at + timedelta(hours=COOLDOWN_PROFIT_H)
+                    elif category == "soft_loss" and pnl_pct > BIG_LOSS_PCT:
+                        exp = sold_at + timedelta(hours=COOLDOWN_SOFT_H)
+                    else:
+                        exp = datetime(sold_at.year, sold_at.month, sold_at.day) + timedelta(days=1)
+                    if exp <= now:
+                        continue  # 이미 만료 → 차단 불필요
+                except Exception:
+                    pass
+                return entry
         return None
 
     # ────────────────────────────────────────────────────────
@@ -396,6 +440,12 @@ class ReentryGuard:
         """
         서버 시작 시 오늘 trade_log SELL → guard 파일 복원.
         기존 등록 항목은 덮어쓰지 않음.
+
+        ★ [버그수정 2026-07-03] 날짜 기준 이중 검증
+          - 동일 날짜 SELL 기록만 복원 (date.today() 일치 필수)
+          - 복원 시 원래 SELL 시각 기준으로 쿨다운 재계산하여
+            "지금 + Nh" 방식으로 매번 갱신되는 문제 방지
+          - 이미 만료된 쿨다운은 복원하지 않음 (skip)
         """
         if log_path is None:
             # v2_trade_log.json 우선, 없으면 trade_log.json 폴백
@@ -408,6 +458,7 @@ class ReentryGuard:
             return
 
         today = date.today().isoformat()
+        now   = datetime.now()
         try:
             with open(log_path, "r", encoding="utf-8") as f:
                 logs = json.load(f)
@@ -415,27 +466,87 @@ class ReentryGuard:
             logger.warning(f"[Guard] trade_log 로드 실패: {e}")
             return
 
-        data = _load()
+        data  = _load()
         n_new = 0
+        n_skip_expired = 0
         for entry in logs:
             if entry.get("action") != "SELL":
                 continue
-            if not str(entry.get("timestamp", "")).startswith(today):
+            ts = str(entry.get("timestamp", ""))
+            if not ts.startswith(today):
                 continue
-            code   = entry.get("code", "")
-            name   = entry.get("name", code)
-            reason = entry.get("reason", "trade_log복원")
-            market = entry.get("market", "KR")
+
+            code    = entry.get("code", "")
+            name    = entry.get("name", code)
+            reason  = entry.get("reason", "trade_log복원")
+            market  = entry.get("market", "KR")
             pnl_pct = float(entry.get("pnl_pct", entry.get("profit_pct", 0.0)))
-            k      = _key(market, code)
+            k       = _key(market, code)
+
+            # ── 이미 guard에 등록된 경우 스킵 ──────────────
             if k in data:
                 continue
-            self.record_sell(market, code, name,
-                             reason=reason, pnl_pct=pnl_pct,
-                             label="RESTORE")
+
+            # ── 원래 매도 시각 파싱 ────────────────────────
+            try:
+                sold_at = datetime.fromisoformat(ts[:19])
+            except Exception:
+                sold_at = now  # 파싱 실패 시 현재 시각
+
+            # ── 원래 시각 기준으로 쿨다운 종료 시각 계산 ──
+            # (now + Nh 대신 sold_at + Nh 로 계산하여 반복 갱신 방지)
+            category = _classify_reason(reason)
+            midnight = datetime(
+                sold_at.year, sold_at.month, sold_at.day
+            ) + timedelta(days=1)  # 매도 당일 자정
+
+            if category == "profit":
+                cooldown_until = sold_at + timedelta(hours=COOLDOWN_PROFIT_H)
+            elif category == "soft_loss" and pnl_pct > BIG_LOSS_PCT:
+                cooldown_until = sold_at + timedelta(hours=COOLDOWN_SOFT_H)
+            else:
+                cooldown_until = midnight
+
+            # 최대 1거래일 상한
+            cap = datetime(sold_at.year, sold_at.month, sold_at.day) + timedelta(days=2)
+            if cooldown_until > cap:
+                cooldown_until = cap
+
+            # ── 이미 만료된 쿨다운은 복원하지 않음 ────────
+            if cooldown_until <= now:
+                n_skip_expired += 1
+                continue
+
+            # ── guard 파일에 직접 기록 (record_sell 미호출 → now 갱신 방지) ──
+            midnight_cap = _next_midnight()
+            entry_data = {
+                "market":           market.upper(),
+                "code":             code,
+                "name":             name,
+                "sell_reason":      reason,
+                "label":            "RESTORE",
+                "category":         category,
+                "is_stoploss":      (category == "hard_loss"),
+                "is_profit_exit":   (category == "profit"),
+                "pnl_pct":          round(pnl_pct, 2),
+                "loss_count_today": 0,
+                "sold_at":          sold_at.isoformat(),
+                "cooldown_until":   cooldown_until.isoformat(),
+            }
+            data[k] = entry_data
             n_new += 1
-        if n_new:
-            logger.info(f"[Guard] trade_log 복원 완료: {n_new}건 (기준={today})")
+            logger.info(
+                f"[Guard] RESTORE: {name}({code}) | {market} | "
+                f"매도={sold_at.strftime('%m/%d %H:%M')} | "
+                f"쿨다운={cooldown_until.strftime('%m/%d %H:%M')}"
+            )
+
+        if n_new or n_skip_expired:
+            _save(data)
+            logger.info(
+                f"[Guard] trade_log 복원 완료: 등록={n_new}건, "
+                f"만료스킵={n_skip_expired}건 (기준={today})"
+            )
 
     # ────────────────────────────────────────────────────────
     # 관리 유틸

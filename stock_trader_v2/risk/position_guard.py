@@ -25,6 +25,8 @@ risk/position_guard.py — 포지션 리스크 관리 (V2)
   - 2026-06-24: TrialPlanManager 연동 — 실험 파라미터 동적 오버라이드 지원
                 breakout_tolerance (돌파봉저가 허용폭)
                 weak_entry_cut_pct / weak_entry_max_min (WEAK_ENTRY 완화)
+  - 2026-06-30: market 파라미터 추가 — US 시장은 15:20 강제청산/오버나이트 제외
+                (KST 22:30~04:00 미국 정규장은 USStrategy 자체 마감로직이 별도 처리)
 """
 
 from datetime import time as dtime, datetime
@@ -63,7 +65,8 @@ STOP_FLOOR_PCT       = 0.8     # 돌파봉저가 손절선 최소 폭 (진입가
 # ── WEAK_ENTRY_EXIT 파라미터 ─────────────────────────────────────
 WEAK_ENTRY_MAX_MIN   = 5.0     # 진입 후 경과 시간 상한 (분)
 WEAK_ENTRY_MAX_PCT   = 0.3     # HWM 상한 (% 미만)
-WEAK_ENTRY_CUT_PCT   = -0.7    # 현재손익 기준 (% 이하)
+WEAK_ENTRY_CUT_PCT   = -0.7    # 현재손익 기준 KR (% 이하)
+WEAK_ENTRY_CUT_PCT_US = -0.9   # [개선 2026-07-03] US는 변동성 크므로 완화 (-0.7→-0.9%)
 
 # ── TIME_EXIT 파라미터 ───────────────────────────────────────────
 TIME_EXIT_20MIN_PCT  = 0.5     # 20분 경과 후 수익률 기준
@@ -90,10 +93,12 @@ class PositionGuard:
                  avg_price:  float,
                  qty:        int,
                  entry_time: datetime,
-                 breakout_low: float = 0.0):
+                 breakout_low: float = 0.0,
+                 market:     str   = "KR"):
         """
         breakout_low: 진입 시점 돌파봉 저가 (0이면 사용 안 함).
         손절 플로어: max(breakout_low, avg_price * (1 - STOP_FLOOR_PCT/100))
+        market: 'KR' 또는 'US' — US는 15:20 강제청산/오버나이트 로직 비활성화
         """
         self.code         = code
         self.name         = name
@@ -101,6 +106,7 @@ class PositionGuard:
         self.qty          = qty
         self.entry_time   = entry_time
         self.breakout_low = breakout_low
+        self.market       = market.upper()   # 'KR' or 'US'
 
         # ── 실험 파라미터 적용 (TrialPlanManager 연동) ───────────
         trial = _get_trial_params()
@@ -223,14 +229,14 @@ class PositionGuard:
             logger.warning(f"[PositionGuard] {name}({code}) {reason}")
             return {"action": "SELL_STOP", "reason": reason, "pct": pct}
 
-        # ── 3. 15:20 강제 청산 ──────────────────────────────────
-        if t >= T_FORCE_CLOSE:
+        # ── 3. 15:20 강제 청산 (KR 전용 — US는 USStrategy 자체 마감로직이 처리)
+        if self.market != "US" and t >= T_FORCE_CLOSE:
             reason = f"15:20 강제청산 | net={pct:.2f}%"
             logger.info(f"[PositionGuard] {name}({code}) {reason}")
             return {"action": "SELL_FORCE", "reason": reason, "pct": pct}
 
-        # ── 4. 오버나이트 검토 (15:10 이후) ────────────────────
-        if t >= T_OVERNIGHT_CHECK and pct < OVERNIGHT_PROFIT_MIN:
+        # ── 4. 오버나이트 검토 (15:10 이후, KR 전용)
+        if self.market != "US" and t >= T_OVERNIGHT_CHECK and pct < OVERNIGHT_PROFIT_MIN:
             reason = (
                 f"오버나이트방지 15:10후 "
                 f"net={pct:.2f}% < +{OVERNIGHT_PROFIT_MIN}% | 청산"
@@ -239,10 +245,12 @@ class PositionGuard:
             return {"action": "SELL_FORCE", "reason": reason, "pct": pct}
 
         # ── 5. WEAK_ENTRY_EXIT ───────────────────────────────────
-        # 진입 5분 이내 + HWM < +0.3% + 현재손익 <= -0.7% → 즉시 청산
+        # 진입 5분 이내 + HWM < +0.3% + 현재손익 <= -0.7%(KR)/-0.9%(US) → 즉시 청산
         # TrialPlanManager 실험 중이면 weak_entry_cut_pct / weak_entry_max_min 완화
         _trial2        = _get_trial_params()
-        _we_cut        = _trial2.get("weak_entry_cut_pct",  WEAK_ENTRY_CUT_PCT)
+        # [개선 2026-07-03] US 기본 컷 기준 -0.9% (변동성 반영)
+        _default_cut   = WEAK_ENTRY_CUT_PCT_US if self.market == "US" else WEAK_ENTRY_CUT_PCT
+        _we_cut        = _trial2.get("weak_entry_cut_pct", _default_cut)
         _we_max_min    = _trial2.get("weak_entry_max_min",  WEAK_ENTRY_MAX_MIN)
         if _trial2:
             _we_label  = f"[TRIAL] cut={_we_cut:+.1f}% max_min={_we_max_min:.0f}분"

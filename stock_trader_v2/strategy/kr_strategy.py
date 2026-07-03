@@ -54,11 +54,15 @@ logger = get_logger("KRStrategy")
 KST    = pytz.timezone("Asia/Seoul")
 
 # ── BUY SCORE 임계 ─────────────────────────────────────────────
-# [개선 2026-06-28] EARLY 임계 0.40→0.35: BUY_SCORE=0.429 고정구조에서
-# RSI=100(오프닝 갭업)인 경우 점수 미달로 인한 기회 손실 방지
-# 단, WARNING 상태이므로 qty_scale=0.30 적용 유지 (수량 자동 제한)
-BUY_SCORE_EARLY = 0.35
+BUY_SCORE_EARLY = 0.38   # [개선 2026-07-03] 0.35→0.38: 오프닝 갭업 획일 진입 방지
 BUY_SCORE_FULL  = 0.55
+
+# ── 오프닝 극과열 필터 (2026-07-03 신규) ──────────────────────
+# RSI=100 구간에서 갭업 진입 → 전일 대비 갭업 크기 임계
+OPENING_RSI_HOT        = 95.0   # RSI ≥ 95 → 오프닝 극과열
+OPENING_RSI_OVERHEAT   = 85.0   # RSI ≥ 85 → 과열 (부분 패널티)
+OPENING_PRIME_MIN      = 3      # 장 시작 후 N분 이내를 "오프닝" 으로 간주
+OPENING_SCORE_BONUS    = 0.60   # 오프닝 구간 진입 최소 임계 상향 (EARLY 기준)
 
 # ── 추격매수 금지 기준 ─────────────────────────────────────────
 CHASE_RISE_15M  = 4.0    # 최근 15분 상승률
@@ -310,6 +314,25 @@ class KRStrategy:
 
         # 장중 면제 경로는 MIDDAY_SCORE_MIN 기준 적용
         _score_min = MIDDAY_SCORE_MIN if _midday_chase_exempt else BUY_SCORE_EARLY
+
+        # ── [개선 2026-07-03] 오프닝 RSI 극과열 필터 ────────────────
+        # 장 시작 후 OPENING_PRIME_MIN 분 이내 & RSI ≥ 95 → 임계 상향
+        # 오프닝 갭업 시 BUY_SCORE가 0.464로 획일화되는 구조 방지
+        _elapsed_open_now = (now - now.replace(hour=9, minute=0, second=0, microsecond=0)
+                             ).total_seconds() / 60
+        _rsi_hot = iv.get("rsi_hot", False)
+        if (not _midday_chase_exempt
+                and _elapsed_open_now <= OPENING_PRIME_MIN
+                and _rsi_hot):
+            # 장 시작 3분 내 RSI ≥ 85: 오프닝 극과열 구간 — 임계 상향
+            _score_min = OPENING_SCORE_BONUS
+            logger.info(
+                f"[OPENING_HOT_FILTER] {name}({code}) | "
+                f"RSI={iv.get('rsi', 0):.0f}(≥{OPENING_RSI_OVERHEAT}) | "
+                f"장개시후={_elapsed_open_now:.1f}분 | "
+                f"임계상향 {BUY_SCORE_EARLY:.2f}→{OPENING_SCORE_BONUS:.2f}"
+            )
+
         if buy_score < _score_min:
             return self._skip(code, name,
                                f"BUY_SCORE={buy_score:.2f} < {_score_min}")
@@ -872,17 +895,20 @@ class KRStrategy:
                 score += 1.0
 
         # RSI 중립~상승 (40~80) — 오프닝 갭업(RSI≥70) 모멘텀 인정
-        # [개선 2026-06-28] 상한 70→80: 오프닝 9시 초기봉 RSI=100은 여전히 제외하되
-        # 오전 모멘텀 구간(RSI=70~80)도 점수 부여
+        # [개선 2026-07-03] RSI 구간 세분화: 극과열(≥95) → 0점, 과열(85~95) → 0.2점
         rsi_val = iv.get("rsi", 0.0)
         if rsi_val == 0.0 and len(closes) >= 14:
             rsi_val = self._calc_rsi(closes, 14)
             iv["rsi"] = rsi_val
         if 40 <= rsi_val <= 80:
             score += 1.0
-        elif rsi_val > 80:
-            # RSI 과열(>80) 이지만 오프닝 갭업 강도 반영 — 0.5점
-            score += 0.5
+        elif 80 < rsi_val < OPENING_RSI_OVERHEAT:  # 80~85
+            score += 0.5    # 기존과 동일
+        elif OPENING_RSI_OVERHEAT <= rsi_val < OPENING_RSI_HOT:  # 85~95
+            score += 0.2    # 과열 — 부분 점수만
+        else:  # rsi_val >= 95 → 극과열, 0점 (오프닝 갭업 RSI=100 포함)
+            score += 0.0    # 극과열 — 점수 없음 + 암묵적 패널티 (다른 항목 없으면 임계 미달)
+        iv["rsi_hot"] = rsi_val >= OPENING_RSI_OVERHEAT  # 과열 플래그 저장
 
         # 볼린저밴드 중심선 위
         if ma20 > 0 and cur_close > ma20:
@@ -908,6 +934,7 @@ class KRStrategy:
             score -= float(sell_score - 2)
 
         # 정규화 (최대 14점 → 1.0)
+        iv["rsi_hot"] = iv.get("rsi_hot", False)   # ★ 초기화 누락 방지 (봉 부족 시)
         iv["buy_score"] = round(min(score / 14.0, 1.0), 3)
 
         return iv
