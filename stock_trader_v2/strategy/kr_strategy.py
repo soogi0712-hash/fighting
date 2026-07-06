@@ -9,7 +9,7 @@ strategy/kr_strategy.py — 국내장 V2 핵심 전략 엔진
   - 포지션 리스크는 PositionGuard에 위임
 
 진입 전략:
-  BUY_SCORE ≥ 0.40 → 30% 선진입 (Early Entry)
+  BUY_SCORE ≥ 0.45 → 30% 선진입 (Early Entry)
   BUY_SCORE ≥ 0.55 → +70% 추가 (Full Entry)
   필수: 거래량증가 + VWAP위 + SELL_SCORE < 5
 
@@ -54,7 +54,11 @@ logger = get_logger("KRStrategy")
 KST    = pytz.timezone("Asia/Seoul")
 
 # ── BUY SCORE 임계 ─────────────────────────────────────────────
-BUY_SCORE_EARLY = 0.38   # [개선 2026-07-03] 0.35→0.38: 오프닝 갭업 획일 진입 방지
+# [개선 2026-07-06] 0.38→0.45: DB 485건 분석 결과
+#   BUY_SCORE=0.43(149건): 승률 14.8%/avg -0.58% → 완전 손실 구간
+#   BUY_SCORE=0.46( 68건): 승률 35.3%/avg +0.15% → 수익 구간
+#   0.43 획일화 진입이 손실의 핵심 원인 → 0.45 미만 진입 전면 차단
+BUY_SCORE_EARLY = 0.45   # [개선 2026-07-06] 0.38→0.45: 0.43획일화 손실구간 차단
 BUY_SCORE_FULL  = 0.55
 
 # ── 오프닝 극과열 필터 (2026-07-03 신규) ──────────────────────

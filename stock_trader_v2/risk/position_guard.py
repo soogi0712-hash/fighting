@@ -55,33 +55,47 @@ T_FORCE_CLOSE      = dtime(15, 20)   # 전량 강제 청산
 T_CANCEL_BUY       = dtime(15, 20)   # 미체결 매수 취소
 
 # ── 손절 파라미터 ────────────────────────────────────────────────
-STOPLOSS_HARD_PCT    = -3.0    # 최종 에어백 -3% (기존 -5% → 조기 대응으로 강화)
-STOPLOSS_SOFT_PCT    = -1.5    # 돌파 실패 청산 -1.5%
-OVERNIGHT_PROFIT_MIN = 1.0     # 오버나이트 검토 기준 수익률 +1.0%
+# [분석 2026-07-06] 485건 거래 분석 결과:
+#   - 승률 18.4%, 돌파봉저가이탈 197건(41%) → 구조적 손절 과다
+#   - 3분 내 즉각손절 158건(33%) → 너무 빠른 손절이 손실 확정
+#   - 20~60분 보유 시 승률 29.6%/avg +0.34% → 보유가 더 유리
+STOPLOSS_HARD_PCT    = -5.0    # 최종 에어백 -5% (3%→5%: 너무 잦은 에어백 방지)
+STOPLOSS_SOFT_PCT    = -2.5    # 돌파 실패 청산 (1.5%→2.5%: 노이즈 손절 방지)
+OVERNIGHT_PROFIT_MIN = 0.5     # 오버나이트 검토 기준 수익률 (1.0%→0.5%: 완화)
 
 # ── 손절 플로어 ──────────────────────────────────────────────────
-STOP_FLOOR_PCT       = 0.8     # 돌파봉저가 손절선 최소 폭 (진입가 대비 -0.8%)
+# [개선 2026-07-06] 0.8% → 1.5%: 작은 플로어가 정상 변동성에서 손절 유발
+STOP_FLOOR_PCT       = 1.5     # 돌파봉저가 손절선 최소 폭 (진입가 대비 -1.5%)
+
+# ── 돌파봉저가이탈 쿨타임 ─────────────────────────────────────────
+# [신규 2026-07-06] 진입 후 N분간 돌파봉저가이탈 손절 비활성
+# → 진입 직후 일시적 되돌림(노이즈)에 의한 즉각손절 방지
+BREAKOUT_COOLTIME_MIN = 3.0    # 진입 후 3분간 돌파봉저가이탈 비활성
 
 # ── WEAK_ENTRY_EXIT 파라미터 ─────────────────────────────────────
-WEAK_ENTRY_MAX_MIN   = 5.0     # 진입 후 경과 시간 상한 (분)
-WEAK_ENTRY_MAX_PCT   = 0.3     # HWM 상한 (% 미만)
-WEAK_ENTRY_CUT_PCT   = -0.7    # 현재손익 기준 KR (% 이하)
-WEAK_ENTRY_CUT_PCT_US = -0.9   # [개선 2026-07-03] US는 변동성 크므로 완화 (-0.7→-0.9%)
+# [개선 2026-07-06] 더 엄격하게: 진입 자체가 나빴을 때만 자름
+WEAK_ENTRY_MAX_MIN   = 7.0     # 진입 후 경과 시간 상한 (5→7분: 여유 확대)
+WEAK_ENTRY_MAX_PCT   = 0.2     # HWM 상한 (0.3→0.2%: 더 약한 진입만 자름)
+WEAK_ENTRY_CUT_PCT   = -1.0    # 현재손익 기준 KR (-0.7→-1.0%: 완화)
+WEAK_ENTRY_CUT_PCT_US = -1.2   # US 기준 (-0.9→-1.2%: 변동성 반영)
 
 # ── TIME_EXIT 파라미터 ───────────────────────────────────────────
-TIME_EXIT_20MIN_PCT  = 0.5     # 20분 경과 후 수익률 기준
-TIME_EXIT_40MIN_PCT  = 1.0     # 40분 경과 후 수익률 기준
-TIME_EXIT_SKIP_HWM   = 0.45    # 이 HWM 이상이면 TIME_EXIT 건너뜀 (PROFIT_PROTECT 우선) ← 2026-06-19 (1.0→0.45)
+# [개선 2026-07-06] 20~60분 보유가 유리한 데이터 반영 → 기준 완화
+TIME_EXIT_20MIN_PCT  = -0.3    # 20분 경과 후 수익률 기준 (0.5%→-0.3%: 손실이 아니면 유지)
+TIME_EXIT_40MIN_PCT  = 0.3     # 40분 경과 후 수익률 기준 (1.0%→0.3%: 완화)
+TIME_EXIT_SKIP_HWM   = 0.30    # 이 HWM 이상이면 TIME_EXIT 건너뜀 (PROFIT_PROTECT 우선)
 
 # ── PROFIT_PROTECT 파라미터 ──────────────────────────────────────
-PROFIT_PROTECT_HWM_PCT   = 0.45    # 활성 HWM 기준 (%) ← 2026-06-19 완화 (1.0→0.45)
-PROFIT_PROTECT_MIN_KRW   = 1000    # 활성 평가수익 기준 (원) ← 2026-06-19 완화 (2000→1000)
-PROFIT_PROTECT_PULLBACK  = 0.40    # HWM 대비 40% 반납 시 청산
+# [개선 2026-07-06] 익절 보호 강화: 작은 이익도 확실히 지키기
+PROFIT_PROTECT_HWM_PCT   = 0.30    # 활성 HWM 기준 (0.45→0.30%: 더 일찍 보호)
+PROFIT_PROTECT_MIN_KRW   = 500     # 활성 평가수익 기준 (1000→500원: 더 일찍 보호)
+PROFIT_PROTECT_PULLBACK  = 0.35    # HWM 대비 35% 반납 시 청산 (40%→35%: 더 빨리 지킴)
 
 # ── 익절 파라미터 ────────────────────────────────────────────────
-TAKE_PROFIT_1   = 1.5    # +1.5% 익절 검토
-TAKE_PROFIT_2   = 2.0    # +2.0% 전량 익절
-TAKE_PROFIT_MAX = 2.5    # +2.5% 무조건 전량 익절
+# [개선 2026-07-06] 빠른 익절보다 수익 극대화: 기준 상향
+TAKE_PROFIT_1   = 1.5    # +1.5% 익절 검토 (유지)
+TAKE_PROFIT_2   = 3.0    # +3.0% 전량 익절 (2.0%→3.0%: 수익 더 달리게)
+TAKE_PROFIT_MAX = 5.0    # +5.0% 무조건 전량 익절 (2.5%→5.0%: 큰 수익 놓치지 않게)
 
 
 class PositionGuard:
@@ -211,11 +225,13 @@ class PositionGuard:
             return {"action": "SELL_STOP", "reason": reason, "pct": pct}
 
         # ── 2. 돌파봉 저가 이탈 (플로어 적용) ──────────────────
-        if self.effective_stop > 0 and cur_price < self.effective_stop:
+        # [개선 2026-07-06] 진입 후 BREAKOUT_COOLTIME_MIN(3분) 내에는 비활성
+        # → 진입 직후 일시 되돌림(노이즈)에 의한 즉각손절 방지
+        _cooltime_passed = elapsed_min >= BREAKOUT_COOLTIME_MIN
+        if self.effective_stop > 0 and cur_price < self.effective_stop and _cooltime_passed:
             # 플로어 발동 여부 표시
             floor_price = self.avg_price * (1.0 - STOP_FLOOR_PCT / 100.0) if self.avg_price > 0 else 0
             if self.breakout_low > 0 and self.effective_stop > self.breakout_low:
-                # 플로어가 원래 돌파저가보다 높아서 발동됨
                 reason = (
                     f"돌파봉저가이탈[플로어] {cur_price:,}원 < 손절선={self.effective_stop:,.0f}원 "
                     f"(원돌파저가={self.breakout_low:,.0f}→플로어{STOP_FLOOR_PCT}% 적용) | "

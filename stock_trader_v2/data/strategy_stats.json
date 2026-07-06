@@ -1,39 +1,39 @@
 {
   "US:US_FULL": {
-    "trade_count": 7,
-    "win_count": 0,
-    "loss_count": 7,
-    "win_rate": 0.0,
-    "avg_win_pct": 0.0,
-    "avg_loss_pct": -0.421,
-    "ev": -0.421,
-    "profit_factor": 0.0,
-    "max_consec_loss": 7,
-    "avg_hold_min": 12.1,
-    "total_pnl_krw": -3400.0,
+    "trade_count": 200,
+    "win_count": 37,
+    "loss_count": 163,
+    "win_rate": 18.5,
+    "avg_win_pct": 0.884,
+    "avg_loss_pct": -0.189,
+    "ev": 0.01,
+    "profit_factor": 4.69,
+    "max_consec_loss": 60,
+    "avg_hold_min": 52.1,
+    "total_pnl_krw": -46630.0,
     "signal_type": "US_FULL",
     "market": "US",
     "status": "ACTIVE",
     "weight": 1.0,
-    "updated_at": "2026-06-18T21:30:04.112892"
+    "updated_at": "2026-07-04T21:38:44.146315"
   },
   "US:US_EARLY": {
-    "trade_count": 0,
-    "win_count": 0,
-    "loss_count": 0,
-    "win_rate": 0.0,
-    "avg_win_pct": 0.0,
-    "avg_loss_pct": 0.0,
-    "ev": 0.0,
-    "profit_factor": 0.0,
-    "max_consec_loss": 0,
-    "avg_hold_min": 0.0,
-    "total_pnl_krw": 0.0,
+    "trade_count": 26,
+    "win_count": 5,
+    "loss_count": 21,
+    "win_rate": 19.2,
+    "avg_win_pct": 0.184,
+    "avg_loss_pct": -0.285,
+    "ev": -0.195,
+    "profit_factor": 0.65,
+    "max_consec_loss": 7,
+    "avg_hold_min": 3.2,
+    "total_pnl_krw": -21328.0,
     "signal_type": "US_EARLY",
     "market": "US",
     "status": "ACTIVE",
     "weight": 1.0,
-    "updated_at": "2026-06-18T21:30:04.114434"
+    "updated_at": "2026-07-04T21:38:44.147301"
   },
   "US:US_SURGE": {
     "trade_count": 0,
@@ -51,7 +51,7 @@
     "market": "US",
     "status": "ACTIVE",
     "weight": 1.0,
-    "updated_at": "2026-06-18T21:30:04.115920"
+    "updated_at": "2026-07-04T21:38:44.148119"
   },
   "US:US_기본": {
     "trade_count": 0,
@@ -69,7 +69,7 @@
     "market": "US",
     "status": "ACTIVE",
     "weight": 1.0,
-    "updated_at": "2026-06-18T21:30:04.117357"
+    "updated_at": "2026-07-04T21:38:44.149025"
   },
   "KR:폭발돌파": {
     "trade_count": 0,
@@ -87,7 +87,7 @@
     "market": "KR",
     "status": "ACTIVE",
     "weight": 1.0,
-    "updated_at": "2026-06-18T06:30:21.024467"
+    "updated_at": "2026-07-04T06:43:34.928931"
   },
   "KR:강한돌파": {
     "trade_count": 0,
@@ -105,25 +105,26 @@
     "market": "KR",
     "status": "ACTIVE",
     "weight": 1.0,
-    "updated_at": "2026-06-18T06:30:21.026004"
+    "updated_at": "2026-07-04T06:43:34.930862"
   },
   "KR:초기돌파": {
-    "trade_count": 45,
-    "win_count": 6,
-    "loss_count": 39,
-    "win_rate": 13.3,
-    "avg_win_pct": 2.154,
-    "avg_loss_pct": -0.958,
-    "ev": -0.543,
-    "profit_factor": 2.25,
-    "max_consec_loss": 27,
-    "avg_hold_min": 28.1,
+    "trade_count": 68,
+    "win_count": 24,
+    "loss_count": 44,
+    "win_rate": 35.3,
+    "avg_win_pct": 1.732,
+    "avg_loss_pct": -0.922,
+    "ev": 0.150,
+    "profit_factor": 1.88,
+    "max_consec_loss": 10,
+    "avg_hold_min": 11.3,
     "total_pnl_krw": 0,
     "signal_type": "초기돌파",
     "market": "KR",
     "status": "ACTIVE",
     "weight": 1.0,
-    "updated_at": "2026-06-19T01:06:46.243098"
+    "_reset_reason": "[리셋 2026-07-06] BUY_SCORE 0.45+ 구간(n=68) 기준으로 재초기화. 0.43 획일화 손실구간 차단 후 신규 기준으로 재학습 시작",
+    "updated_at": "2026-07-06T00:00:00.000000"
   },
   "KR:거래량폭증": {
     "trade_count": 0,
@@ -141,7 +142,7 @@
     "market": "KR",
     "status": "ACTIVE",
     "weight": 1.0,
-    "updated_at": "2026-06-18T06:30:21.030305"
+    "updated_at": "2026-07-04T06:43:34.936623"
   },
   "KR:거래량증가": {
     "trade_count": 0,
@@ -159,7 +160,7 @@
     "market": "KR",
     "status": "ACTIVE",
     "weight": 1.0,
-    "updated_at": "2026-06-18T06:30:21.031667"
+    "updated_at": "2026-07-04T06:43:34.938485"
   },
   "KR:기본진입": {
     "trade_count": 6,
@@ -177,6 +178,6 @@
     "market": "KR",
     "status": "ACTIVE",
     "weight": 1.0,
-    "updated_at": "2026-06-18T06:30:21.033202"
+    "updated_at": "2026-07-04T06:43:34.940581"
   }
 }
