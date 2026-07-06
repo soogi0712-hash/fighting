@@ -835,6 +835,14 @@ class KRStrategy:
                 iv["chase_reason"]  = f"연속양봉={bull_cnt}개"
 
         # ── 장중 신호 계산 (Midday Signals) ─────────────────────
+        # ★ [BUG FIX 2026-07-06] bb_upper 지역변수 사전 초기화
+        #   bb_upper는 아래 BUY SCORE 블록에서 계산되지만,
+        #   Python은 지역변수 할당이 존재하면 함수 전체에서 지역변수로 취급하므로
+        #   이 시점에 참조하면 "cannot access local variable" 에러 발생
+        bb_upper = 0.0
+        bb_lower = 0.0
+        ma20     = 0.0
+
         # VWAP 크로스 업: 직전봉은 VWAP 아래, 현재봉은 VWAP 위 (회복 신호)
         if vwap > 0 and len(closes) >= 2:
             prev_close_for_cross = closes[-2]
@@ -865,9 +873,6 @@ class KRStrategy:
         score = 0.0
 
         # MA 배열 (MA5 > MA20)
-        ma20 = 0.0
-        bb_lower = 0.0
-        bb_upper = 0.0
         if len(closes) >= 20:
             ma5  = np.mean(closes[-5:])
             ma20 = float(np.mean(closes[-20:]))
