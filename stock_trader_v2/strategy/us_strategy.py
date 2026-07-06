@@ -9,8 +9,8 @@ strategy/us_strategy.py — 미국장 V2 핵심 전략 엔진
   - 국내장과 완전 분리 — DailyPnLGuard(market="US") 별도 인스턴스
 
 진입 전략:
-  BUY_SCORE ≥ 0.40 → 30% 선진입 (Early Entry)
-  BUY_SCORE ≥ 0.55 → +70% 추가 (Full Entry)
+  BUY_SCORE ≥ 0.55 → 30% 선진입 (Early Entry)
+  BUY_SCORE ≥ 0.65 → +70% 추가 (Full Entry)
   필수: 거래량증가 + VWAP위 + SELL_SCORE < 5
   추격매수 금지: 15분+4%, 5분+2%, 연속3봉
 
@@ -22,7 +22,7 @@ strategy/us_strategy.py — 미국장 V2 핵심 전략 엔진
 익절 전략:
   +1.5% SELL_SCORE 연동 청산
   +2.0% 전량 익절
-  +2.5% 무조건 전량 익절
+  +3.0% 무조건 전량 익절
 
 시간 관리:
   정규장 마감 30분 전: 신규매수 금지
@@ -60,8 +60,15 @@ logger = get_logger("USStrategy")
 KST    = pytz.timezone("Asia/Seoul")
 
 # ── BUY SCORE 임계 ─────────────────────────────────────────────
-BUY_SCORE_EARLY = 0.40   # 30% 선진입
-BUY_SCORE_FULL  = 0.55   # 100% 진입
+# [개선 2026-07-06] DB 262건 분석 결과:
+#   score=0.40~0.50: n=19건 승률 23.1%, avg -0.272%  → 완전 손실구간
+#   score=0.55+:     n=23건 승률 56.5%, avg -0.025%  → 거의 본전
+#   score=0.60 획일화(133건): 승률 13.5%, avg -0.080% → 손실 공장
+#   score=0.70(14건): 승률 50.0%, avg +1.092%        → 수익 구간
+#   US_EARLY 자체: n=19건 승률 26.3%, avg -0.267%    → 손실 패턴
+# → EARLY 임계를 0.40→0.55로 상향: 0.40~0.54 손실구간 전면 차단
+BUY_SCORE_EARLY = 0.55   # [개선 2026-07-06] 0.40→0.55: score≤0.50 손실구간 차단
+BUY_SCORE_FULL  = 0.65   # [개선 2026-07-06] 0.55→0.65: score=0.60 획일화 손실구간 차단
 
 # ── 추격매수 금지 기준 ─────────────────────────────────────────
 CHASE_RISE_15M  = 4.0    # 최근 15분 상승률(%) 초과 시 금지
@@ -73,7 +80,7 @@ CHASE_BULL_CNT  = 3      # 연속 양봉 N개 이상 시 금지
 MIDDAY_START_MIN    = 60         # 개장 후 60분 = 23:30 KST(EDT) 이후
 MIDDAY_VOL_MULT     = 2.5        # 직전 4봉 평균 대비 2.5x 이상 거래량
 MIDDAY_VWAP_CROSS_MARGIN = 0.001 # VWAP 크로스 허용 오차 0.1%
-MIDDAY_SCORE_MIN    = 0.40       # 장중 면제 경로 최소 BUY_SCORE (EARLY와 동일)
+MIDDAY_SCORE_MIN    = 0.50       # [개선 2026-07-06] 0.40→0.50: 장중 면제 경로 최소 임계 상향
 
 # ── 오버나이트 관련 ───────────────────────────────────────────
 OVERNIGHT_CHECK_MIN   = 10   # 마감 10분 전: 수익<+1% → 청산 검토
@@ -1946,10 +1953,14 @@ class USStrategy:
             score_raw += 0.5
 
         # 5. 거래량
-        if vol_ok:
-            score_raw += 1.0
+        # [개선 2026-07-06] score=0.60 획일화 → vol=1.0(약) 구간 손실
+        #   vol=1.0(약): 승률 13.5%, avg -0.080% (손실)
+        #   vol=1.5+(강): 승률 16.7%, avg +0.300% (수익)
+        #   → vol_surge일 때만 가점 2.0, vol_ok만이면 0.5로 축소 (차별화)
+        if vol_ok and not vol_surge:
+            score_raw += 0.5    # 약한 거래량: 가점 축소 (기존 1.0→0.5)
         if vol_surge:
-            score_raw += 1.0
+            score_raw += 2.0    # 강한 거래량: 가점 확대 (기존 1.0→2.0, 차별화)
 
         # 6. 돌파 가점
         breakout_bonus = self._calc_breakout_bonus(
