@@ -73,9 +73,14 @@ CHASE_RISE_15M  = 4.0    # 최근 15분 상승률
 CHASE_RISE_5M   = 2.0    # 최근 5분 상승률
 CHASE_BULL_CNT  = 3      # 연속 양봉 수
 
-# ── 신규매수 마감 ──────────────────────────────────────────────
-BUY_STOP_TIME   = dtime(14, 30)
-FORCE_CLOSE_TIME = dtime(15, 20)
+# ── 신규매수 시간 제한 ────────────────────────────────────────
+BUY_STOP_TIME       = dtime(14, 30)   # 14:30 이후 신규매수 금지
+FORCE_CLOSE_TIME    = dtime(15, 20)
+# ★ [2026-07-14] 오프닝 혼조 구간 진입 금지
+# 09:00~09:20: 갭업/갭다운 교란, 호가 스프레드 과대, 세력 방향 미결정
+# → 유동성 안정 이후(09:20~)에만 진입 허용
+BUY_BLOCK_START     = dtime(9, 0)     # 09:00 진입 금지 시작
+BUY_BLOCK_END       = dtime(9, 20)    # 09:20 진입 금지 종료 (이후 허용)
 
 # ── 장중 신호 (Midday Signal) 상수 ───────────────────────────
 # 장 시작 후 N분 이후를 "장중"으로 간주 (09:00+30분 = 09:30)
@@ -199,6 +204,16 @@ class KRStrategy:
         # 14:30 이후 신규매수 금지
         if t >= BUY_STOP_TIME:
             return self._skip(code, name, f"14:30 이후 신규매수 금지 ({t.strftime('%H:%M')})")
+
+        # ★ [2026-07-14] 09:00~09:20 오프닝 혼조 구간 진입 금지
+        # 이유: 갭업/갭다운 교란 + 호가 스프레드 과대 + 세력 방향 미결정
+        #       → 07-06 36건 모두 BUY_SCORE=0.429 획일화 / 100% 손실 구간
+        #       → 09:20 이후 유동성 안정 시 진입 허용
+        if BUY_BLOCK_START <= t < BUY_BLOCK_END:
+            return self._skip(
+                code, name,
+                f"⛔ 09:00~09:20 오프닝 진입 금지 ({t.strftime('%H:%M')}) — 유동성 안정 대기"
+            )
 
         # PnL 한도 체크
         if not self.pnl.can_buy:
