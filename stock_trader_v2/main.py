@@ -439,6 +439,17 @@ def main():
     _us_sync_cnt = strategy_us.sync_positions_from_kis()
     if _us_sync_cnt == 0:
         logger.info("[POS SYNC] US 포지션 복구: KIS 잔고와 내부 포지션 일치 (복구 불필요)")
+
+    # ── 오버나이트 방지: 서버 재시작이 US 마감 후 시간대(KST 05:00~09:00)이면
+    # 복원된 포지션을 즉각 강제청산 (NKTR/HOOD/CELH 사례 재발 방지)
+    _startup_kst = datetime.now(KST)
+    _overnight_closed = strategy_us.force_close_overnight_positions(_startup_kst)
+    if _overnight_closed > 0:
+        logger.warning(
+            f"[STARTUP] ⚠️ 오버나이트 강제청산 완료: {_overnight_closed}건 청산 "
+            f"(재시작 시각 KST {_startup_kst.strftime('%H:%M')})"
+        )
+
     logger.info("✅ V2 봇 루프 시작 (국내 + 미국장)")
 
     loop_count   = 0

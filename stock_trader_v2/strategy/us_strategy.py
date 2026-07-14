@@ -173,6 +173,11 @@ class USStrategy:
         # Adaptive 진입 iv 캐시 {code: iv_dict}  ← record_exit 시 활용
         self._entry_iv:     dict = {}
 
+        # ★ [중복진입 차단] 동일 종목 마지막 BUY 주문 시각 {code: float(timestamp)}
+        # 30초 내 동일 종목 재진입 시도를 차단 (KIS 체결 확인 전 중복 주문 방지)
+        self._last_buy_time: dict = {}
+        _BUY_DEDUP_SEC = 30.0   # 30초 내 동일 종목 BUY 재시도 차단
+
         # ★ US 실잔고 캐시 (broker_us.get_balance() 결과, 30초 TTL)
         # AccountSync는 KRBroker 기반이므로 US 잔고 별도 관리
         self._us_holdings_cache: dict  = {}   # {code: holding_dict}
@@ -489,6 +494,17 @@ class USStrategy:
             return self._skip(
                 code, name,
                 f"⛔ 재진입 차단 — {block_info.get('block_reason', '')}"
+            )
+
+        # ★ [중복진입 차단] 30초 내 동일 종목 BUY 재시도 차단
+        import time as _time_mod
+        _now_ts = _time_mod.time()
+        _last_buy_ts = self._last_buy_time.get(code, 0.0)
+        if _now_ts - _last_buy_ts < 30.0:
+            _elapsed = _now_ts - _last_buy_ts
+            return self._skip(
+                code, name,
+                f"⛔ 중복진입 차단 — 마지막BUY로부터 {_elapsed:.0f}초 경과 (<30초)"
             )
 
         # ── ★ 수량0 사전 제외: BUY 판정 전에 자금 확인 ─────────────
@@ -992,6 +1008,9 @@ class USStrategy:
                 f"order_no={order_no} | "
                 f"사유={reason}"
             )
+            # ★ [중복진입 차단] BUY 성공 시각 기록
+            import time as _time_mod2
+            self._last_buy_time[code] = _time_mod2.time()
             return {
                 "action":  "BUY_US",
                 "code":    code,
@@ -2503,3 +2522,113 @@ class USStrategy:
                 f"{[c for c in self._positions]}"
             )
         return recovered
+
+    # ════════════════════════════════════════════════════════════
+    # 오버나이트 방지 — 서버 재시작 후 마감시간대 포지션 즉각 강제청산
+    # ════════════════════════════════════════════════════════════
+
+    def force_close_overnight_positions(self, now_kst: datetime) -> int:
+        """
+        서버 재시작 시 US 마감 후 시간대(KST 05:00~09:00)에 잔존하는
+        모든 US 포지션을 즉각 시장가(지정가) 강제청산한다.
+
+        ▸ 호출 시점: main.py startup — sync_positions_from_kis() 직후
+        ▸ 청산 조건: KST 05:00 ~ 09:00 사이 && self._positions 에 종목 존재
+        ▸ 미국장(is_market_open) 여부와 무관하게 강제 실행
+          (KIS 지정가로 즉시체결 — 프리마켓/AH 가격 활용)
+
+        Returns:
+            강제청산 시도 종목 수 (int)
+        """
+        from broker.us_broker import _is_dst_kst as _dst_fn_oc
+
+        t = now_kst.time()
+        is_dst = _dst_fn_oc(now_kst)
+
+        # EDT(서머타임): 장마감 KST 05:00 / 표준시: KST 06:00
+        # 재시작 감지 창: 마감 이후 ~ 개장 전 (KST 05:00~09:00)
+        # 서머타임 여부에 따라 hard_t(마감) 기준 적용
+        hard_t = dtime(5, 0) if is_dst else dtime(6, 0)
+        reopen_t = dtime(9, 0)   # KST 09시 이전까지 강제청산 창
+
+        # 현재 시각이 강제청산 창 밖이면 아무것도 하지 않음
+        # (정상 장중 재시작이면 스킵, 오버나이트 재시작만 처리)
+        if not (t >= hard_t and t < reopen_t):
+            logger.info(
+                f"[OVERNIGHT_CLOSE] 강제청산 불필요 — 현재 KST {t.strftime('%H:%M')} "
+                f"(창: {hard_t.strftime('%H:%M')}~{reopen_t.strftime('%H:%M')} 아님)"
+            )
+            return 0
+
+        if not self._positions:
+            logger.info("[OVERNIGHT_CLOSE] 잔존 포지션 없음 — 강제청산 불필요")
+            return 0
+
+        codes = list(self._positions.keys())
+        logger.warning(
+            f"[OVERNIGHT_CLOSE] ⚠️ 서버 재시작 감지 — KST {t.strftime('%H:%M')} "
+            f"US 마감 후 잔존 포지션 {len(codes)}건 즉각 강제청산: {codes}"
+        )
+
+        closed = 0
+        for code in codes:
+            pg = self._positions.get(code)
+            if pg is None:
+                continue
+
+            name    = pg.name
+            qty     = pg.qty
+            exch_cd = getattr(pg, "exch_cd", EXCH_NASD)
+
+            # KIS 현재가 조회 (실패 시 avg_price로 폴백)
+            try:
+                price_data = self.broker.get_price(code, exch_cd)
+                cur_price  = float(price_data.get("price", pg.avg_price))
+                if cur_price <= 0:
+                    cur_price = pg.avg_price
+            except Exception as _e:
+                logger.warning(
+                    f"[OVERNIGHT_CLOSE] {name}({code}) 현재가 조회 실패 "
+                    f"→ avg_price ${pg.avg_price:.2f} 사용: {_e}"
+                )
+                cur_price = pg.avg_price
+
+            logger.warning(
+                f"[OVERNIGHT_CLOSE] 강제청산 실행: {name}({code}) "
+                f"qty={qty} avg=${pg.avg_price:.2f} cur=${cur_price:.2f} "
+                f"exch={exch_cd}"
+            )
+
+            try:
+                result = self._do_sell(
+                    code=code,
+                    name=name,
+                    exch_cd=exch_cd,
+                    qty=qty,
+                    cur_price=cur_price,
+                    reason="[OVERNIGHT_CLOSE] 서버재시작 오버나이트 강제청산",
+                    is_stoploss=True,
+                    is_profit_exit=False,
+                    now_kst=now_kst,
+                )
+                action = result.get("action", "")
+                if action == "SELL":
+                    logger.warning(
+                        f"[OVERNIGHT_CLOSE] ✅ {name}({code}) 강제청산 성공 "
+                        f"pnl={result.get('pnl_krw', 0):+,.0f}원"
+                    )
+                    closed += 1
+                else:
+                    logger.error(
+                        f"[OVERNIGHT_CLOSE] ❌ {name}({code}) 강제청산 실패 "
+                        f"result={result}"
+                    )
+            except Exception as _sell_e:
+                logger.error(
+                    f"[OVERNIGHT_CLOSE] ❌ {name}({code}) 강제청산 예외: {_sell_e}"
+                )
+
+        logger.warning(
+            f"[OVERNIGHT_CLOSE] 완료 — {closed}/{len(codes)}건 청산 성공"
+        )
+        return closed
