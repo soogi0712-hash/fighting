@@ -3,33 +3,49 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>⚙️ 초기 설정 | 주식 자동매매</title>
+<title>⚙️ 자동매매 설정 | 장기 복리수익 극대화</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
     font-family: 'Segoe UI', sans-serif;
     background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
-    min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    min-height: 100vh;
     color: #e0e0e0;
+    padding: 30px 16px;
   }
   .card {
     background: rgba(255,255,255,0.05);
     backdrop-filter: blur(20px);
     border: 1px solid rgba(255,255,255,0.1);
-    border-radius: 20px; padding: 40px; width: 560px;
+    border-radius: 20px;
+    padding: 36px 40px;
+    width: 640px;
+    max-width: 100%;
+    margin: 0 auto;
     box-shadow: 0 20px 60px rgba(0,0,0,0.5);
   }
-  h1 { font-size: 1.8rem; margin-bottom: 6px; color: #7ee8fa; }
-  .subtitle { font-size: 0.85rem; color: #aaa; margin-bottom: 30px; }
+  h1 { font-size: 1.8rem; margin-bottom: 4px; color: #7ee8fa; }
+  .philosophy {
+    background: rgba(126,232,250,0.08);
+    border-left: 3px solid #7ee8fa;
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-size: 0.8rem;
+    color: #aad;
+    margin-bottom: 28px;
+    line-height: 1.7;
+  }
+  .philosophy b { color: #7ee8fa; }
   .section-title {
-    font-size: 0.75rem; font-weight: 700; letter-spacing: 1.5px;
-    color: #7ee8fa; text-transform: uppercase; margin: 24px 0 12px;
+    font-size: 0.72rem; font-weight: 700; letter-spacing: 1.5px;
+    color: #7ee8fa; text-transform: uppercase; margin: 28px 0 14px;
     padding-bottom: 6px; border-bottom: 1px solid rgba(126,232,250,0.2);
+    display: flex; align-items: center; gap: 8px;
   }
   .form-row { display: flex; gap: 12px; }
   .form-group { margin-bottom: 16px; flex: 1; }
   label { display: block; font-size: 0.8rem; color: #bbb; margin-bottom: 6px; }
-  input, select {
+  input[type="text"], input[type="password"], input[type="number"], select {
     width: 100%; padding: 10px 14px;
     background: rgba(255,255,255,0.07);
     border: 1px solid rgba(255,255,255,0.15);
@@ -40,11 +56,17 @@
     outline: none; border-color: #7ee8fa;
     background: rgba(126,232,250,0.05);
   }
-  .toggle-row {
-    display: flex; align-items: center; gap: 14px; margin-bottom: 16px;
+  input:disabled {
+    opacity: 0.35; cursor: not-allowed;
   }
-  .toggle-label { font-size: 0.85rem; color: #bbb; }
-  .toggle { position: relative; width: 48px; height: 26px; }
+
+  /* 토글 스위치 */
+  .toggle-row {
+    display: flex; align-items: center; gap: 14px; margin-bottom: 14px;
+  }
+  .toggle-label { font-size: 0.85rem; color: #bbb; flex: 1; }
+  .toggle-label small { display: block; font-size: 0.72rem; color: #888; margin-top: 2px; }
+  .toggle { position: relative; width: 48px; height: 26px; flex-shrink: 0; }
   .toggle input { opacity: 0; width: 0; height: 0; }
   .slider {
     position: absolute; inset: 0; background: #444;
@@ -55,31 +77,118 @@
     width: 20px; height: 20px; left: 3px; bottom: 3px;
     background: white; border-radius: 50%; transition: .3s;
   }
-  input:checked + .slider { background: #e74c3c; }
+  input:checked + .slider { background: #7ee8fa; }
+  input:checked + .slider { background: #4CAF50; }
   input:checked + .slider::before { transform: translateX(22px); }
+  .real-slider input:checked + .slider { background: #e74c3c; }
+
+  /* 경고 박스 */
   .warn {
     background: rgba(231,76,60,0.15); border: 1px solid rgba(231,76,60,0.3);
     border-radius: 8px; padding: 12px 16px; font-size: 0.82rem;
-    color: #ff8a80; margin: 16px 0;
+    color: #ff8a80; margin: 12px 0;
   }
+  .info-box {
+    background: rgba(126,232,250,0.08); border: 1px solid rgba(126,232,250,0.2);
+    border-radius: 8px; padding: 10px 14px; font-size: 0.78rem;
+    color: #9ec; margin: 8px 0 14px;
+    line-height: 1.6;
+  }
+
+  /* 피라미딩 단계 */
+  .pyramid-row {
+    display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px;
+    margin-bottom: 8px;
+  }
+  .pyramid-step {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 8px; padding: 10px 12px;
+    text-align: center;
+  }
+  .pyramid-step label { font-size: 0.7rem; color: #7ee8fa; margin-bottom: 6px; }
+  .pyramid-step input { text-align: center; }
+
+  /* 실험 전략 */
+  .exp-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+    margin-bottom: 12px;
+  }
+  .exp-card {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 10px; padding: 14px;
+  }
+  .exp-card h4 { font-size: 0.78rem; color: #7ee8fa; margin-bottom: 10px; }
+  .exp-tag-list { display: flex; flex-wrap: wrap; gap: 6px; }
+  .exp-tag {
+    background: rgba(126,232,250,0.1);
+    border: 1px solid rgba(126,232,250,0.25);
+    border-radius: 20px; padding: 3px 10px;
+    font-size: 0.72rem; color: #cef;
+    cursor: pointer; user-select: none;
+    transition: background .2s;
+  }
+  .exp-tag.active {
+    background: rgba(126,232,250,0.3);
+    border-color: #7ee8fa; color: #fff;
+  }
+
+  /* 평가 기준 우선순위 */
+  .priority-list {
+    list-style: none; counter-reset: prio;
+  }
+  .priority-list li {
+    counter-increment: prio;
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 12px; margin-bottom: 6px;
+    background: rgba(255,255,255,0.04);
+    border-radius: 8px; font-size: 0.82rem;
+  }
+  .priority-list li::before {
+    content: counter(prio);
+    background: #7ee8fa; color: #1a1a2e;
+    font-weight: 700; font-size: 0.7rem;
+    width: 20px; height: 20px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .priority-list li .label { font-weight: 600; color: #eee; min-width: 120px; }
+  .priority-list li .desc { color: #999; font-size: 0.72rem; }
+
+  /* 버튼 */
   .btn {
-    width: 100%; padding: 14px; margin-top: 10px;
+    width: 100%; padding: 14px; margin-top: 16px;
     background: linear-gradient(135deg, #7ee8fa, #80ff72);
     border: none; border-radius: 10px; font-size: 1rem; font-weight: 700;
     color: #1a1a2e; cursor: pointer; transition: opacity .2s, transform .1s;
   }
   .btn:hover { opacity: 0.9; transform: translateY(-1px); }
-  .hint { font-size: 0.75rem; color: #888; margin-top: 4px; }
+  .hint { font-size: 0.73rem; color: #888; margin-top: 4px; line-height: 1.5; }
+  .badge {
+    display: inline-block; font-size: 0.65rem; font-weight: 700;
+    padding: 2px 7px; border-radius: 20px; margin-left: 6px;
+    vertical-align: middle;
+  }
+  .badge-green { background: rgba(80,200,120,0.2); color: #80ff72; border: 1px solid #80ff72; }
+  .badge-blue  { background: rgba(126,232,250,0.2); color: #7ee8fa; border: 1px solid #7ee8fa; }
+  .badge-red   { background: rgba(231,76,60,0.2); color: #ff8a80; border: 1px solid #ff8a80; }
+  .disabled-field { opacity: 0.35; pointer-events: none; }
 </style>
 </head>
 <body>
 <div class="card">
-  <h1>📈 자동매매 초기 설정</h1>
-  <p class="subtitle">한국투자증권 KIS Open API 연동 정보를 입력하세요</p>
+  <h1>📈 자동매매 설정</h1>
 
-  <form method="POST" action="/setup">
+  <div class="philosophy">
+    <b>전략 철학:</b> 승률이 아닌 <b>장기 복리수익률 극대화</b>가 목표입니다.<br>
+    강한 종목을 찾아 손실은 제한하고, 수익은 트레일링스탑으로 최대한 길게 보유합니다.<br>
+    고정 익절 없음 · 추세추종 · 모멘텀 · 피라미딩 전략을 사용합니다.
+  </div>
 
-    <!-- KIS API -->
+  <form method="POST" action="/setup" id="setupForm">
+
+    <!-- ① KIS API -->
     <div class="section-title">🔑 KIS Open API 인증</div>
     <div class="form-group">
       <label>App Key</label>
@@ -92,55 +201,196 @@
     <div class="form-group">
       <label>계좌번호</label>
       <input name="account_no" type="text" placeholder="12345678-01 (계좌번호-상품코드)" required>
-      <p class="hint">💡 모의투자 계좌를 먼저 테스트하세요</p>
+      <p class="hint">💡 KIS 실전투자 계좌번호를 입력하세요</p>
     </div>
 
-    <!-- 투자 모드 -->
-    <div class="section-title">⚠️ 투자 모드</div>
-    <div class="toggle-row">
-      <label class="toggle">
-        <input type="checkbox" name="is_real" value="true" id="real_toggle">
-        <span class="slider"></span>
-      </label>
-      <span class="toggle-label" id="mode_text">📊 모의투자 모드</span>
-    </div>
-    <div class="warn" id="real_warn" style="display:none">
-      ⚠️ <b>실전투자 모드</b>: 실제 자금으로 매매가 실행됩니다.<br>
-      반드시 소액으로 충분히 테스트 후 사용하세요!
-    </div>
-
-    <!-- 리스크 설정 -->
+    <!-- ② 리스크 관리 -->
     <div class="section-title">💰 리스크 관리</div>
     <div class="form-row">
       <div class="form-group">
-        <label>종목당 최대 투자금 (원)</label>
-        <input name="max_per_stock" type="number" value="1000000" min="100000" step="100000">
-      </div>
-      <div class="form-group">
-        <label>총 최대 투자금 (원)</label>
+        <label>총 투자금 (원)</label>
         <input name="max_total" type="number" value="5000000" min="100000" step="100000">
-      </div>
-    </div>
-    <div class="form-row">
-      <div class="form-group">
-        <label>손절 기준 (%)</label>
-        <input name="stop_loss" type="number" value="3.0" min="0.5" max="20" step="0.5">
+        <p class="hint">전체 운용 자금 (예: 500만원)</p>
       </div>
       <div class="form-group">
-        <label>익절 기준 (%)</label>
-        <input name="take_profit" type="number" value="5.0" min="1" max="30" step="0.5">
+        <label>종목당 최대 투자금 (원)</label>
+        <input name="max_per_stock" type="number" value="5000000" min="100000" step="100000">
+        <p class="hint">AI 점수로 자동 배분 (한도 없음 권장)</p>
       </div>
     </div>
 
-    <!-- 텔레그램 (선택) -->
-    <div class="section-title">📱 텔레그램 알림 (선택)</div>
-    <div class="form-group">
-      <label>Bot Token</label>
-      <input name="tg_token" type="text" placeholder="1234567890:ABC...">
+    <!-- ④ 손절 기준 -->
+    <div class="section-title">🛡️ 손절 기준 (실질수익률 기준)</div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>손절 기준 (%) <span class="badge badge-red">필수</span></label>
+        <input name="stop_loss" type="number" value="10" min="1" max="30" step="0.5">
+        <p class="hint">수수료·세금 차감 후 실질손익 -10% 도달 시 자동 손절</p>
+      </div>
+      <div class="form-group">
+        <label>고정 익절 사용 <span class="badge badge-blue">OFF 권장</span></label>
+        <div class="toggle-row" style="margin-top:8px; margin-bottom:0">
+          <label class="toggle">
+            <input type="checkbox" name="use_take_profit" value="true" id="tp_toggle">
+            <span class="slider"></span>
+          </label>
+          <span class="toggle-label" id="tp_text" style="font-size:0.82rem">
+            OFF — 트레일링스탑만 사용
+            <small>수익 극대화를 위해 OFF 권장</small>
+          </span>
+        </div>
+        <div id="tp_field" class="disabled-field" style="margin-top:8px">
+          <input name="take_profit" type="number" value="15" min="1" max="50" step="0.5" id="tp_input" disabled>
+          <p class="hint">고정 익절 % (ON 시에만 적용)</p>
+        </div>
+      </div>
     </div>
-    <div class="form-group">
-      <label>Chat ID</label>
-      <input name="tg_chat_id" type="text" placeholder="-100...">
+
+    <!-- ⑤ 트레일링스탑 -->
+    <div class="section-title">📉 트레일링스탑 <span class="badge badge-green">핵심 전략</span></div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>트레일링스탑 하락률 (%)</label>
+        <input name="trailing_stop" type="number" value="15" min="5" max="40" step="1">
+        <p class="hint">고점 대비 이 % 하락 시 자동 매도<br>예) 매수 100 → 고점 200 → 170 하락 시 매도</p>
+      </div>
+      <div class="form-group">
+        <label>트레일링 활성화 수익률 (%)</label>
+        <input name="trailing_activate" type="number" value="5" min="1" max="20" step="1">
+        <p class="hint">실질수익 +5% 도달 후부터 트레일링 작동</p>
+      </div>
+    </div>
+
+    <!-- ⑥ 추가매수 설정 -->
+    <div class="section-title">📈 추가매수 (피라미딩) 설정</div>
+
+    <div class="toggle-row">
+      <label class="toggle">
+        <input type="checkbox" name="add_buy_profit" value="true" id="add_profit_toggle" checked>
+        <span class="slider"></span>
+      </label>
+      <span class="toggle-label">
+        수익 종목 추가매수 <span class="badge badge-green">ON 권장</span>
+        <small>수익 중 + AI점수 유지 + RS 양수 + 20일선 위 + 거래대금 유지 시에만 추가매수</small>
+      </span>
+    </div>
+
+    <div class="toggle-row">
+      <label class="toggle">
+        <input type="checkbox" name="add_buy_loss" value="true" id="add_loss_toggle">
+        <span class="slider"></span>
+      </label>
+      <span class="toggle-label">
+        손실 종목 추가매수 (물타기) <span class="badge badge-red">OFF 권장</span>
+        <small>손실 중인 종목 추가매수 금지 — 물타기 절대 금지</small>
+      </span>
+    </div>
+
+    <div class="info-box">
+      ✅ <b>추가매수 조건 (모두 충족 시에만):</b> 현재 수익 중 · AI점수 유지 · RS(상대강도) 양수 · 20일 이동평균선 위 · 거래대금 유지
+    </div>
+
+    <label style="margin-bottom:10px; display:block;">추가매수 단계 (수익률 % 도달 시)</label>
+    <div class="pyramid-row">
+      <div class="pyramid-step">
+        <label>1차 추가매수</label>
+        <input name="pyramid_1" type="number" value="10" min="1" max="50" step="1">
+        <p class="hint" style="margin-top:4px">+10% 도달 시</p>
+      </div>
+      <div class="pyramid-step">
+        <label>2차 추가매수</label>
+        <input name="pyramid_2" type="number" value="20" min="1" max="80" step="1">
+        <p class="hint" style="margin-top:4px">+20% 도달 시</p>
+      </div>
+      <div class="pyramid-step">
+        <label>3차 추가매수</label>
+        <input name="pyramid_3" type="number" value="35" min="1" max="100" step="1">
+        <p class="hint" style="margin-top:4px">+35% 도달 시</p>
+      </div>
+    </div>
+
+    <!-- ⑦ 실험 전략 -->
+    <div class="section-title">🧪 실험 전략 (가상 포트폴리오)</div>
+    <div class="info-box">
+      실제 주문 없이 가상 포트폴리오로 다양한 파라미터를 동시에 테스트합니다.<br>
+      실전과 별도로 운영되며, 전략 평가 기준(CAGR·MDD·샤프비율)으로 자동 랭킹합니다.
+    </div>
+
+    <div class="toggle-row">
+      <label class="toggle">
+        <input type="checkbox" name="use_lab" value="true" id="lab_toggle" checked>
+        <span class="slider"></span>
+      </label>
+      <span class="toggle-label">
+        실험 전략 기능 사용
+        <small>가상 포트폴리오로 다양한 전략 동시 테스트</small>
+      </span>
+    </div>
+
+    <div id="lab_section">
+      <div class="exp-grid">
+        <div class="exp-card">
+          <h4>📉 트레일링스탑 실험값 (%)</h4>
+          <div class="exp-tag-list" id="trail_tags">
+            <span class="exp-tag active" data-val="10">10%</span>
+            <span class="exp-tag active" data-val="12">12%</span>
+            <span class="exp-tag active" data-val="15">15%</span>
+            <span class="exp-tag active" data-val="18">18%</span>
+            <span class="exp-tag active" data-val="20">20%</span>
+            <span class="exp-tag active" data-val="25">25%</span>
+          </div>
+          <input type="hidden" name="lab_trailing" id="lab_trailing_val" value="10,12,15,18,20,25">
+        </div>
+        <div class="exp-card">
+          <h4>🛡️ 손절 실험값 (%)</h4>
+          <div class="exp-tag-list" id="sl_tags">
+            <span class="exp-tag active" data-val="5">5%</span>
+            <span class="exp-tag active" data-val="7">7%</span>
+            <span class="exp-tag active" data-val="10">10%</span>
+            <span class="exp-tag active" data-val="12">12%</span>
+          </div>
+          <input type="hidden" name="lab_stoploss" id="lab_sl_val" value="5,7,10,12">
+        </div>
+        <div class="exp-card">
+          <h4>📈 추가매수 단계 실험</h4>
+          <div class="exp-tag-list" id="pyr_tags">
+            <span class="exp-tag active" data-val="10-20-35">10-20-35</span>
+            <span class="exp-tag active" data-val="15-30-50">15-30-50</span>
+            <span class="exp-tag active" data-val="20-40-60">20-40-60</span>
+          </div>
+          <input type="hidden" name="lab_pyramid" id="lab_pyr_val" value="10-20-35,15-30-50,20-40-60">
+        </div>
+        <div class="exp-card">
+          <h4>⚖️ 전략 평가 기준 우선순위</h4>
+          <ul class="priority-list" style="margin-top:4px">
+            <li><span class="label">CAGR</span><span class="desc">연복리수익률</span></li>
+            <li><span class="label">MDD</span><span class="desc">최대낙폭</span></li>
+            <li><span class="label">샤프비율</span><span class="desc">위험조정수익</span></li>
+            <li><span class="label">총수익률</span><span class="desc">누적 수익</span></li>
+            <li><span class="label">승률</span><span class="desc">마지막 고려</span></li>
+          </ul>
+        </div>
+      </div>
+      <p class="hint">💡 태그를 클릭하면 해당 실험값을 활성/비활성화할 수 있습니다</p>
+    </div>
+
+    <!-- ⑧ 텔레그램 -->
+    <div class="section-title">📱 텔레그램 알림 (선택)</div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>Bot Token</label>
+        <input name="tg_token" type="text" placeholder="1234567890:ABC...">
+      </div>
+      <div class="form-group">
+        <label>Chat ID</label>
+        <input name="tg_chat_id" type="text" placeholder="-100...">
+      </div>
+    </div>
+
+    <!-- ⑨ 최종 목표 요약 -->
+    <div class="info-box" style="margin-top:8px">
+      🎯 <b>최종 목표:</b> 매달 일정 수익률 달성이 아닌, 강한 종목을 찾아 손실은 제한하고
+      수익은 트레일링스탑으로 최대한 길게 가져가 <b>장기 복리 성장률을 극대화</b>하는 것입니다.
     </div>
 
     <button class="btn" type="submit">🚀 설정 완료 &amp; 시작</button>
@@ -148,18 +398,46 @@
 </div>
 
 <script>
-  const toggle = document.getElementById('real_toggle');
-  const warn   = document.getElementById('real_warn');
-  const text   = document.getElementById('mode_text');
-  toggle.addEventListener('change', () => {
-    if (toggle.checked) {
-      warn.style.display = 'block';
-      text.textContent = '🔴 실전투자 모드';
+  // 고정 익절 토글
+  const tpToggle = document.getElementById('tp_toggle');
+  const tpText   = document.getElementById('tp_text');
+  const tpField  = document.getElementById('tp_field');
+  const tpInput  = document.getElementById('tp_input');
+  tpToggle.addEventListener('change', () => {
+    if (tpToggle.checked) {
+      tpText.innerHTML = 'ON — 고정 익절 사용<small>설정한 % 도달 시 자동 매도</small>';
+      tpField.classList.remove('disabled-field');
+      tpInput.disabled = false;
     } else {
-      warn.style.display = 'none';
-      text.textContent = '📊 모의투자 모드';
+      tpText.innerHTML = 'OFF — 트레일링스탑만 사용<small>수익 극대화를 위해 OFF 권장</small>';
+      tpField.classList.add('disabled-field');
+      tpInput.disabled = true;
     }
   });
+
+  // 실험 전략 토글
+  const labToggle  = document.getElementById('lab_toggle');
+  const labSection = document.getElementById('lab_section');
+  labToggle.addEventListener('change', () => {
+    labSection.style.display = labToggle.checked ? 'block' : 'none';
+  });
+
+  // 실험 태그 클릭
+  function setupTags(containerId, hiddenId) {
+    const container = document.getElementById(containerId);
+    const hidden    = document.getElementById(hiddenId);
+    container.querySelectorAll('.exp-tag').forEach(tag => {
+      tag.addEventListener('click', () => {
+        tag.classList.toggle('active');
+        const active = [...container.querySelectorAll('.exp-tag.active')]
+          .map(t => t.dataset.val);
+        hidden.value = active.join(',');
+      });
+    });
+  }
+  setupTags('trail_tags', 'lab_trailing_val');
+  setupTags('sl_tags',    'lab_sl_val');
+  setupTags('pyr_tags',   'lab_pyr_val');
 </script>
 </body>
 </html>

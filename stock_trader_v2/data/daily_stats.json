@@ -1,0 +1,59 @@
+[
+  {
+    "date": "2026-06-15",
+    "all": {
+      "trade_count": 13,
+      "win_count": 5,
+      "loss_count": 8,
+      "win_rate": 38.5,
+      "avg_win_pct": 2.135,
+      "avg_loss_pct": -1.19,
+      "ev": 0.089,
+      "profit_factor": 1.79,
+      "max_consec_loss": 3,
+      "avg_hold_min": 69.2,
+      "total_pnl_krw": 0
+    },
+    "KR": {
+      "trade_count": 13,
+      "win_count": 5,
+      "loss_count": 8,
+      "win_rate": 38.5,
+      "avg_win_pct": 2.135,
+      "avg_loss_pct": -1.19,
+      "ev": 0.089,
+      "profit_factor": 1.79,
+      "max_consec_loss": 3,
+      "avg_hold_min": 69.2,
+      "total_pnl_krw": 0
+    },
+    "US": {
+      "trade_count": 0,
+      "win_count": 0,
+      "loss_count": 0,
+      "win_rate": 0.0,
+      "avg_win_pct": 0.0,
+      "avg_loss_pct": 0.0,
+      "ev": 0.0,
+      "profit_factor": 0.0,
+      "max_consec_loss": 0,
+      "avg_hold_min": 0.0,
+      "total_pnl_krw": 0.0
+    },
+    "by_signal": {
+      "초기돌파": {
+        "trade_count": 13,
+        "win_count": 5,
+        "loss_count": 8,
+        "win_rate": 38.5,
+        "avg_win_pct": 2.135,
+        "avg_loss_pct": -1.19,
+        "ev": 0.089,
+        "profit_factor": 1.79,
+        "max_consec_loss": 3,
+        "avg_hold_min": 69.2,
+        "total_pnl_krw": 0
+      }
+    }
+  }
+]

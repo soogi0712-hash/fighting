@@ -1,0 +1,11 @@
+{
+  "_updated_at": "2026-07-06T00:00:00.000000",
+  "_updated_reason": "[리셋 2026-07-06] KR:초기돌파 0.3→1.0: Adaptive가 가중치를 0.3까지 낮춰 진입 억제. 485건 분석 결과 손실 구조 개혁으로 재학습 필요 — 초기화 후 재학습 시작",
+  "_live_min": 0.8,
+  "_live_max": 1.2,
+  "_warning_scale": 0.5,
+  "KR:초기돌파": 1.0,
+  "US:US_FULL": 1.35,
+  "_warning_qty_scale": 0.3,
+  "_block_qty_scale": 0.0
+}

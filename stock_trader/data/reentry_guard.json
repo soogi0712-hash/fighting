@@ -1,0 +1,65 @@
+{
+  "KR:035420": {
+    "market": "KR",
+    "code": "035420",
+    "name": "NAVER",
+    "sell_reason": "SELL_FAIL_예약차단|🔔트레일링(고점대비-7.03% ≤ -1.0%, 실질-1.42%)",
+    "is_stoploss": false,
+    "sold_at": "2026-06-12T05:49:27.127931",
+    "cooldown_until": "2026-06-13T05:49:27.127931"
+  },
+  "KR:035720": {
+    "market": "KR",
+    "code": "035720",
+    "name": "카카오",
+    "sell_reason": "SELL_FAIL_예약차단|🔔트레일링(고점대비-3.26% ≤ -1.0%, 실질-0.33%)",
+    "is_stoploss": false,
+    "sold_at": "2026-06-12T05:49:34.748267",
+    "cooldown_until": "2026-06-13T05:49:34.748267"
+  },
+  "KR:042700": {
+    "market": "KR",
+    "code": "042700",
+    "name": "한미반도체",
+    "sell_reason": "SELL_FAIL_예약차단|🔔트레일링(고점대비-4.97% ≤ -1.0%, 실질-1.87%)",
+    "is_stoploss": false,
+    "sold_at": "2026-06-12T05:50:27.673423",
+    "cooldown_until": "2026-06-13T05:50:27.673423"
+  },
+  "KR:357780": {
+    "market": "KR",
+    "code": "357780",
+    "name": "솔브레인",
+    "sell_reason": "SELL_FAIL_예약차단|💰KRW부분익절(50%) 미실현이익18,868원 ≥ 10,000원",
+    "is_stoploss": false,
+    "sold_at": "2026-06-12T05:53:42.009619",
+    "cooldown_until": "2026-06-13T05:53:42.009619"
+  },
+  "KR:000990": {
+    "market": "KR",
+    "code": "000990",
+    "name": "DB하이텍",
+    "sell_reason": "SELL_FAIL_예약차단|🔔트레일링(고점대비-6.36% ≤ -1.0%, 실질-0.85%)",
+    "is_stoploss": false,
+    "sold_at": "2026-06-12T05:58:09.898406",
+    "cooldown_until": "2026-06-13T05:58:09.898406"
+  },
+  "KR:336370": {
+    "market": "KR",
+    "code": "336370",
+    "name": "솔루엠",
+    "sell_reason": "SELL_FAIL_예약차단|🔔트레일링(고점대비-6.06% ≤ -1.0%, 실질-1.18%)",
+    "is_stoploss": false,
+    "sold_at": "2026-06-12T06:00:59.368701",
+    "cooldown_until": "2026-06-13T06:00:59.368701"
+  },
+  "KR:000270": {
+    "market": "KR",
+    "code": "000270",
+    "name": "기아",
+    "sell_reason": "SELL_FAIL_예약차단|🔔트레일링(고점대비-2.19% ≤ -1.0%, 실질-0.51%)",
+    "is_stoploss": false,
+    "sold_at": "2026-06-12T06:17:26.591383",
+    "cooldown_until": "2026-06-13T06:17:26.591383"
+  }
+}

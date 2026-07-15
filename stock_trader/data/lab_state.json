@@ -18,7 +18,7 @@
     "P4": "EXPERIMENT"
   },
   "market_regime": "LATERAL",
-  "last_rank_date": "2026-05-25",
+  "last_rank_date": "2026-06-15",
   "portfolios": {
     "S1": {
       "strategy_id": "S1",
@@ -74,8 +74,13 @@
           "qty": 13,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S1]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.842316"
         },
         {
@@ -87,8 +92,13 @@
           "qty": 8,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S1]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.844771"
         },
         {
@@ -100,8 +110,13 @@
           "qty": 13,
           "date": "2026-04-28",
           "profit": -171574,
+          "profit_pct": 0.0,
           "hold_days": 2,
           "reason": "손절(-7.3% ≤ -5.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.847912"
         },
         {
@@ -113,8 +128,13 @@
           "qty": 26,
           "date": "2026-04-29",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S1]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.850063"
         },
         {
@@ -126,8 +146,13 @@
           "qty": 9,
           "date": "2026-05-02",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S1]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.854162"
         },
         {
@@ -139,8 +164,13 @@
           "qty": 8,
           "date": "2026-05-19",
           "profit": -90672,
+          "profit_pct": 0.0,
           "hold_days": 23,
           "reason": "손절(-5.3% ≤ -5.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.887152"
         },
         {
@@ -152,8 +182,13 @@
           "qty": 7,
           "date": "2026-05-22",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S1]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.894107"
         },
         {
@@ -165,8 +200,13 @@
           "qty": 5,
           "date": "2026-04-07",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +10.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:39.960082"
         },
         {
@@ -178,8 +218,13 @@
           "qty": 3,
           "date": "2026-04-12",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +10.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.030285"
         },
         {
@@ -191,8 +236,13 @@
           "qty": 26,
           "date": "2026-04-28",
           "profit": -98618,
+          "profit_pct": 0.0,
           "hold_days": -1,
           "reason": "손절(-5.0% ≤ -5.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.247022"
         },
         {
@@ -204,8 +254,13 @@
           "qty": 17,
           "date": "2026-05-02",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S1]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.272524"
         },
         {
@@ -217,8 +272,13 @@
           "qty": 3,
           "date": "2026-05-06",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +20.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.315055"
         },
         {
@@ -230,8 +290,13 @@
           "qty": 2,
           "date": "2026-05-07",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +20.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.331766"
         },
         {
@@ -243,8 +308,13 @@
           "qty": 12,
           "date": "2026-04-26",
           "profit": -59713.0,
+          "profit_pct": 0.0,
           "hold_days": -26,
           "reason": "트레일링스탑(고점대비-22.6% ≤ -15.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.197628"
         },
         {
@@ -256,8 +326,13 @@
           "qty": 17,
           "date": "2026-04-27",
           "profit": -65435.0,
+          "profit_pct": 0.0,
           "hold_days": -5,
           "reason": "트레일링스탑(고점대비-15.3% ≤ -15.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.260022"
         },
         {
@@ -269,8 +344,13 @@
           "qty": 12,
           "date": "2026-05-02",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S1]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.371358"
         },
         {
@@ -282,8 +362,13 @@
           "qty": 7,
           "date": "2026-05-05",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S1]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.421107"
         }
       ],
@@ -465,8 +550,13 @@
           "qty": 13,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S2]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.842447"
         },
         {
@@ -478,8 +568,13 @@
           "qty": 8,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S2]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.844879"
         },
         {
@@ -491,8 +586,13 @@
           "qty": 13,
           "date": "2026-04-28",
           "profit": -171574,
+          "profit_pct": 0.0,
           "hold_days": 2,
           "reason": "손절(-7.3% ≤ -7.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.848006"
         },
         {
@@ -504,8 +604,13 @@
           "qty": 26,
           "date": "2026-04-29",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S2]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.850181"
         },
         {
@@ -517,8 +622,13 @@
           "qty": 9,
           "date": "2026-05-02",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S2]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.854274"
         },
         {
@@ -530,8 +640,13 @@
           "qty": 4,
           "date": "2026-04-07",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +10.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:39.961187"
         },
         {
@@ -543,8 +658,13 @@
           "qty": 26,
           "date": "2026-04-30",
           "profit": -148252,
+          "profit_pct": 0.0,
           "hold_days": 1,
           "reason": "손절(-7.6% ≤ -7.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.258254"
         },
         {
@@ -556,8 +676,13 @@
           "qty": 19,
           "date": "2026-05-02",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S2]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.272986"
         },
         {
@@ -569,8 +694,13 @@
           "qty": 3,
           "date": "2026-05-03",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +10.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.287097"
         },
         {
@@ -582,8 +712,13 @@
           "qty": 3,
           "date": "2026-05-06",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +20.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.315401"
         },
         {
@@ -595,8 +730,13 @@
           "qty": 2,
           "date": "2026-05-09",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +20.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.351286"
         },
         {
@@ -608,8 +748,13 @@
           "qty": 13,
           "date": "2026-04-26",
           "profit": -161847.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "트레일링스탑(고점대비-22.6% ≤ -15.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.198623"
         },
         {
@@ -621,8 +766,13 @@
           "qty": 16,
           "date": "2026-04-27",
           "profit": -53938.0,
+          "profit_pct": 0.0,
           "hold_days": -5,
           "reason": "트레일링스탑(고점대비-15.3% ≤ -15.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.260813"
         },
         {
@@ -634,8 +784,13 @@
           "qty": 11,
           "date": "2026-05-02",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S2]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.372488"
         },
         {
@@ -647,8 +802,13 @@
           "qty": 7,
           "date": "2026-05-05",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S2]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.421881"
         }
       ],
@@ -830,8 +990,13 @@
           "qty": 13,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S3]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.842571"
         },
         {
@@ -843,8 +1008,13 @@
           "qty": 8,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S3]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.844953"
         },
         {
@@ -856,8 +1026,13 @@
           "qty": 19,
           "date": "2026-04-29",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S3]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.850258"
         },
         {
@@ -869,8 +1044,13 @@
           "qty": 3,
           "date": "2026-05-03",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +10.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.287503"
         },
         {
@@ -882,8 +1062,13 @@
           "qty": 3,
           "date": "2026-05-06",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +10.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.315734"
         },
         {
@@ -895,8 +1080,13 @@
           "qty": 2,
           "date": "2026-05-09",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +20.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.351609"
         },
         {
@@ -908,8 +1098,13 @@
           "qty": 13,
           "date": "2026-04-26",
           "profit": -161847.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "트레일링스탑(고점대비-22.6% ≤ -15.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.199515"
         },
         {
@@ -921,8 +1116,13 @@
           "qty": 16,
           "date": "2026-04-27",
           "profit": -144638.0,
+          "profit_pct": 0.0,
           "hold_days": 1,
           "reason": "트레일링스탑(고점대비-15.3% ≤ -15.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.261486"
         },
         {
@@ -934,8 +1134,13 @@
           "qty": 12,
           "date": "2026-05-02",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S3]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.373478"
         },
         {
@@ -947,8 +1152,13 @@
           "qty": 7,
           "date": "2026-05-05",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S3]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.422648"
         }
       ],
@@ -1130,8 +1340,13 @@
           "qty": 13,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S4]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.842654"
         },
         {
@@ -1143,8 +1358,13 @@
           "qty": 8,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S4]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.845019"
         },
         {
@@ -1156,8 +1376,13 @@
           "qty": 19,
           "date": "2026-04-29",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S4]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.850327"
         },
         {
@@ -1169,8 +1394,13 @@
           "qty": 3,
           "date": "2026-05-03",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +10.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.287868"
         },
         {
@@ -1182,8 +1412,13 @@
           "qty": 3,
           "date": "2026-05-06",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +10.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.316045"
         },
         {
@@ -1195,8 +1430,13 @@
           "qty": 2,
           "date": "2026-05-09",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +20.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.351888"
         },
         {
@@ -1208,8 +1448,13 @@
           "qty": 13,
           "date": "2026-04-26",
           "profit": -161847.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "트레일링스탑(고점대비-22.6% ≤ -15.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.200320"
         },
         {
@@ -1221,8 +1466,13 @@
           "qty": 16,
           "date": "2026-04-27",
           "profit": -144638.0,
+          "profit_pct": 0.0,
           "hold_days": 1,
           "reason": "트레일링스탑(고점대비-15.3% ≤ -15.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.262149"
         },
         {
@@ -1234,8 +1484,13 @@
           "qty": 12,
           "date": "2026-05-02",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S4]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.374405"
         },
         {
@@ -1247,8 +1502,13 @@
           "qty": 7,
           "date": "2026-05-05",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S4]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.423359"
         }
       ],
@@ -1430,8 +1690,13 @@
           "qty": 13,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S5]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.842730"
         },
         {
@@ -1443,8 +1708,13 @@
           "qty": 8,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S5]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.845084"
         },
         {
@@ -1456,8 +1726,13 @@
           "qty": 19,
           "date": "2026-04-29",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S5]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.850392"
         },
         {
@@ -1469,8 +1744,13 @@
           "qty": 3,
           "date": "2026-05-03",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +10.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.288214"
         },
         {
@@ -1482,8 +1762,13 @@
           "qty": 3,
           "date": "2026-05-06",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +10.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.316353"
         },
         {
@@ -1495,8 +1780,13 @@
           "qty": 2,
           "date": "2026-05-09",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +20.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.352164"
         },
         {
@@ -1508,8 +1798,13 @@
           "qty": 13,
           "date": "2026-04-26",
           "profit": -161847.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "트레일링스탑(고점대비-22.6% ≤ -15.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.201120"
         },
         {
@@ -1521,8 +1816,13 @@
           "qty": 16,
           "date": "2026-04-27",
           "profit": -144638.0,
+          "profit_pct": 0.0,
           "hold_days": 1,
           "reason": "트레일링스탑(고점대비-15.3% ≤ -15.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.262863"
         },
         {
@@ -1534,8 +1834,13 @@
           "qty": 12,
           "date": "2026-05-02",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S5]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.375340"
         },
         {
@@ -1547,8 +1852,13 @@
           "qty": 7,
           "date": "2026-05-05",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [S5]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.424070"
         }
       ],
@@ -1730,8 +2040,13 @@
           "qty": 13,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T1]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.842816"
         },
         {
@@ -1743,8 +2058,13 @@
           "qty": 8,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T1]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.845147"
         },
         {
@@ -1756,8 +2076,13 @@
           "qty": 19,
           "date": "2026-04-29",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T1]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.850455"
         },
         {
@@ -1769,8 +2094,13 @@
           "qty": 3,
           "date": "2026-05-03",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +10.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.288581"
         },
         {
@@ -1782,8 +2112,13 @@
           "qty": 3,
           "date": "2026-05-06",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +10.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.316664"
         },
         {
@@ -1795,8 +2130,13 @@
           "qty": 2,
           "date": "2026-05-09",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +20.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.352440"
         },
         {
@@ -1808,8 +2148,13 @@
           "qty": 16,
           "date": "2026-04-26",
           "profit": -66174.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "트레일링스탑(고점대비-12.9% ≤ -10.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.168752"
         },
         {
@@ -1821,8 +2166,13 @@
           "qty": 13,
           "date": "2026-04-26",
           "profit": -161847.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "트레일링스탑(고점대비-22.6% ≤ -10.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.201965"
         },
         {
@@ -1834,8 +2184,13 @@
           "qty": 12,
           "date": "2026-05-02",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T1]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.376180"
         },
         {
@@ -1847,8 +2202,13 @@
           "qty": 7,
           "date": "2026-05-05",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T1]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.424824"
         }
       ],
@@ -2030,8 +2390,13 @@
           "qty": 13,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T2]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.842888"
         },
         {
@@ -2043,8 +2408,13 @@
           "qty": 8,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T2]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.845210"
         },
         {
@@ -2056,8 +2426,13 @@
           "qty": 19,
           "date": "2026-04-29",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T2]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.850549"
         },
         {
@@ -2069,8 +2444,13 @@
           "qty": 3,
           "date": "2026-05-03",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +10.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.288923"
         },
         {
@@ -2082,8 +2462,13 @@
           "qty": 3,
           "date": "2026-05-06",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +10.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.316965"
         },
         {
@@ -2095,8 +2480,13 @@
           "qty": 2,
           "date": "2026-05-09",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +20.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.352719"
         },
         {
@@ -2108,8 +2498,13 @@
           "qty": 16,
           "date": "2026-04-26",
           "profit": -66174.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "트레일링스탑(고점대비-12.9% ≤ -12.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.171770"
         },
         {
@@ -2121,8 +2516,13 @@
           "qty": 13,
           "date": "2026-04-26",
           "profit": -161847.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "트레일링스탑(고점대비-22.6% ≤ -12.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.202995"
         },
         {
@@ -2134,8 +2534,13 @@
           "qty": 12,
           "date": "2026-05-02",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T2]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.377009"
         },
         {
@@ -2147,8 +2552,13 @@
           "qty": 7,
           "date": "2026-05-05",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T2]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.425548"
         }
       ],
@@ -2330,8 +2740,13 @@
           "qty": 13,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T3]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.842971"
         },
         {
@@ -2343,8 +2758,13 @@
           "qty": 8,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T3]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.845273"
         },
         {
@@ -2356,8 +2776,13 @@
           "qty": 19,
           "date": "2026-04-29",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T3]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.850614"
         },
         {
@@ -2369,8 +2794,13 @@
           "qty": 3,
           "date": "2026-05-03",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +10.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.289258"
         },
         {
@@ -2382,8 +2812,13 @@
           "qty": 3,
           "date": "2026-05-06",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +10.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.317264"
         },
         {
@@ -2395,8 +2830,13 @@
           "qty": 2,
           "date": "2026-05-09",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +20.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.352984"
         },
         {
@@ -2408,8 +2848,13 @@
           "qty": 13,
           "date": "2026-04-26",
           "profit": -161847.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "트레일링스탑(고점대비-22.6% ≤ -15.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.204072"
         },
         {
@@ -2421,8 +2866,13 @@
           "qty": 16,
           "date": "2026-04-27",
           "profit": -144638.0,
+          "profit_pct": 0.0,
           "hold_days": 1,
           "reason": "트레일링스탑(고점대비-15.3% ≤ -15.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.263530"
         },
         {
@@ -2434,8 +2884,13 @@
           "qty": 12,
           "date": "2026-05-02",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T3]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.377836"
         },
         {
@@ -2447,8 +2902,13 @@
           "qty": 7,
           "date": "2026-05-05",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T3]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.426252"
         }
       ],
@@ -2630,8 +3090,13 @@
           "qty": 13,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T4]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.843036"
         },
         {
@@ -2643,8 +3108,13 @@
           "qty": 8,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T4]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.845335"
         },
         {
@@ -2656,8 +3126,13 @@
           "qty": 19,
           "date": "2026-04-29",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T4]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.850676"
         },
         {
@@ -2669,8 +3144,13 @@
           "qty": 3,
           "date": "2026-05-03",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +10.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.289598"
         },
         {
@@ -2682,8 +3162,13 @@
           "qty": 3,
           "date": "2026-05-06",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +10.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.317581"
         },
         {
@@ -2695,8 +3180,13 @@
           "qty": 2,
           "date": "2026-05-09",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +20.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.353242"
         },
         {
@@ -2708,8 +3198,13 @@
           "qty": 13,
           "date": "2026-04-26",
           "profit": -161847.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "트레일링스탑(고점대비-22.6% ≤ -18.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.205008"
         },
         {
@@ -2721,8 +3216,13 @@
           "qty": 16,
           "date": "2026-04-28",
           "profit": -277342.0,
+          "profit_pct": 0.0,
           "hold_days": 2,
           "reason": "트레일링스탑(고점대비-19.2% ≤ -18.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.281263"
         },
         {
@@ -2734,8 +3234,13 @@
           "qty": 12,
           "date": "2026-05-02",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T4]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.378648"
         },
         {
@@ -2747,8 +3252,13 @@
           "qty": 7,
           "date": "2026-05-05",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T4]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.426952"
         }
       ],
@@ -2930,8 +3440,13 @@
           "qty": 13,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T5]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.843100"
         },
         {
@@ -2943,8 +3458,13 @@
           "qty": 8,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T5]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.845403"
         },
         {
@@ -2956,8 +3476,13 @@
           "qty": 19,
           "date": "2026-04-29",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T5]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.850738"
         },
         {
@@ -2969,8 +3494,13 @@
           "qty": 3,
           "date": "2026-05-03",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +10.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.289922"
         },
         {
@@ -2982,8 +3512,13 @@
           "qty": 3,
           "date": "2026-05-06",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +10.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.317879"
         },
         {
@@ -2995,8 +3530,13 @@
           "qty": 2,
           "date": "2026-05-09",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +20.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.353502"
         },
         {
@@ -3008,8 +3548,13 @@
           "qty": 13,
           "date": "2026-04-26",
           "profit": -161847.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "트레일링스탑(고점대비-22.6% ≤ -20.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.205897"
         },
         {
@@ -3021,8 +3566,13 @@
           "qty": 16,
           "date": "2026-04-29",
           "profit": -306014.0,
+          "profit_pct": 0.0,
           "hold_days": 3,
           "reason": "손절(-10.3% ≤ -10.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.304484"
         },
         {
@@ -3034,8 +3584,13 @@
           "qty": 11,
           "date": "2026-05-02",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T5]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.379510"
         },
         {
@@ -3047,8 +3602,13 @@
           "qty": 7,
           "date": "2026-05-05",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T5]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.427647"
         }
       ],
@@ -3230,8 +3790,13 @@
           "qty": 13,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T6]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.843163"
         },
         {
@@ -3243,8 +3808,13 @@
           "qty": 8,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T6]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.845469"
         },
         {
@@ -3256,8 +3826,13 @@
           "qty": 19,
           "date": "2026-04-29",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T6]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.850800"
         },
         {
@@ -3269,8 +3844,13 @@
           "qty": 3,
           "date": "2026-05-03",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +10.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.290245"
         },
         {
@@ -3282,8 +3862,13 @@
           "qty": 3,
           "date": "2026-05-06",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +10.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.318195"
         },
         {
@@ -3295,8 +3880,13 @@
           "qty": 2,
           "date": "2026-05-09",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +20.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.353774"
         },
         {
@@ -3308,8 +3898,13 @@
           "qty": 16,
           "date": "2026-04-29",
           "profit": -306014.0,
+          "profit_pct": 0.0,
           "hold_days": 3,
           "reason": "손절(-10.3% ≤ -10.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.305380"
         },
         {
@@ -3321,8 +3916,13 @@
           "qty": 13,
           "date": "2026-04-29",
           "profit": -261843.0,
+          "profit_pct": 0.0,
           "hold_days": 3,
           "reason": "트레일링스탑(고점대비-25.4% ≤ -25.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.312717"
         },
         {
@@ -3334,8 +3934,13 @@
           "qty": 11,
           "date": "2026-05-02",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T6]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.380337"
         },
         {
@@ -3347,8 +3952,13 @@
           "qty": 7,
           "date": "2026-05-05",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [T6]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.428350"
         }
       ],
@@ -3530,8 +4140,13 @@
           "qty": 13,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [P1]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.843228"
         },
         {
@@ -3543,8 +4158,13 @@
           "qty": 8,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [P1]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.845549"
         },
         {
@@ -3556,8 +4176,13 @@
           "qty": 19,
           "date": "2026-04-29",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [P1]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.850864"
         },
         {
@@ -3569,8 +4194,13 @@
           "qty": 3,
           "date": "2026-05-03",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +10.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.290560"
         },
         {
@@ -3582,8 +4212,13 @@
           "qty": 3,
           "date": "2026-05-06",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +10.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.318498"
         },
         {
@@ -3595,8 +4230,13 @@
           "qty": 2,
           "date": "2026-05-09",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +20.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.354031"
         },
         {
@@ -3608,8 +4248,13 @@
           "qty": 13,
           "date": "2026-04-26",
           "profit": -161847.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "트레일링스탑(고점대비-22.6% ≤ -15.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.206749"
         },
         {
@@ -3621,8 +4266,13 @@
           "qty": 16,
           "date": "2026-04-27",
           "profit": -144638.0,
+          "profit_pct": 0.0,
           "hold_days": 1,
           "reason": "트레일링스탑(고점대비-15.3% ≤ -15.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.264230"
         },
         {
@@ -3634,8 +4284,13 @@
           "qty": 12,
           "date": "2026-05-02",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [P1]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.381223"
         },
         {
@@ -3647,8 +4302,13 @@
           "qty": 7,
           "date": "2026-05-05",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [P1]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.429065"
         }
       ],
@@ -3830,8 +4490,13 @@
           "qty": 13,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [P2]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.843303"
         },
         {
@@ -3843,8 +4508,13 @@
           "qty": 8,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [P2]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.845613"
         },
         {
@@ -3856,8 +4526,13 @@
           "qty": 19,
           "date": "2026-04-29",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [P2]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.850932"
         },
         {
@@ -3869,8 +4544,13 @@
           "qty": 3,
           "date": "2026-05-07",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +15.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.332142"
         },
         {
@@ -3882,8 +4562,13 @@
           "qty": 11,
           "date": "2026-04-26",
           "profit": -105171.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "트레일링스탑(고점대비-22.6% ≤ -15.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.207663"
         },
         {
@@ -3895,8 +4580,13 @@
           "qty": 13,
           "date": "2026-04-27",
           "profit": -63752,
+          "profit_pct": 0.0,
           "hold_days": 1,
           "reason": "트레일링스탑(고점대비-15.3% ≤ -15.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.264876"
         },
         {
@@ -3908,8 +4598,13 @@
           "qty": 12,
           "date": "2026-05-02",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [P2]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.382097"
         },
         {
@@ -3921,8 +4616,13 @@
           "qty": 7,
           "date": "2026-05-05",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [P2]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.429823"
         }
       ],
@@ -4104,8 +4804,13 @@
           "qty": 13,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [P3]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.843368"
         },
         {
@@ -4117,8 +4822,13 @@
           "qty": 8,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [P3]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.845685"
         },
         {
@@ -4130,8 +4840,13 @@
           "qty": 19,
           "date": "2026-04-29",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [P3]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.850998"
         },
         {
@@ -4143,8 +4858,13 @@
           "qty": 3,
           "date": "2026-05-09",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "가상추가매수 +20.0% 레벨",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:23:40.354329"
         },
         {
@@ -4156,8 +4876,13 @@
           "qty": 11,
           "date": "2026-04-26",
           "profit": -138780.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "트레일링스탑(고점대비-22.6% ≤ -15.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.208474"
         },
         {
@@ -4169,8 +4894,13 @@
           "qty": 13,
           "date": "2026-04-27",
           "profit": -63752,
+          "profit_pct": 0.0,
           "hold_days": 1,
           "reason": "트레일링스탑(고점대비-15.3% ≤ -15.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.265605"
         },
         {
@@ -4182,8 +4912,13 @@
           "qty": 12,
           "date": "2026-05-02",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [P3]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.382943"
         },
         {
@@ -4195,8 +4930,13 @@
           "qty": 7,
           "date": "2026-05-05",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [P3]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.430589"
         }
       ],
@@ -4378,8 +5118,13 @@
           "qty": 13,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [P4]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.843436"
         },
         {
@@ -4391,8 +5136,13 @@
           "qty": 8,
           "date": "2026-04-26",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [P4]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.845746"
         },
         {
@@ -4404,8 +5154,13 @@
           "qty": 19,
           "date": "2026-04-29",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [P4]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:22:36.851062"
         },
         {
@@ -4417,8 +5172,13 @@
           "qty": 8,
           "date": "2026-04-26",
           "profit": 0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "트레일링스탑(고점대비-22.6% ≤ -15.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.209292"
         },
         {
@@ -4430,8 +5190,13 @@
           "qty": 13,
           "date": "2026-04-27",
           "profit": -63752,
+          "profit_pct": 0.0,
           "hold_days": 1,
           "reason": "트레일링스탑(고점대비-15.3% ≤ -15.0%)",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.266324"
         },
         {
@@ -4443,8 +5208,13 @@
           "qty": 12,
           "date": "2026-05-02",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [P4]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.383769"
         },
         {
@@ -4456,8 +5226,13 @@
           "qty": 7,
           "date": "2026-05-05",
           "profit": 0.0,
+          "profit_pct": 0.0,
           "hold_days": 0,
           "reason": "매수신호 [P4]",
+          "buy_commission": 0.0,
+          "sell_commission": 0.0,
+          "transaction_tax": 0.0,
+          "total_fee": 0.0,
           "ts": "2026-05-25T05:24:25.431376"
         }
       ],

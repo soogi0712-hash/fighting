@@ -1,0 +1,13 @@
+{
+  "HOOD": {
+    "symbol": "HOOD",
+    "name": "로빈훗 마케츠",
+    "excd": "NASD",
+    "qty": 2,
+    "avg_price": 88.75,
+    "highest_price": 88.75,
+    "current_level": 1,
+    "created_at": "2026-06-12T14:04:15.308188",
+    "is_overseas": true
+  }
+}

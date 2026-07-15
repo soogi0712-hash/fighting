@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# 런타임 데이터 (변경사항 추적 불필요)
+stock_trader_v2/data/*.db
+stock_trader_v2/data/*.json
+stock_trader_v2/data/*.lock
+stock_trader_v2/data/kis_token_cache.json
+
+# 로그 (대용량, 런타임 생성)
+stock_trader_v2/logs/
+logs/
+
+# 환경변수
+.env
+*.env
+
+# 에디터
+.vscode/
+.idea/
+*.swp
+*.swo

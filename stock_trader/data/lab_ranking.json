@@ -1,5 +1,5 @@
 {
-  "calc_date": "2026-05-25",
+  "calc_date": "2026-06-15",
   "regime": "LATERAL",
   "ranking": [
     {
@@ -26,7 +26,11 @@
         "return_3m": -0.64,
         "return_6m": -0.64,
         "final_capital": 10110423,
-        "initial_capital": 10000000
+        "initial_capital": 10000000,
+        "total_fee": 0.0,
+        "total_buy_commission": 0.0,
+        "total_sell_commission": 0.0,
+        "total_transaction_tax": 0.0
       },
       "ai": {
         "grade": "N/A",
@@ -37,7 +41,7 @@
       "stop_loss_pct": -10.0,
       "trailing_pct": -15.0,
       "add_buy_levels": [],
-      "calc_date": "2026-05-25"
+      "calc_date": "2026-06-15"
     },
     {
       "rank": 2,
@@ -63,7 +67,11 @@
         "return_3m": -1.69,
         "return_6m": -1.69,
         "final_capital": 10005252,
-        "initial_capital": 10000000
+        "initial_capital": 10000000,
+        "total_fee": 0.0,
+        "total_buy_commission": 0.0,
+        "total_sell_commission": 0.0,
+        "total_transaction_tax": 0.0
       },
       "ai": {
         "grade": "N/A",
@@ -78,7 +86,7 @@
         30.0,
         50.0
       ],
-      "calc_date": "2026-05-25"
+      "calc_date": "2026-06-15"
     },
     {
       "rank": 3,
@@ -104,7 +112,11 @@
         "return_3m": -2.03,
         "return_6m": -2.03,
         "final_capital": 9971643,
-        "initial_capital": 10000000
+        "initial_capital": 10000000,
+        "total_fee": 0.0,
+        "total_buy_commission": 0.0,
+        "total_sell_commission": 0.0,
+        "total_transaction_tax": 0.0
       },
       "ai": {
         "grade": "N/A",
@@ -119,7 +131,7 @@
         40.0,
         60.0
       ],
-      "calc_date": "2026-05-25"
+      "calc_date": "2026-06-15"
     },
     {
       "rank": 4,
@@ -145,7 +157,11 @@
         "return_3m": -2.28,
         "return_6m": -2.28,
         "final_capital": 9946154,
-        "initial_capital": 10000000
+        "initial_capital": 10000000,
+        "total_fee": 0.0,
+        "total_buy_commission": 0.0,
+        "total_sell_commission": 0.0,
+        "total_transaction_tax": 0.0
       },
       "ai": {
         "grade": "N/A",
@@ -160,7 +176,7 @@
         20.0,
         35.0
       ],
-      "calc_date": "2026-05-25"
+      "calc_date": "2026-06-15"
     },
     {
       "rank": 5,
@@ -186,7 +202,11 @@
         "return_3m": -2.28,
         "return_6m": -2.28,
         "final_capital": 9946154,
-        "initial_capital": 10000000
+        "initial_capital": 10000000,
+        "total_fee": 0.0,
+        "total_buy_commission": 0.0,
+        "total_sell_commission": 0.0,
+        "total_transaction_tax": 0.0
       },
       "ai": {
         "grade": "N/A",
@@ -201,7 +221,7 @@
         20.0,
         35.0
       ],
-      "calc_date": "2026-05-25"
+      "calc_date": "2026-06-15"
     },
     {
       "rank": 6,
@@ -227,7 +247,11 @@
         "return_3m": -3.06,
         "return_6m": -3.06,
         "final_capital": 9867690,
-        "initial_capital": 10000000
+        "initial_capital": 10000000,
+        "total_fee": 0.0,
+        "total_buy_commission": 0.0,
+        "total_sell_commission": 0.0,
+        "total_transaction_tax": 0.0
       },
       "ai": {
         "grade": "N/A",
@@ -242,7 +266,7 @@
         20.0,
         35.0
       ],
-      "calc_date": "2026-05-25"
+      "calc_date": "2026-06-15"
     },
     {
       "rank": 7,
@@ -268,7 +292,11 @@
         "return_3m": -3.06,
         "return_6m": -3.06,
         "final_capital": 9867690,
-        "initial_capital": 10000000
+        "initial_capital": 10000000,
+        "total_fee": 0.0,
+        "total_buy_commission": 0.0,
+        "total_sell_commission": 0.0,
+        "total_transaction_tax": 0.0
       },
       "ai": {
         "grade": "N/A",
@@ -283,7 +311,7 @@
         20.0,
         35.0
       ],
-      "calc_date": "2026-05-25"
+      "calc_date": "2026-06-15"
     },
     {
       "rank": 8,
@@ -309,7 +337,11 @@
         "return_3m": -3.06,
         "return_6m": -3.06,
         "final_capital": 9867690,
-        "initial_capital": 10000000
+        "initial_capital": 10000000,
+        "total_fee": 0.0,
+        "total_buy_commission": 0.0,
+        "total_sell_commission": 0.0,
+        "total_transaction_tax": 0.0
       },
       "ai": {
         "grade": "N/A",
@@ -324,7 +356,7 @@
         20.0,
         35.0
       ],
-      "calc_date": "2026-05-25"
+      "calc_date": "2026-06-15"
     },
     {
       "rank": 9,
@@ -350,7 +382,11 @@
         "return_3m": -3.06,
         "return_6m": -3.06,
         "final_capital": 9867690,
-        "initial_capital": 10000000
+        "initial_capital": 10000000,
+        "total_fee": 0.0,
+        "total_buy_commission": 0.0,
+        "total_sell_commission": 0.0,
+        "total_transaction_tax": 0.0
       },
       "ai": {
         "grade": "N/A",
@@ -365,7 +401,7 @@
         20.0,
         35.0
       ],
-      "calc_date": "2026-05-25"
+      "calc_date": "2026-06-15"
     },
     {
       "rank": 10,
@@ -391,7 +427,11 @@
         "return_3m": -3.06,
         "return_6m": -3.06,
         "final_capital": 9867690,
-        "initial_capital": 10000000
+        "initial_capital": 10000000,
+        "total_fee": 0.0,
+        "total_buy_commission": 0.0,
+        "total_sell_commission": 0.0,
+        "total_transaction_tax": 0.0
       },
       "ai": {
         "grade": "N/A",
@@ -406,7 +446,7 @@
         20.0,
         35.0
       ],
-      "calc_date": "2026-05-25"
+      "calc_date": "2026-06-15"
     },
     {
       "rank": 11,
@@ -433,7 +473,11 @@
         "return_3m": -4.86,
         "return_6m": -4.86,
         "final_capital": 9749251,
-        "initial_capital": 10000000
+        "initial_capital": 10000000,
+        "total_fee": 0.0,
+        "total_buy_commission": 0.0,
+        "total_sell_commission": 0.0,
+        "total_transaction_tax": 0.0
       },
       "ai": {
         "grade": "F",
@@ -451,7 +495,7 @@
         20.0,
         35.0
       ],
-      "calc_date": "2026-05-25"
+      "calc_date": "2026-06-15"
     },
     {
       "rank": 12,
@@ -477,7 +521,11 @@
         "return_3m": -5.36,
         "return_6m": -5.36,
         "final_capital": 9696790,
-        "initial_capital": 10000000
+        "initial_capital": 10000000,
+        "total_fee": 0.0,
+        "total_buy_commission": 0.0,
+        "total_sell_commission": 0.0,
+        "total_transaction_tax": 0.0
       },
       "ai": {
         "grade": "F",
@@ -495,7 +543,7 @@
         20.0,
         35.0
       ],
-      "calc_date": "2026-05-25"
+      "calc_date": "2026-06-15"
     },
     {
       "rank": 13,
@@ -521,7 +569,11 @@
         "return_3m": -4.39,
         "return_6m": -4.39,
         "final_capital": 9734986,
-        "initial_capital": 10000000
+        "initial_capital": 10000000,
+        "total_fee": 0.0,
+        "total_buy_commission": 0.0,
+        "total_sell_commission": 0.0,
+        "total_transaction_tax": 0.0
       },
       "ai": {
         "grade": "N/A",
@@ -536,7 +588,7 @@
         20.0,
         35.0
       ],
-      "calc_date": "2026-05-25"
+      "calc_date": "2026-06-15"
     },
     {
       "rank": 14,
@@ -562,7 +614,11 @@
         "return_3m": -4.68,
         "return_6m": -4.68,
         "final_capital": 9694012,
-        "initial_capital": 10000000
+        "initial_capital": 10000000,
+        "total_fee": 0.0,
+        "total_buy_commission": 0.0,
+        "total_sell_commission": 0.0,
+        "total_transaction_tax": 0.0
       },
       "ai": {
         "grade": "N/A",
@@ -577,7 +633,7 @@
         20.0,
         35.0
       ],
-      "calc_date": "2026-05-25"
+      "calc_date": "2026-06-15"
     },
     {
       "rank": 15,
@@ -603,7 +659,11 @@
         "return_3m": -5.68,
         "return_6m": -5.68,
         "final_capital": 9594016,
-        "initial_capital": 10000000
+        "initial_capital": 10000000,
+        "total_fee": 0.0,
+        "total_buy_commission": 0.0,
+        "total_sell_commission": 0.0,
+        "total_transaction_tax": 0.0
       },
       "ai": {
         "grade": "N/A",
@@ -618,7 +678,7 @@
         20.0,
         35.0
       ],
-      "calc_date": "2026-05-25"
+      "calc_date": "2026-06-15"
     }
   ]
 }
