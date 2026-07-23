@@ -56,7 +56,8 @@ from screener.transaction_cost      import net_profit_pct_from_cost
 # ── 실거래 원장 이중기록 (기록 전용; import 실패해도 매매엔 영향 없음) ──
 try:
     from ledger import LedgerRecorder
-    from ledger.integration import record_from_log
+    from ledger.wiring import record_trade_event
+    from ledger.health import LEDGER_HEALTH
     _LEDGER_OK = True
 except Exception:
     _LEDGER_OK = False
@@ -101,6 +102,9 @@ class StrategyManager:
 
         # ★ 실거래 원장 (지연 초기화; 기록 전용)
         self._ledger = None
+        # 체결 확인 소스 — 기본 None(체결 확인 불가 시 접수를 체결로 기록하지 않음).
+        # 실환경(PHASE 5)에서 KisFillSource(api) 를 주입한다.
+        self._fill_source = None
 
     # ── 하위 호환: daily_loss_krw 프로퍼티 ──────────────────
     @property
@@ -1068,14 +1072,15 @@ class StrategyManager:
         except Exception as e:
             logger.error(f"거래로그 오류: {e}")
 
-        # ── 실거래 원장 이중기록 (기록 전용; 실패해도 매매 흐름에 영향 없음) ──
+        # ── 실거래 원장 이중기록 (체결 기반; 실패해도 매매 흐름에 영향 없음) ──
         if _LEDGER_OK:
             try:
                 if self._ledger is None:
                     self._ledger = LedgerRecorder()
-                record_from_log(self._ledger, entry, "KR")
+                record_trade_event(self._ledger, LEDGER_HEALTH, entry, "KR", self._fill_source)
             except Exception as _le:
-                logger.debug(f"[ledger] KR 원장 기록 실패(무시): {_le}")
+                LEDGER_HEALTH.record_fail("KR", entry.get("code"),
+                                          entry.get("action"), entry.get("order_no"), _le)
 
     def get_daily_pnl_status(self) -> dict:
         """대시보드용 일일 손익 상태 반환"""

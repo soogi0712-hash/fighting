@@ -60,7 +60,8 @@ from strategies.reentry_guard   import ReentryGuard, _is_stoploss_reason
 # ── 실거래 원장 이중기록 (기록 전용; import 실패해도 매매엔 영향 없음) ──
 try:
     from ledger import LedgerRecorder
-    from ledger.integration import record_from_log
+    from ledger.wiring import record_trade_event
+    from ledger.health import LEDGER_HEALTH
     _LEDGER_OK = True
 except Exception:
     _LEDGER_OK = False
@@ -640,6 +641,9 @@ class USStrategyManager:
 
         # ★ 실거래 원장 (지연 초기화; 기록 전용)
         self._ledger = None
+        # 체결 확인 소스 — 기본 None(체결 확인 불가 시 접수를 체결로 기록하지 않음).
+        # 실환경(PHASE 5)에서 KisFillSource(api) 를 주입한다.
+        self._fill_source = None
 
         # ── [US OPEN SCAN] 인스턴스 레벨 추적 ──────────────
         self._us_open_scan: dict = {
@@ -1896,15 +1900,16 @@ class USStrategyManager:
         return res
 
     def _ledger_record(self, entry: dict):
-        """실거래 원장 이중기록 (기록 전용; 실패해도 매매 흐름에 영향 없음)."""
+        """실거래 원장 이중기록 (체결 기반; 실패해도 매매 흐름에 영향 없음)."""
         if not _LEDGER_OK:
             return
         try:
             if self._ledger is None:
                 self._ledger = LedgerRecorder()
-            record_from_log(self._ledger, entry, "US")
+            record_trade_event(self._ledger, LEDGER_HEALTH, entry, "US", self._fill_source)
         except Exception as _le:
-            logger.debug(f"[ledger] US 원장 기록 실패(무시): {_le}")
+            LEDGER_HEALTH.record_fail("US", entry.get("symbol"),
+                                      entry.get("action"), entry.get("order_no"), _le)
 
     def sync_from_balance(self):
         """서버 시작 시 KIS 잔고 기반 포지션 복원"""
