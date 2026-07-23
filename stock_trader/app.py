@@ -2518,6 +2518,27 @@ def api_build():
     })
 
 
+@app.route("/api/ledger/health")
+def api_ledger_health():
+    """
+    원장 기록 건강상태 + 주문 게이트 상태.
+    노출: LIVE_ORDER_ENABLED, runtime_kill_switch, pending_order_count, cancel_fail_count,
+          원장 기록/실패 카운트. ★ 인증정보(app_key/secret)·계좌번호는 노출하지 않음.
+    """
+    out = {}
+    try:
+        from ledger.health import LEDGER_HEALTH
+        out["ledger"] = LEDGER_HEALTH.snapshot()
+    except Exception as e:
+        out["ledger"] = {"error": str(e)}
+    try:
+        from utils.order_gate import snapshot as _gate_snapshot
+        out["order_gate"] = _gate_snapshot()
+    except Exception as e:
+        out["order_gate"] = {"error": str(e)}
+    return jsonify(out)
+
+
 @app.route("/api/reentry")
 def api_reentry():
     """재진입 차단 중인 종목 목록 조회 (국내장 + 미국장 공통)"""
