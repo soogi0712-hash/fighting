@@ -1,0 +1,6 @@
+[
+  {"timestamp": "2026-07-23T09:31:00", "action": "BUY",  "code": "005930", "name": "삼성전자", "price": 70000, "qty": 100, "reason": "돌파진입", "buy_score": 0.62},
+  {"timestamp": "2026-07-23T09:45:00", "action": "BUY",  "code": "005930", "name": "삼성전자", "price": 71500, "qty": 50,  "reason": "+10% 추가매수"},
+  {"timestamp": "2026-07-23T10:20:00", "action": "SELL", "code": "005930", "name": "삼성전자", "price": 72000, "qty": 60,  "reason": "분할익절"},
+  {"timestamp": "2026-07-23T10:40:00", "action": "SELL", "code": "005930", "name": "삼성전자", "price": 71000, "qty": 90,  "reason": "트레일링스탑"}
+]
