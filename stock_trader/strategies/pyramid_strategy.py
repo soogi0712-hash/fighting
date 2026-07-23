@@ -47,6 +47,20 @@ from screener.transaction_cost import (
 
 logger = get_logger("PyramidStrategy")
 
+
+def net_krw_profit(avg_price: float, qty: int, cur_price: float) -> float:
+    """
+    실질 원화 순손익 (수수료·세금 반영).
+    - SSOT 재사용: calc_sell_proceeds 로 매도측 순수령액 계산.
+    - avg_price 는 이미 매수수수료 포함 원가(cost basis) → 매수수수료 이중 반영 없음.
+    - %(net_profit_pct_from_cost)와 동일 비용모델을 사용해 원화/퍼센트 익절 기준 통일.
+    """
+    if qty <= 0 or avg_price <= 0 or cur_price <= 0:
+        return 0.0
+    sp = calc_sell_proceeds(cur_price, qty)
+    return sp.net_proceeds - avg_price * qty
+
+
 PYRAMID_FILE  = os.path.join(os.path.dirname(__file__), "..", "data", "pyramid_positions.json")
 COMPOUND_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "compound_pool.json")
 
@@ -335,7 +349,9 @@ class PyramidStrategyManager:
             )
 
         # ── ⑤ KRW 금액 기준 익절 ─────────────────────────────
-        cur_profit_amt = (cur_price - pos.avg_price) * pos.total_qty  # 근사값
+        # [B] gross→net 일원화: 퍼센트 익절과 동일 비용모델(calc_sell_proceeds SSOT) 사용.
+        #     수수료·세금 반영 실질 순손익으로 임계값(10,000/30,000원) 판정.
+        cur_profit_amt = net_krw_profit(pos.avg_price, pos.total_qty, cur_price)  # 실질 net
 
         if cur_profit_amt >= PROFIT_FULL_KRW:
             sp         = calc_sell_proceeds(cur_price, pos.total_qty)
