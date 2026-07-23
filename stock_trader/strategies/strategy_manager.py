@@ -391,7 +391,7 @@ class StrategyManager:
         logger.info(
             f"[{sess['icon']} {sess['session']}] {name}({code}) | "
             f"현재가={cur_price:,.0f}원 | "
-            f"BUY_SCORE={buy_score:.2f}(early≥0.40/full≥0.55) | "
+            f"BUY_SCORE={buy_score:.2f}(early≥0.50/full≥0.65) | "
             f"SELL_SCORE={sell_score}/27{'🚨' if sell_urgent else ('⛔매수금지' if buy_blocked_sell else '')} | "
             f"거래량={vol_label} | VWAP={vwap_state} | "
             f"실질수익={net_pct:+.2f}% | 최고수익={max_net_pct:+.2f}% | "

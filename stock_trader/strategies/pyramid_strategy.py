@@ -81,11 +81,11 @@ PYRAMID_LEVELS = {
 
 # ★ 복리형 초회전 단타 파라미터
 # ★ 모든 % 기준은 실질수익률 기준 (수수료·세금 차감 후)
-STOP_LOSS_PCT            = -5.0   # ★ 최종 안전장치 -5% (손절은 청산 순서 마지막)
+STOP_LOSS_PCT            = -3.0   # [TOP2] -5.0→-3.0: 파국 꼬리 축소(손익분기 승률 71%→~60%), -2% 반등 케이스는 보존
 TRAILING_STOP_PCT        = -1.0   # 트레일링 스탑 (고점 대비 -1.0%)
 TRAILING_ACTIVATE_PCT    =  1.5   # 트레일링 활성화 (+1.5% 달성 시)
-PROFIT_SUPER_PCT         =  2.5   # ★ +2.5% 무조건 전량 익절 (최우선)
-PROFIT_FULL_PCT          =  2.0   # ★ +2.0% 전량 익절 (SELL_SCORE 무관)
+PROFIT_SUPER_PCT         =  5.0   # [TOP3] 2.5→5.0: 강한 승자의 하드 상한 완화(트레일링이 실질 관리)
+PROFIT_FULL_PCT          =  3.5   # [TOP3] 2.0→3.5: '+2% 무조건 익절' 천장 제거 → 승자가 트레일링으로 더 상승 포착
 PROFIT_TRAIL_PCT         =  1.5   # ★ +1.5% + SELL_SCORE≥4 → 전량 익절
 PARTIAL_PROFIT_PCT       =  2.0   # 단계별 부분 익절 기준 (% 폴백용)
 PARTIAL_SELL_RATIO       =  0.5   # 부분 익절 시 해당 단계 보유 비율
@@ -108,8 +108,8 @@ MAX_DAILY_LOSSES         = 2        # 당일 연속 손실 허용 횟수 (이 �
 SELL_SCORE_PROTECTION_PCT = 1.0    # 이 이상 수익 시 SELL SCORE 즉시 매도 적용
 
 # ── Early / Full Entry BUY SCORE 임계 ─────────────────────────
-BUY_SCORE_EARLY          = 0.40   # 0.60 → 0.40 (빠른 선점 전략)
-BUY_SCORE_FULL           = 0.55   # 0.75 → 0.55 (빠른 선점 전략)
+BUY_SCORE_EARLY          = 0.50   # [TOP1] 0.40→0.50: 거래량급증(+3=0.43)만으론 진입 불가 → 최소 지표 1개 확인 필수
+BUY_SCORE_FULL           = 0.65   # [TOP1] 0.55→0.65: 본진입은 지표 2개+거래량 수준 확인(진입 품질↑)
 
 
 class PyramidStrategyManager:
