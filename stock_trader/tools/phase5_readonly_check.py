@@ -128,13 +128,27 @@ def main():
 
     print(f"LIVE_ORDER_ENABLED={Config.LIVE_ORDER_ENABLED} (읽기 검증엔 무관, 주문 호출 없음)")
     api = KISApi()
+
+    # ── ★ 주문 호출 감시(tripwire): 읽기검증 중 주문 API 가 단 1회라도 불리면 즉시 차단·집계 ──
+    order_calls = {"n": 0, "names": []}
+    for _m in ("buy", "sell", "buy_us", "sell_us", "cancel_order"):
+        if hasattr(api, _m):
+            def _trip(*a, _name=_m, **k):
+                order_calls["n"] += 1
+                order_calls["names"].append(_name)
+                raise AssertionError(f"금지된 주문 API 호출 감지: {_name}")
+            setattr(api, _m, _trip)
+
     results = run_checks(api, market_session, Config)
     print("─" * 60)
     allok = True
     for name, ok, detail in results:
         allok = allok and ok
         print(f"  [{'PASS' if ok else 'FAIL'}] {name}: {detail}")
+    print(f"  [{'PASS' if order_calls['n'] == 0 else 'FAIL'}] 주문 API 호출 횟수: {order_calls['n']}회"
+          + (f" — {order_calls['names']}" if order_calls["n"] else " (buy/sell/buy_us/sell_us/cancel 0회)"))
     print("─" * 60)
+    allok = allok and order_calls["n"] == 0
     print("결과:", "✅ 전체 통과 → 실주문 직전 보고 단계로" if allok else "❌ 실패 항목 있음 → 원인 수정 후 재검증")
     return 0 if allok else 1
 
