@@ -57,6 +57,14 @@ from utils.market_session     import (
 from strategies.daily_pnl_guard import DailyPnLGuard
 from strategies.reentry_guard   import ReentryGuard, _is_stoploss_reason
 
+# ── 실거래 원장 이중기록 (기록 전용; import 실패해도 매매엔 영향 없음) ──
+try:
+    from ledger import LedgerRecorder
+    from ledger.integration import record_from_log
+    _LEDGER_OK = True
+except Exception:
+    _LEDGER_OK = False
+
 logger = get_logger("USStrategy")
 
 US_POSITIONS_FILE = os.path.join(
@@ -629,6 +637,9 @@ class USStrategyManager:
 
         # ★ 재진입 차단 (국내장/미국장 공통 파일 기반)
         self.reentry = ReentryGuard()
+
+        # ★ 실거래 원장 (지연 초기화; 기록 전용)
+        self._ledger = None
 
         # ── [US OPEN SCAN] 인스턴스 레벨 추적 ──────────────
         self._us_open_scan: dict = {
@@ -1835,7 +1846,7 @@ class USStrategyManager:
                     is_stoploss= _is_sl,
                 )
 
-            return {
+            sell_res = {
                 "action":      action_tag,
                 "symbol":      symbol, "name": name, "excd": excd,
                 "price":       cur_price, "qty": qty,
@@ -1846,6 +1857,8 @@ class USStrategyManager:
                 "peak_pnl":    pnl_st["peak_pnl"],
                 "pnl_state":   pnl_st["state"],
             }
+            self._ledger_record(sell_res)   # 실거래 원장 이중기록 (US 매도 관문)
+            return sell_res
         # ★ 매도 실패 시 — '가능수량보다 큽니다' 오류 = KIS에 실제 잔고 없음
         # → 유령 포지션으로 판단하고 봇 포지션에서도 제거
         fail_msg = result.get('msg1', '매도실패')
@@ -1861,7 +1874,7 @@ class USStrategyManager:
 
     def _buy_result(self, symbol, name, excd, price, qty, level,
                     sess, iv, entry_reason, tag) -> dict:
-        return {
+        res = {
             "action":       "BUY",
             "symbol":       symbol, "name": name, "excd": excd,
             "price":        price,  "qty": qty,
@@ -1879,6 +1892,19 @@ class USStrategyManager:
             "session":      sess["session"],
             "currency":     "USD",
         }
+        self._ledger_record(res)   # 실거래 원장 이중기록 (US 매수 단일 관문)
+        return res
+
+    def _ledger_record(self, entry: dict):
+        """실거래 원장 이중기록 (기록 전용; 실패해도 매매 흐름에 영향 없음)."""
+        if not _LEDGER_OK:
+            return
+        try:
+            if self._ledger is None:
+                self._ledger = LedgerRecorder()
+            record_from_log(self._ledger, entry, "US")
+        except Exception as _le:
+            logger.debug(f"[ledger] US 원장 기록 실패(무시): {_le}")
 
     def sync_from_balance(self):
         """서버 시작 시 KIS 잔고 기반 포지션 복원"""
