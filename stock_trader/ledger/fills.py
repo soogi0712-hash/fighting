@@ -48,13 +48,41 @@ class MockFillSource(FillSource):
         return []
 
 
+class CumulativeFillTracker:
+    """
+    누적 체결값(KIS get_order_history 는 tot_ccld_qty/tot_ccld_amt = '누적'을 준다)을
+    받아, 아직 반영하지 않은 '신규 델타'만 Fill 로 방출한다.
+
+    - 신규 반영수량 = 현재 누적 체결수량 - 기존 반영 누적수량   (item 6)
+    - 델타 평균체결가 = (현재 누적금액 - 기존 누적금액) / 델타수량  (item 7)
+      → 동일 주문이 여러 체결가로 나뉘어도 실제 누적금액/수량으로 평균가 산출.
+    """
+    def __init__(self):
+        self._seen = {}   # key -> (cum_qty, cum_amount)
+
+    def update(self, key, cum_qty, cum_amount, order_no=None, ts=None):
+        prev_q, prev_a = self._seen.get(key, (0, 0.0))
+        dq = cum_qty - prev_q
+        if dq <= 0:
+            return None                      # 신규 반영분 없음
+        da = cum_amount - prev_a
+        avg = (da / dq) if dq else 0.0
+        self._seen[key] = (cum_qty, cum_amount)
+        return Fill(order_no=(order_no or str(key)), qty=dq, price=avg, ts=ts)
+
+
 class KisFillSource(FillSource):
     """
     실환경 어댑터 (PHASE 5). 실 API 호출을 포함하므로 이 단계에서는 사용 금지.
     LIVE_ORDER_ENABLED=false 면 네트워크 호출 없이 빈 목록을 반환한다.
+
+    get_order_history 의 '확인된' 필드만 사용:
+      qty=tot_ccld_qty(누적), amount=tot_ccld_amt(누적), price=avg_prvs.
+    누적값이므로 CumulativeFillTracker 로 델타만 방출(중복/부분체결 안전).
     """
     def __init__(self, api):
         self.api = api
+        self._tracker = CumulativeFillTracker()
 
     def get_fills(self, market, code, side, requested_qty=None,
                   requested_price=None, order_hint=None, ts=None):
@@ -65,16 +93,20 @@ class KisFillSource(FillSource):
             from ..config import Config
         if not getattr(Config, "LIVE_ORDER_ENABLED", False):
             return []
-        # ── 이하 실환경(PHASE 5)에서만 동작 — get_order_history 확인 필드 사용 ──
         want = "매수" if side.startswith("BUY") else "매도"
         fills = []
         try:
             for od in self.api.get_order_history(days=1):   # 실 API (PHASE 5)
-                if od.get("code") == code and od.get("type") == want:
-                    q = int(od.get("qty", 0))
-                    if q > 0:
-                        fills.append(Fill(order_no=str(od.get("order_no", od.get("odno", ""))),
-                                          qty=q, price=float(od.get("price", 0)), ts=od.get("time")))
+                if od.get("code") != code or od.get("type") != want:
+                    continue
+                order_no = od.get("order_no") or f"{code}:{side}"
+                key = (market, order_no)
+                cum_qty = int(od.get("qty", 0))
+                cum_amt = float(od.get("amount", 0) or (od.get("price", 0) * cum_qty))
+                f = self._tracker.update(key, cum_qty, cum_amt, order_no=order_no,
+                                         ts=od.get("time"))
+                if f:
+                    fills.append(f)
         except Exception:
             return []
         return fills
