@@ -25,6 +25,15 @@ from ledger.fills import Fill, MockFillSource, CumulativeFillTracker
 from ledger.wiring import record_trade_event
 from ledger.health import LedgerHealth, check_consistency
 from api.kis_api import _parse_order_history
+import profile_config as _pc
+
+# ── 이 파일의 게이트 테스트는 'LIVE 프로필' 전제(신규주문 차단은 LIVE_ORDER_ENABLED/kill 로만) ──
+for _k in [x for x in os.environ if x.startswith("KIS_")]:
+    del os.environ[_k]
+os.environ.update({"KIS_ACTIVE_PROFILE": "kakao", "KIS_KAKAO_APP_KEY": "D",
+                   "KIS_KAKAO_APP_SECRET": "D", "KIS_KAKAO_ACCOUNT": "22222222",
+                   "KIS_KAKAO_MODE": "LIVE"})
+_pc.reset_for_test(); _pc.resolve_profile(force_reload=True)
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures", "order_history_sample.json")
 
@@ -88,7 +97,9 @@ def test_new_order_blocked_by_kill_no_network():
 
 
 def test_cancel_not_gated():
-    """취소는 게이트하지 않음 — live=False + 킬 활성이어도 취소는 실행(긴급정지용)."""
+    """취소는 신규주문 게이트(LIVE_ORDER_ENABLED/kill)로 막지 않음 —
+    LIVE 프로필(모듈 상단 설정)이면 live=False + kill 이어도 긴급정지 취소가 실행된다.
+    (READ_ONLY/legacy 프로필은 취소도 차단 — test_profile_separation 에서 검증)"""
     import api.kis_api as kmod
     saved = Config.LIVE_ORDER_ENABLED
     Config.LIVE_ORDER_ENABLED = False
@@ -99,11 +110,11 @@ def test_cancel_not_gated():
         api = kmod.KISApi(); api.account_no = "00000000-01"
         api._headers = lambda *a, **k: {}; api._rate_limit = lambda: None
         r = api.cancel_order("0000123456", "005930", 1, 70000)
-        assert r.get("rt_cd") == "0" and r.get("_blocked") is None   # 차단 아님
+        assert r.get("rt_cd") == "0" and r.get("_blocked") is None   # LIVE 프로필 → 차단 아님
         assert fake.posted == 1   # 실제 취소 요청 수행
     finally:
         kmod.requests = orig; order_gate.clear_kill(); Config.LIVE_ORDER_ENABLED = saved
-    print("✓ 취소는 게이트 미적용(신규주문 차단과 분리)")
+    print("✓ 취소: LIVE 프로필은 kill 중에도 실행(신규주문 차단과 분리), READ_ONLY는 차단")
 
 
 class _MockApi:
@@ -206,14 +217,17 @@ def test_consistency_no_false_mismatch():
 
 
 def test_gate_snapshot_no_credentials():
-    """게이트 스냅샷에 인증정보/계좌번호 미포함, 필수 필드 포함."""
+    """게이트 스냅샷: 필수필드 포함 + 원문 시크릿/전체 계좌번호 미노출(마스킹 account 필드는 허용)."""
     snap = order_gate.snapshot()
     for k in ("live_order_enabled", "runtime_kill_switch", "cancel_fail_count", "pending_order_count"):
         assert k in snap
-    blob = json.dumps(snap).lower()
-    for bad in ("app_key", "app_secret", "appkey", "appsecret", "account", "계좌", "secret"):
-        assert bad not in blob
-    print("✓ 게이트 스냅샷: 필수필드 포함·인증정보/계좌 미노출")
+    blob = json.dumps(snap, ensure_ascii=False)
+    # 원문 값 미노출: 전체 계좌번호(모듈 kakao 프로필=22222222)·app_key/secret 원문
+    assert "22222222" not in blob                 # 전체 계좌번호 원문 미노출
+    assert snap["active_profile"]["account"] == "22****22"   # 마스킹 형태만
+    for secret in ("app_secret", "appsecret", "KIS_KAKAO_APP_SECRET"):
+        assert secret not in blob                 # 시크릿 필드/원문 미노출
+    print("✓ 게이트 스냅샷: 필수필드 포함·원문 시크릿/전체계좌 미노출(account 마스킹만)")
 
 
 def _run_all():
