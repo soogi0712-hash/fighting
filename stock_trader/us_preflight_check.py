@@ -65,7 +65,8 @@ def hashkey(body):
 # ════════════════════════════════════════════════════════════
 banner(1, "KIS OAuth2 토큰 발급")
 print(f"  url    : {BASE_URL}/oauth2/tokenP")
-print(f"  appkey : {APP_KEY[:8]}...")
+print(f"  appkey : {'configured' if APP_KEY else 'MISSING'}")
+print(f"  secret : {'configured' if APP_SECRET else 'MISSING'}")
 
 t0 = time.time()
 r = requests.post(f"{BASE_URL}/oauth2/tokenP",
@@ -80,7 +81,7 @@ if 'access_token' not in d:
 TOKEN      = d['access_token']
 expires_in = int(d.get('expires_in', 0))
 print(f"  HTTP   : {r.status_code}  ({elapsed*1000:.0f}ms)")
-print(f"  ✅  token : {TOKEN[:20]}...{TOKEN[-6:]}")
+print(f"  ✅  token : {'obtained' if TOKEN else 'none'}")   # 토큰 문자열 미출력
 print(f"       만료 : {expires_in//3600}시간 후")
 
 def H(tr_id):
