@@ -778,15 +778,22 @@ class PyramidStrategyManager:
         else:
             pos.remove_qty(qty, level)
 
-        # ★ 실질 순손익(양수만) 복리 적립
+        # ★ 실질 순손익을 복리풀에 양방향 반영 (역마틴게일 제거)
+        #   - 이익: 그대로 적립
+        #   - 손실: 풀에서 차감(0 하한). 손실이 풀보다 크면 풀은 0에서 멈추고,
+        #           초과분은 풀이 아니라 실제 현금(계좌 잔고)에서 이미 반영됨.
         if net_profit > 0:
             self.compound_pool += net_profit
             logger.info(
                 f"💰 복리풀 적립 +{net_profit:,.0f}원 → 누적={self.compound_pool:,.0f}원"
             )
         elif net_profit < 0:
+            before_pool = self.compound_pool
+            self.compound_pool = max(0.0, self.compound_pool + net_profit)
+            drawn = before_pool - self.compound_pool  # 실제로 풀에서 빠진 금액(≥0)
             logger.info(
-                f"📉 실질손실 {net_profit:,.0f}원 (수수료·세금 {sp.total_cost:.0f}원 포함)"
+                f"📉 복리풀 차감 -{drawn:,.0f}원 (실질손실 {net_profit:,.0f}원, "
+                f"수수료·세금 {sp.total_cost:.0f}원 포함) → 누적={self.compound_pool:,.0f}원"
             )
 
         # ★ 쿨다운 기록 + 연속 손실 카운터 갱신
