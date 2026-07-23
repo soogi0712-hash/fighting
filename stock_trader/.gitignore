@@ -4,8 +4,16 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+# ── 운영 DB (버전관리 대상 아님 — checkout 이 운영 데이터를 덮어쓰지 않도록) ──
 data/screener.db
+data/screener.db-shm
+data/screener.db-wal
 data/lab.db
+data/lab.db-shm
+data/lab.db-wal
+data/ledger.db
+data/ledger.db-shm
+data/ledger.db-wal
 nohup.out
 *.pid
 .idea/
