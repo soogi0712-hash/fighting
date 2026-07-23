@@ -14,6 +14,7 @@ import requests
 import pytz
 from datetime import datetime, timedelta
 from utils.logger import get_logger
+from utils.order_gate import orders_allowed
 from config import Config
 
 KST = pytz.timezone("Asia/Seoul")
@@ -33,6 +34,32 @@ def _mask_acct(acct) -> str:
     if len(s) <= 4:
         return "****"
     return s[:2] + "*" * (len(s) - 4) + s[-2:]
+
+
+def _parse_order_history(data: dict) -> list:
+    """
+    inquire-daily-ccld(TTTC8001R) output1 → 표준 dict 목록. (순수 함수: 오프라인 테스트용)
+    확인된 필드(기존 코드 사용): pdno/prdt_name/sll_buy_dvsn_cd/tot_ccld_qty/avg_prvs/
+                                 tot_ccld_amt/ord_stts_name/ord_dt/ord_tmd
+    order_no(odno): get_open_orders(TTTC8036R)에서 확인된 KIS 주문번호 필드명 규약.
+                    (inquire-daily-ccld 실응답은 PHASE 5에서 재확인 필요 — 로직은 이에 의존하지 않음)
+    반환 각 항목: qty=tot_ccld_qty(누적 체결수량), amount=tot_ccld_amt(누적 체결금액)
+    """
+    orders = []
+    for item in (data.get("output1", []) or []):
+        orders.append({
+            "date":     item.get("ord_dt", ""),
+            "time":     item.get("ord_tmd", ""),
+            "order_no": item.get("odno", ""),
+            "code":     item.get("pdno", ""),
+            "name":     item.get("prdt_name", ""),
+            "type":     "매수" if item.get("sll_buy_dvsn_cd") == "02" else "매도",
+            "qty":      int(item.get("tot_ccld_qty", 0)),   # 누적 체결수량
+            "price":    int(item.get("avg_prvs", 0)),        # 평균 체결가
+            "amount":   int(item.get("tot_ccld_amt", 0)),    # 누적 체결금액
+            "status":   item.get("ord_stts_name", ""),
+        })
+    return orders
 
 
 class KISApi:
@@ -543,10 +570,11 @@ class KISApi:
         ★ adaptive backoff: 500/EGW00201 발생 시 자동 간격 조정
         ★ 500 재시도: 3초 대기 → 10초 대기 → 종목 스킵 (즉시재시도 없음)
         """
-        # ── ★ 실주문 마스터 게이트 — LIVE_ORDER_ENABLED=false 면 네트워크 호출 없이 차단 ──
-        if not Config.LIVE_ORDER_ENABLED:
-            logger.warning(f"[LIVE_ORDER_ENABLED=false] KR {order_type} 주문 차단(네트워크 미호출): {stock_code}")
-            return {"rt_cd": "9", "msg1": "LIVE_ORDER_ENABLED=false — 주문 차단", "_blocked": True}
+        # ── ★ 신규주문 게이트(마스터+런타임 킬) — 차단 시 네트워크 미호출 ──
+        _ok, _why = orders_allowed()
+        if not _ok:
+            logger.warning(f"[주문차단] KR {order_type} {stock_code}: {_why} (네트워크 미호출)")
+            return {"rt_cd": "9", "msg1": f"주문차단: {_why}", "_blocked": True}
 
         # ── 중복 주문 쿨다운 체크 ────────────────────────────────
         last_order_ts = self._order_cooldown.get(stock_code, 0)
@@ -896,11 +924,8 @@ class KISApi:
         ord_dvsn  : 주문구분 (원래 주문과 동일하게)
         반환: KIS API 응답 dict (rt_cd=="0" 이면 취소 성공)
         """
-        # ── ★ 실주문 마스터 게이트 — LIVE_ORDER_ENABLED=false 면 네트워크 호출 없이 차단 ──
-        if not Config.LIVE_ORDER_ENABLED:
-            logger.warning(f"[LIVE_ORDER_ENABLED=false] 주문취소 차단(네트워크 미호출): {stock_code}")
-            return {"rt_cd": "9", "msg1": "LIVE_ORDER_ENABLED=false — 취소 차단", "_blocked": True}
-
+        # ── ★ 취소는 게이트하지 않는다 — 긴급정지 시 기존 미체결 취소가 반드시 실행돼야 함
+        #    (신규 주문 차단과 기존 미체결 취소를 분리)
         url   = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-rvsecncl"
         tr_id = "TTTC0803U"
         acc_no, acc_prod = self.account_no.split("-") \
@@ -1492,10 +1517,11 @@ class KISApi:
           설정하고 OVRS_ORD_UNPR을 "0"으로 두면 자동환전으로 처리됨.
           단, KIS에서 원화결제 계좌 설정 필요.
         """
-        # ── ★ 실주문 마스터 게이트 — LIVE_ORDER_ENABLED=false 면 네트워크 호출 없이 차단 ──
-        if not Config.LIVE_ORDER_ENABLED:
-            logger.warning(f"[LIVE_ORDER_ENABLED=false] US BUY 주문 차단(네트워크 미호출): {symbol}")
-            return {"rt_cd": "9", "msg1": "LIVE_ORDER_ENABLED=false — 주문 차단", "_blocked": True}
+        # ── ★ 신규주문 게이트(마스터+런타임 킬) — 차단 시 네트워크 미호출 ──
+        _ok, _why = orders_allowed()
+        if not _ok:
+            logger.warning(f"[주문차단] US BUY {symbol}: {_why} (네트워크 미호출)")
+            return {"rt_cd": "9", "msg1": f"주문차단: {_why}", "_blocked": True}
 
         url   = f"{self.base_url}/uapi/overseas-stock/v1/trading/order"
         tr_id = "TTTT1002U"   # 실전 해외주식 매수
@@ -1725,10 +1751,11 @@ class KISApi:
           "00" + price>0 : 지정가 매도 (미국 기본, 현재가 지정)
         ★ KIS 해외주식은 시장가(price=0) 미지원 → 반드시 현재가 지정가로 주문
         """
-        # ── ★ 실주문 마스터 게이트 — LIVE_ORDER_ENABLED=false 면 네트워크 호출 없이 차단 ──
-        if not Config.LIVE_ORDER_ENABLED:
-            logger.warning(f"[LIVE_ORDER_ENABLED=false] US SELL 주문 차단(네트워크 미호출): {symbol}")
-            return {"rt_cd": "9", "msg1": "LIVE_ORDER_ENABLED=false — 주문 차단", "_blocked": True}
+        # ── ★ 신규주문 게이트(마스터+런타임 킬) — 차단 시 네트워크 미호출 ──
+        _ok, _why = orders_allowed()
+        if not _ok:
+            logger.warning(f"[주문차단] US SELL {symbol}: {_why} (네트워크 미호출)")
+            return {"rt_cd": "9", "msg1": f"주문차단: {_why}", "_blocked": True}
 
         url   = f"{self.base_url}/uapi/overseas-stock/v1/trading/order"
         tr_id = "TTTT1006U"   # 실전 해외주식 매도
@@ -1976,20 +2003,7 @@ class KISApi:
                                 params=params, timeout=10)
             resp.raise_for_status()
             data = resp.json()
-            orders = []
-            for item in data.get("output1", []):
-                orders.append({
-                    "date":    item.get("ord_dt", ""),
-                    "time":    item.get("ord_tmd", ""),
-                    "code":    item.get("pdno", ""),
-                    "name":    item.get("prdt_name", ""),
-                    "type":    "매수" if item.get("sll_buy_dvsn_cd") == "02" else "매도",
-                    "qty":     int(item.get("tot_ccld_qty", 0)),
-                    "price":   int(item.get("avg_prvs", 0)),
-                    "amount":  int(item.get("tot_ccld_amt", 0)),
-                    "status":  item.get("ord_stts_name", ""),
-                })
-            return orders
+            return _parse_order_history(data)
         except Exception as e:
             logger.error(f"체결 내역 조회 실패: {e}")
             return []
