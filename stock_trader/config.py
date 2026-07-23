@@ -16,6 +16,11 @@ class Config:
     KIS_IS_REAL = True
     BASE_URL    = "https://openapi.koreainvestment.com:9443"
 
+    # ── 실주문 마스터 게이트 (기본 OFF) ───────────────────────
+    # False 이면 KIS 주문/취소 API 가 네트워크 호출 없이 차단된다.
+    # 실환경 검증(PHASE 5) 시에만 .env 에 LIVE_ORDER_ENABLED=true 로 명시 활성화.
+    LIVE_ORDER_ENABLED = os.getenv("LIVE_ORDER_ENABLED", "false").lower() == "true"
+
     # ── 텔레그램 ─────────────────────────────────────────────
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")

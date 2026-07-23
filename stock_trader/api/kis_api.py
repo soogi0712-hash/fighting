@@ -535,6 +535,11 @@ class KISApi:
         ★ adaptive backoff: 500/EGW00201 발생 시 자동 간격 조정
         ★ 500 재시도: 3초 대기 → 10초 대기 → 종목 스킵 (즉시재시도 없음)
         """
+        # ── ★ 실주문 마스터 게이트 — LIVE_ORDER_ENABLED=false 면 네트워크 호출 없이 차단 ──
+        if not Config.LIVE_ORDER_ENABLED:
+            logger.warning(f"[LIVE_ORDER_ENABLED=false] KR {order_type} 주문 차단(네트워크 미호출): {stock_code}")
+            return {"rt_cd": "9", "msg1": "LIVE_ORDER_ENABLED=false — 주문 차단", "_blocked": True}
+
         # ── 중복 주문 쿨다운 체크 ────────────────────────────────
         last_order_ts = self._order_cooldown.get(stock_code, 0)
         elapsed_since_order = time.time() - last_order_ts
@@ -883,6 +888,11 @@ class KISApi:
         ord_dvsn  : 주문구분 (원래 주문과 동일하게)
         반환: KIS API 응답 dict (rt_cd=="0" 이면 취소 성공)
         """
+        # ── ★ 실주문 마스터 게이트 — LIVE_ORDER_ENABLED=false 면 네트워크 호출 없이 차단 ──
+        if not Config.LIVE_ORDER_ENABLED:
+            logger.warning(f"[LIVE_ORDER_ENABLED=false] 주문취소 차단(네트워크 미호출): {stock_code}")
+            return {"rt_cd": "9", "msg1": "LIVE_ORDER_ENABLED=false — 취소 차단", "_blocked": True}
+
         url   = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-rvsecncl"
         tr_id = "TTTC0803U"
         acc_no, acc_prod = self.account_no.split("-") \
@@ -1474,6 +1484,11 @@ class KISApi:
           설정하고 OVRS_ORD_UNPR을 "0"으로 두면 자동환전으로 처리됨.
           단, KIS에서 원화결제 계좌 설정 필요.
         """
+        # ── ★ 실주문 마스터 게이트 — LIVE_ORDER_ENABLED=false 면 네트워크 호출 없이 차단 ──
+        if not Config.LIVE_ORDER_ENABLED:
+            logger.warning(f"[LIVE_ORDER_ENABLED=false] US BUY 주문 차단(네트워크 미호출): {symbol}")
+            return {"rt_cd": "9", "msg1": "LIVE_ORDER_ENABLED=false — 주문 차단", "_blocked": True}
+
         url   = f"{self.base_url}/uapi/overseas-stock/v1/trading/order"
         tr_id = "TTTT1002U"   # 실전 해외주식 매수
         acc_no, acc_prod = self.account_no.split("-") \
@@ -1702,6 +1717,11 @@ class KISApi:
           "00" + price>0 : 지정가 매도 (미국 기본, 현재가 지정)
         ★ KIS 해외주식은 시장가(price=0) 미지원 → 반드시 현재가 지정가로 주문
         """
+        # ── ★ 실주문 마스터 게이트 — LIVE_ORDER_ENABLED=false 면 네트워크 호출 없이 차단 ──
+        if not Config.LIVE_ORDER_ENABLED:
+            logger.warning(f"[LIVE_ORDER_ENABLED=false] US SELL 주문 차단(네트워크 미호출): {symbol}")
+            return {"rt_cd": "9", "msg1": "LIVE_ORDER_ENABLED=false — 주문 차단", "_blocked": True}
+
         url   = f"{self.base_url}/uapi/overseas-stock/v1/trading/order"
         tr_id = "TTTT1006U"   # 실전 해외주식 매도
         acc_no, acc_prod = self.account_no.split("-") \
