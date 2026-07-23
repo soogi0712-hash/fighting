@@ -1,0 +1,17 @@
+{
+  "rt_cd": "0",
+  "output1": [
+    {
+      "ord_dt": "20260723",
+      "ord_tmd": "093105",
+      "odno": "0000123456",
+      "pdno": "005930",
+      "prdt_name": "삼성전자",
+      "sll_buy_dvsn_cd": "02",
+      "tot_ccld_qty": "100",
+      "avg_prvs": "70600",
+      "tot_ccld_amt": "7060000",
+      "ord_stts_name": "체결"
+    }
+  ]
+}

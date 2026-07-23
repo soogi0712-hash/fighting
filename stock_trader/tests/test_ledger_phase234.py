@@ -128,9 +128,10 @@ def test_consistency_check_counts():
     tmplog = tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False)
     json.dump([{"action": "BUY"}, {"action": "SELL"}], tmplog); tmplog.close()
     res = check_consistency(rec, tmplog.name)
-    assert res["ledger_closed"] == 1 and res["log_sell"] == 1 and res["match"] is True
+    # 접수(trade_log) vs 체결(ledger) 기준 차이 → 건수로 mismatch 판정하지 않음(match=None)
+    assert res["ledger_closed"] == 1 and res["log_sell_accepted"] == 1 and res["match"] is None
     os.unlink(tmplog.name)
-    print("✓ 정합성: ledger CLOSED=1 == trade_log SELL=1")
+    print("✓ 정합성: 정보성 카운트만(ledger CLOSED=1, log SELL접수=1, match=None)")
 
 
 def test_replay_from_fixture():
@@ -170,16 +171,16 @@ def test_live_order_gate_blocks_without_network():
         api = kmod.KISApi()
         # 키 사용 방지 위해 즉시 더미로 덮어씀(값 유출/사용 방지)
         api.app_key = api.app_secret = api.account_no = "DUMMY"
+        # 신규 주문만 차단(취소는 게이트 미적용 — test_safety_phase5 에서 검증)
         r1 = api.buy("005930", 1, 70000)
         r2 = api.sell("005930", 1, 70000)
         r3 = api.buy_us("AAPL", 1, 200.0)
         r4 = api.sell_us("AAPL", 1, 200.0)
-        r5 = api.cancel_order("0", "005930", 1, 70000)
-        for r in (r1, r2, r3, r4, r5):
+        for r in (r1, r2, r3, r4):
             assert r.get("rt_cd") == "9" and r.get("_blocked") is True
     finally:
         kmod.requests = orig
-    print("✓ LIVE_ORDER_ENABLED=false: KR/US 매수·매도·취소 전부 차단(네트워크 미호출)")
+    print("✓ LIVE_ORDER_ENABLED=false: KR/US 신규 매수·매도 차단(네트워크 미호출)")
 
 
 def _run_all():

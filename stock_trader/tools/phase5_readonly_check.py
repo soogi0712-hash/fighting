@@ -27,11 +27,6 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def mask_secret(s, keep=4) -> str:
-    s = str(s or "")
-    return (s[:keep] + "…(masked)") if s else "(empty)"
-
-
 def mask_acct(s) -> str:
     s = str(s or "")
     if len(s) <= 4:
@@ -53,7 +48,8 @@ def run_checks(api, session_mod, cfg, sample_kr="005930", sample_us="AAPL"):
     # 1) 인증 (토큰 발급)
     def _auth():
         tok = api._get_token()
-        return (bool(tok), f"token={mask_secret(tok, 6)}")
+        # 토큰 문자열은 로그에 출력하지 않는다 — 획득 여부만 표시.
+        return (bool(tok), f"token={'obtained' if tok else 'none'}")
     check("1.신규 API 인증", _auth)
 
     # 2) 계좌번호 인식 (마스킹 출력)

@@ -10,7 +10,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tools.phase5_readonly_check import run_checks, mask_acct, mask_secret
+from tools.phase5_readonly_check import run_checks, mask_acct
 
 
 class MockApi:
@@ -76,7 +76,6 @@ def test_credentials_masked_in_output():
 def test_mask_helpers():
     assert mask_acct("73180640-01") == "73*******01"   # 앞2·뒤2만 노출(중간 마스킹)
     assert mask_acct("12") == "****"
-    assert "…(masked)" in mask_secret("verylongsecretkey")
     print("✓ 마스킹 헬퍼 동작")
 
 
