@@ -1076,7 +1076,12 @@ class StrategyManager:
         if _LEDGER_OK:
             try:
                 if self._ledger is None:
-                    self._ledger = LedgerRecorder()
+                    try:
+                        from profile_config import resolve_profile
+                        _lp = resolve_profile().ledger_path()   # 프로필별 ledger 분리
+                    except Exception:
+                        _lp = None
+                    self._ledger = LedgerRecorder(db_path=_lp)
                 record_trade_event(self._ledger, LEDGER_HEALTH, entry, "KR", self._fill_source)
             except Exception as _le:
                 LEDGER_HEALTH.record_fail("KR", entry.get("code"),

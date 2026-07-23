@@ -69,13 +69,40 @@ def clear_kill():
 def orders_allowed():
     """
     신규 주문 허용 여부 판정. 반환 (allowed: bool, reason: str).
-    = 마스터(LIVE_ORDER_ENABLED) AND (런타임 킬 비활성).
+    = 활성 프로필 LIVE AND 마스터(LIVE_ORDER_ENABLED) AND (런타임 킬 비활성).
     주문 함수가 네트워크 호출 직전에 호출한다.
+    ★ legacy/READ_ONLY 프로필은 구조적으로 항상 차단.
     """
+    # ── 프로필 READ_ONLY 차단 (legacy·READ_ONLY 는 mode·env 무관 차단) ──
+    try:
+        from profile_config import resolve_profile
+        prof = resolve_profile()
+        if prof.is_read_only:
+            return False, f"profile '{prof.profile_name}' READ_ONLY"
+    except Exception as e:
+        # 프로필 해석 실패 시 안전측(차단)
+        return False, f"profile resolve failed: {e!r}"
+
     if not getattr(Config, "LIVE_ORDER_ENABLED", False):
         return False, "LIVE_ORDER_ENABLED=false"
     if kill_active():
         return False, f"runtime_kill_switch active({_state['kill_reason']})"
+    return True, "ok"
+
+
+def cancels_allowed():
+    """
+    취소/정정 허용 여부. 반환 (allowed, reason).
+    - READ_ONLY/legacy 프로필: 취소·정정도 불가(과거자료 조회 전용).
+    - LIVE 프로필: 허용(킬스위치 중 긴급취소가 실행돼야 하므로 kill/LIVE_ORDER_ENABLED 로 막지 않음).
+    """
+    try:
+        from profile_config import resolve_profile
+        prof = resolve_profile()
+        if prof.is_read_only:
+            return False, f"profile '{prof.profile_name}' READ_ONLY — 취소/정정 불가"
+    except Exception as e:
+        return False, f"profile resolve failed: {e!r}"
     return True, "ok"
 
 
@@ -90,8 +117,21 @@ def set_pending_count(n):
 
 
 def snapshot() -> dict:
-    """상태 API 노출용 (인증정보/계좌번호 미포함)."""
+    """상태 API 노출용 (인증정보/계좌번호 미포함, 마스킹만)."""
+    prof_summary = None
+    allowed = False
+    try:
+        from profile_config import resolve_profile
+        prof_summary = resolve_profile().safe_summary()   # 민감정보 없음
+    except Exception as e:
+        prof_summary = {"error": repr(e)}
+    try:
+        allowed = orders_allowed()[0]
+    except Exception:
+        allowed = False
     return {
+        "active_profile": prof_summary,
+        "orders_allowed": allowed,
         "live_order_enabled": bool(getattr(Config, "LIVE_ORDER_ENABLED", False)),
         "runtime_kill_switch": kill_active(),
         "kill_reason": _state["kill_reason"],

@@ -16,6 +16,10 @@ from datetime import datetime, timedelta
 from utils.logger import get_logger
 from utils.order_gate import orders_allowed
 from config import Config
+from profile_config import resolve_profile
+
+# ── 프로필별 토큰 저장소 (원문 키 저장 안 함; token_cache_key 로만 분리) ──
+_TOKEN_STORE: dict = {}   # token_cache_key -> {"token": str, "expires": datetime}
 
 KST = pytz.timezone("Asia/Seoul")
 
@@ -63,14 +67,18 @@ def _parse_order_history(data: dict) -> list:
 
 
 class KISApi:
-    def __init__(self):
-        self.app_key    = Config.KIS_APP_KEY
-        self.app_secret = Config.KIS_APP_SECRET
-        self.account_no = Config.KIS_ACCOUNT_NO
+    def __init__(self, profile=None):
+        # ── 프로필 SSOT 에서 키/계좌 로드 (하드코딩 없음) ──
+        self.profile    = profile or resolve_profile()
+        self.app_key    = self.profile.app_key
+        self.app_secret = self.profile.app_secret
+        acct = self.profile.account_no
+        if "-" not in acct and self.profile.product_code:
+            acct = f"{acct}-{self.profile.product_code}"   # 기존 split 로직 호환
+        self.account_no = acct
         self.base_url   = Config.BASE_URL
+        self._token_key = self.profile.token_cache_key()   # 프로필별 토큰 분리 키
 
-        self._access_token    = None
-        self._token_expired   = None
         self._approval_key    = None   # 웹소켓 실시간용
 
         # ── 잔고 캐시 (최대 5분) ─────────────────────────────────
@@ -107,10 +115,11 @@ class KISApi:
     # 1. OAuth2 토큰 관리
     # ──────────────────────────────────────────────────────────
     def _get_token(self) -> str:
-        """액세스 토큰 발급 (만료 전 자동 갱신)"""
+        """액세스 토큰 발급 (만료 전 자동 갱신) — 프로필별 캐시 분리."""
         now = datetime.now()
-        if self._access_token and self._token_expired and now < self._token_expired:
-            return self._access_token
+        cached = _TOKEN_STORE.get(self._token_key)
+        if cached and cached.get("token") and now < cached.get("expires"):
+            return cached["token"]
 
         url  = f"{self.base_url}/oauth2/tokenP"
         body = {
@@ -122,11 +131,15 @@ class KISApi:
         resp.raise_for_status()
         data = resp.json()
 
-        self._access_token  = data["access_token"]
-        expires_in          = int(data.get("expires_in", 86400))
-        self._token_expired = now + timedelta(seconds=expires_in - 60)
-        logger.info("✅ KIS 액세스 토큰 발급 성공")
-        return self._access_token
+        token      = data["access_token"]
+        expires_in = int(data.get("expires_in", 86400))
+        # 원문 키/시크릿은 저장하지 않는다 — 토큰/만료만 프로필 키로 분리 저장
+        _TOKEN_STORE[self._token_key] = {
+            "token":   token,
+            "expires": now + timedelta(seconds=expires_in - 60),
+        }
+        logger.info(f"✅ KIS 액세스 토큰 발급 성공 (profile={self.profile.profile_name})")
+        return token
 
     def _hashkey(self, body: dict) -> str:
         """매수/매도 주문용 HashKey 생성"""
@@ -924,8 +937,14 @@ class KISApi:
         ord_dvsn  : 주문구분 (원래 주문과 동일하게)
         반환: KIS API 응답 dict (rt_cd=="0" 이면 취소 성공)
         """
-        # ── ★ 취소는 게이트하지 않는다 — 긴급정지 시 기존 미체결 취소가 반드시 실행돼야 함
-        #    (신규 주문 차단과 기존 미체결 취소를 분리)
+        # ── ★ 취소 게이트: READ_ONLY/legacy 프로필은 취소·정정도 차단(네트워크 미호출).
+        #    LIVE 프로필은 허용(긴급정지 시 미체결 취소가 실행돼야 하므로 kill 로는 막지 않음).
+        from utils.order_gate import cancels_allowed
+        _ok, _why = cancels_allowed()
+        if not _ok:
+            logger.warning(f"[취소차단] {stock_code}: {_why} (네트워크 미호출)")
+            return {"rt_cd": "9", "msg1": f"취소차단: {_why}", "_blocked": True}
+
         url   = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-rvsecncl"
         tr_id = "TTTC0803U"
         acc_no, acc_prod = self.account_no.split("-") \
