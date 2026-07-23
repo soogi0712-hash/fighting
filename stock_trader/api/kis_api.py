@@ -27,6 +27,14 @@ _KIS_COOLDOWN_SEC    = 1800  # 30분 쿨다운 후 KIS 재시도
 logger = get_logger("KIS_API")
 
 
+def _mask_acct(acct) -> str:
+    """계좌번호 로그 마스킹 — 앞2·뒤2 자리만 노출."""
+    s = str(acct or "")
+    if len(s) <= 4:
+        return "****"
+    return s[:2] + "*" * (len(s) - 4) + s[-2:]
+
+
 class KISApi:
     def __init__(self):
         self.app_key    = Config.KIS_APP_KEY
@@ -201,10 +209,10 @@ class KISApi:
                 f"  ▶ 원인 후보: "
                 f"① 요청빈도초과 ② endpoint 오류 "
                 f"③ 실전/모의 tr_id 불일치(현재 base_url={'실전' if is_real else '모의'}) "
-                f"④ 계좌번호 오류(account_no={acc!r})"
+                f"④ 계좌번호 오류(account_no={_mask_acct(acc)})"
             )
         elif "계좌" in msg1 or "account" in msg1.lower():
-            logger.error(f"  ▶ 원인: 계좌번호/상품코드 오류 — account_no={acc!r}")
+            logger.error(f"  ▶ 원인: 계좌번호/상품코드 오류 — account_no={_mask_acct(acc)}")
         elif "권한" in msg1 or "auth" in msg1.lower():
             logger.error(f"  ▶ 원인: 권한 없음 (모의투자 tr_id를 실전에 사용?) tr_id={tr_id}")
         else:
