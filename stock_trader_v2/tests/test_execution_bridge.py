@@ -77,7 +77,7 @@ def test_tc02_partial_fill_once():
     filled = []
     br.poll(on_buy_fill=lambda p, f: filled.append(f), on_sell_fill=lambda p, f: None)
     assert len(filled) == 1
-    assert filled[0].qty == 5
+    assert filled[0].applied_qty == 5
 
 
 # ─────────────────────────────────────────────────────────────
@@ -106,7 +106,7 @@ def test_tc04_full_fill():
 
     filled = []
     br.poll(on_buy_fill=lambda p, f: filled.append(f), on_sell_fill=lambda p, f: None)
-    assert sum(f.qty for f in filled) == 10
+    assert sum(f.applied_qty for f in filled) == 10
 
 
 # ─────────────────────────────────────────────────────────────
@@ -194,7 +194,7 @@ def test_tc11_sell_partial_position_kept():
     sell_fills = []
     br.poll(on_buy_fill=lambda p, f: None, on_sell_fill=lambda p, f: sell_fills.append(f))
     assert len(sell_fills) == 1
-    assert sell_fills[0].qty == 5   # delta = 5
+    assert sell_fills[0].applied_qty == 5   # delta = 5
 
 
 # ─────────────────────────────────────────────────────────────
@@ -209,7 +209,7 @@ def test_tc12_sell_full_position_removed():
 
     sell_fills = []
     br.poll(on_buy_fill=lambda p, f: None, on_sell_fill=lambda p, f: sell_fills.append(f))
-    assert sum(f.qty for f in sell_fills) == 10
+    assert sum(f.applied_qty for f in sell_fills) == 10
 
 
 # ─────────────────────────────────────────────────────────────
@@ -238,7 +238,7 @@ def test_tc14_pnl_called_on_fill_delta():
 
     pnl_calls = []
     def mock_sell_fill(p, f):
-        pnl_calls.append(f.qty * f.price)
+        pnl_calls.append(f.applied_qty * f.price)
 
     br.poll(on_buy_fill=lambda p, f: None, on_sell_fill=mock_sell_fill)
     assert len(pnl_calls) == 1

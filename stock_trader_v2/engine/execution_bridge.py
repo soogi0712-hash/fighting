@@ -30,6 +30,26 @@ _BACKOFF_BASE   = 2.0            # 지수형 backoff 기저
 _BACKOFF_MAX    = 120.0          # 최대 대기 초
 
 
+def _dispatch(callback, po, ev):
+    """
+    콜백 시그니처가 1-arg(ev) 또는 2-arg(po, ev)인지 자동 판별해 호출.
+    테스트(2-arg) 와 전략(1-arg) 둘 다 지원.
+    """
+    import inspect
+    try:
+        sig = inspect.signature(callback)
+        n = len([
+            p for p in sig.parameters.values()
+            if p.default is inspect.Parameter.empty
+        ])
+    except (ValueError, TypeError):
+        n = 1
+    if n >= 2:
+        callback(po, ev)
+    else:
+        callback(ev)
+
+
 class ExecutionBridge:
     """
     한 시장의 미확정 주문 상태 + 체결 반영 배선.
@@ -94,12 +114,21 @@ class ExecutionBridge:
                         using_compound=0.0, is_full=False) -> bool:
         """
         주문 접수 성공 시 호출. 주문번호가 없으면 False.
+        동일 종목+방향 pending이 이미 존재하면 중복 등록 차단 → False.
         등록만 하고 포지션은 절대 만들지 않는다.
         """
         if not order_no:
             if self.log:
                 self.log.error(
                     f"[ExecBridge:{self.market}] 주문번호 없음 → pending 등록 금지 {code}"
+                )
+            return False
+        # ── 중복 pending 차단 (동일 종목 + 동일 방향) ──────────────
+        if self.registry.has_open(code, side):
+            if self.log:
+                self.log.warning(
+                    f"[ExecBridge:{self.market}] 중복 pending 차단 {side} {code} "
+                    f"order_no={order_no} (기존 open 주문 있음)"
                 )
             return False
         try:
@@ -167,12 +196,18 @@ class ExecutionBridge:
         self._save()
 
     # ── 매 tick 체결 폴링 + 반영 ────────────────────────────
-    def poll(self, on_buy_fill, on_sell_fill,
+    def poll(self, on_buy_fill, on_sell_fill=None,
              on_terminal=None, on_cancel_request=None,
+             on_fill_error=None,
              timeout_sec=15):
         """
         FillSource로 실체결 delta를 조회해 콜백으로 반영.
         빈 registry이면 조회 없이 반환. 반환: PollResult | None.
+
+        콜백 시그니처(2가지 모두 지원):
+          on_buy_fill(ev)         — 1-arg (AppliedFillEvent)
+          on_buy_fill(pending, ev)— 2-arg (PendingOrder | None, AppliedFillEvent)
+        on_fill_error(err_tuple)  — fill_errors 기록 통지 (선택)
 
         오류 정책:
           - 첫 실패: 다음 tick 재시도 (backoff 2초)
@@ -205,18 +240,26 @@ class ExecutionBridge:
         # fill_errors가 있어도 부분 성공으로 처리
         if result.fill_errors:
             self._record_fail()
+            if on_fill_error:
+                for err in result.fill_errors:
+                    try:
+                        on_fill_error(err)
+                    except Exception:
+                        pass
         else:
             self._record_success()
 
-        # 체결 콜백
+        # 체결 콜백 — 1-arg / 2-arg 모두 지원
         for ev in result.fills:
             if ev.applied_qty <= 0:
                 continue
+            # pending 객체 조회 (2-arg 콜백용)
+            po = self.registry.get(ev.order_no) if hasattr(self.registry, "get") else None
             try:
                 if ev.side == "BUY":
-                    on_buy_fill(ev)
-                else:
-                    on_sell_fill(ev)
+                    _dispatch(on_buy_fill, po, ev)
+                elif on_sell_fill is not None:
+                    _dispatch(on_sell_fill, po, ev)
             except Exception as e:
                 if self.log:
                     self.log.error(

@@ -452,6 +452,21 @@ def main():
 
     logger.info("✅ V2 봇 루프 시작 (국내 + 미국장)")
 
+    # ── GAP2 bridge restore (재시작 복구) ───────────────────────
+    # ENABLE_GAP2=true 이면 pending_kr.json / pending_us.json 로드
+    # → 미확인 주문을 PendingRegistry에 복원, 다음 poll에서 체결 재확인
+    _gap2_on = os.environ.get("ENABLE_GAP2", "false").lower() == "true"
+    if _gap2_on:
+        try:
+            _kr_restored = strategy_kr._bridge.restore() if getattr(strategy_kr, "_bridge", None) else 0
+            _us_restored = strategy_us._bridge.restore() if getattr(strategy_us, "_bridge", None) else 0
+            logger.info(
+                f"[GAP2 RESTORE] KR pending 복원={_kr_restored}건 | "
+                f"US pending 복원={_us_restored}건"
+            )
+        except Exception as _gap2_re:
+            logger.warning(f"[GAP2 RESTORE] bridge restore 오류: {_gap2_re}")
+
     loop_count   = 0
     _kr_reported = False   # 오늘 KR 일일 보고서 생성 여부
     _us_reported = False   # 오늘 US 일일 보고서 생성 여부
@@ -944,6 +959,13 @@ def main():
                 except Exception as _hwm_e:
                     logger.debug(f"[HWM_UPDATE] KR 갱신 오류: {_hwm_e}")
 
+                # ── GAP2 KR poll_fills ── 미확정 주문 체결 확인 ──────
+                if _gap2_on:
+                    try:
+                        strategy_kr.poll_fills()
+                    except Exception as _kpf_e:
+                        logger.warning(f"[GAP2_KR] poll_fills 예외 (루프 계속): {_kpf_e}")
+
                 # ── [ENTRY_SUMMARY] 집계용 카운터 ──────────────
                 _es_reentry  = 0   # 재진입 차단
                 _es_exclude  = 0   # 수량0 사전 제외
@@ -957,7 +979,7 @@ def main():
                         result = strategy_kr.run(stock)
                         action = result.get("action", "SKIP")
                         reason = result.get("reason", "")
-                        if action == "BUY":
+                        if action == "BUY" or action == "BUY_ACCEPTED":
                             _es_order += 1
                         elif action == "SKIP":
                             if "재진입 차단" in reason or "⛔" in reason:
@@ -1236,6 +1258,13 @@ def main():
             except Exception as _hwm_e:
                 logger.debug(f"[HWM_UPDATE] US 갱신 오류: {_hwm_e}")
 
+            # ── GAP2 US poll_fills ── 미확정 주문 체결 확인 ─────────
+            if _gap2_on:
+                try:
+                    strategy_us.poll_fills()
+                except Exception as _upf_e:
+                    logger.warning(f"[GAP2_US] poll_fills 예외 (루프 계속): {_upf_e}")
+
             # ── [US_ENTRY_SUMMARY] 집계용 카운터 ───────────────
             _ues_reentry  = 0
             _ues_exclude  = 0
@@ -1254,7 +1283,7 @@ def main():
                     result = strategy_us.run(stock)
                     action = result.get("action", "SKIP")
                     reason = result.get("reason", "")
-                    if action == "BUY":
+                    if action == "BUY" or action == "BUY_ACCEPTED":
                         _ues_order += 1
                     elif action == "SKIP":
                         if "재진입 차단" in reason or "⛔" in reason:

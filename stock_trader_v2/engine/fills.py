@@ -161,7 +161,15 @@ def _first_num(d: dict, keys, default=0):
 
 
 def _us_row_side(d: dict):
-    """행의 매수/매도 구분을 방어적으로 판별. 불명이면 None."""
+    """행의 매수/매도 구분을 방어적으로 판별. 불명이면 None.
+    정규화된 "side" 키(BUY/SELL)와 원본 KIS 코드("sll_buy_dvsn_cd") 모두 지원.
+    """
+    # 정규화된 side 키 우선 (get_executed_orders() 반환값)
+    side_direct = str(d.get("side", "")).strip().upper()
+    if side_direct in ("BUY", "SELL"):
+        return side_direct
+
+    # 원본 KIS 코드 기반
     for k in ("sll_buy_dvsn_cd", "sll_buy_dvsn_cd_name", "trad_dvsn_name"):
         v = str(d.get(k, "")).strip()
         if not v:
@@ -181,10 +189,10 @@ class UsKisFillSource(_SeedMixin, FillSource):
 
     ENABLE_GAP2=false면 빈 목록 반환.
     """
-    QTY_KEYS   = ("ft_ccld_qty", "ccld_qty", "tot_ccld_qty")
+    QTY_KEYS   = ("ft_ccld_qty", "ccld_qty", "tot_ccld_qty", "filled_qty")
     AMT_KEYS   = ("ft_ccld_amt3", "ft_ccld_amt", "tot_ccld_amt", "ccld_amt")
-    PRICE_KEYS = ("ft_ccld_unpr3", "ft_ccld_unpr", "avg_prvs", "ccld_unpr")
-    CODE_KEYS  = ("pdno", "ovrs_pdno", "symb")
+    PRICE_KEYS = ("ft_ccld_unpr3", "ft_ccld_unpr", "avg_prvs", "ccld_unpr", "filled_price")
+    CODE_KEYS  = ("pdno", "ovrs_pdno", "symb", "code")
     ODNO_KEYS  = ("odno", "ODNO", "order_no")
 
     def __init__(self, broker):
