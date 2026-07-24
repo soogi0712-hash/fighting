@@ -58,6 +58,7 @@ try:
     from ledger import LedgerRecorder
     from ledger.wiring import record_trade_event
     from ledger.health import LEDGER_HEALTH
+    from ledger.fills import KisFillSource
     _LEDGER_OK = True
 except Exception:
     _LEDGER_OK = False
@@ -102,9 +103,18 @@ class StrategyManager:
 
         # ★ 실거래 원장 (지연 초기화; 기록 전용)
         self._ledger = None
-        # 체결 확인 소스 — 기본 None(체결 확인 불가 시 접수를 체결로 기록하지 않음).
-        # 실환경(PHASE 5)에서 KisFillSource(api) 를 주입한다.
+        # 체결 확인 소스 — KisFillSource(api) 주입.
+        #   · KisFillSource 는 내부 마스터 게이트로 LIVE_ORDER_ENABLED=false 이면
+        #     실 API(get_order_history) 를 절대 호출하지 않고 빈 목록을 반환한다.
+        #     → 현재(false) 상태에서는 원장에 아무 것도 기록되지 않음(무해).
+        #   · 실환경(PHASE 5, LIVE=true)에서만 실제 체결을 조회해 기록.
+        #   · 테스트는 set_fill_source(MockFillSource(...)) 로 대체 주입.
         self._fill_source = None
+        if _LEDGER_OK:
+            try:
+                self._fill_source = KisFillSource(self.api)
+            except Exception:
+                self._fill_source = None
 
     # ── 하위 호환: daily_loss_krw 프로퍼티 ──────────────────
     @property
@@ -589,6 +599,7 @@ class StrategyManager:
                                 decision["reason"] + " [잔고확인 자동등록]",
                                 sess["session"],
                                 extra={
+                                    "order_no":       self._extract_order_no(result),
                                     "level":          level,
                                     "buy_score":      buy_score,
                                     "sell_score":     sell_score,
@@ -657,6 +668,7 @@ class StrategyManager:
                     "BUY", code, name, price, qty,
                     decision["reason"], sess["session"],
                     extra={
+                        "order_no":       self._extract_order_no(result),
                         "level":          level,
                         "buy_score":      buy_score,
                         "sell_score":     sell_score,
@@ -770,6 +782,7 @@ class StrategyManager:
                     "SELL", code, name, price, qty,
                     reason, sess["session"],
                     extra={
+                        "order_no":       self._extract_order_no(result),
                         "level":          level,
                         "profit":         profit,
                         "net_pct":        net_pct_actual,
@@ -1015,6 +1028,7 @@ class StrategyManager:
                         f"손절재배분→{tgt['reason']}",
                         sess["session"],
                         extra={
+                            "order_no":       self._extract_order_no(res),
                             "recycled_cash":  recycled_cash,
                             "alloc_amount":   alloc,
                             "trend_score":    tgt["trend_score"],
@@ -1050,6 +1064,32 @@ class StrategyManager:
         return realloc_results
 
     # ── 거래 로그 ──────────────────────────────────────────
+    def set_fill_source(self, fill_source):
+        """체결 확인 소스 주입(테스트/실환경 교체용). None 이면 접수를 체결로 기록하지 않음."""
+        self._fill_source = fill_source
+
+    @staticmethod
+    def _extract_order_no(result):
+        """
+        KIS 주문 응답에서 주문번호(odno)를 방어적으로 추출.
+        국내 order-cash 성공 응답은 output.ODNO 에 주문번호를 담는다.
+        필드명/위치가 환경에 따라 다를 수 있어 후보 키를 순서대로 확인한다.
+        찾지 못하면 None(=order_hint 없음, 매칭은 code+side 로 폴백).
+        """
+        if not isinstance(result, dict):
+            return None
+        out = result.get("output")
+        if isinstance(out, dict):
+            for k in ("ODNO", "odno", "KRX_FWDG_ORD_ODNO"):
+                v = out.get(k)
+                if v not in (None, "", "0"):
+                    return str(v).strip()
+        for k in ("ODNO", "odno", "order_no"):
+            v = result.get(k)
+            if v not in (None, "", "0"):
+                return str(v).strip()
+        return None
+
     def _log_trade(self, action, code, name, price, qty,
                    reason, session, extra=None):
         entry = {
