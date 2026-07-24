@@ -104,6 +104,14 @@ TIME_EXIT_40_PCT         = 1.0     # 40분 내 +1.0% 미달이면 청산
 COOLDOWN_MIN             = 15       # 매도 후 재진입 쿨다운 (분)
 MAX_DAILY_LOSSES         = 2        # 당일 연속 손실 허용 횟수 (이 이상이면 당일 금지)
 
+# ── 종목당 최대 투자비중(하드 캡) ─────────────────────────────
+# 단일 종목 집중 위험(갭하락·거래정지 시 손절 미작동) 경계용 상한.
+# max_per_stock 을 계좌자본(max_total)의 이 비율로 제한한다.
+#   예) max_total=500만 → 종목당 최대 100만(20%)까지만 투자.
+# 기존 30/70/100 진입구조·BUY_SCORE·손절/익절은 그대로 두고,
+# 종목 총투자금이 이 캡을 넘는 부분만 수량 산정 단계에서 잘린다.
+MAX_STOCK_WEIGHT_PCT     = 20.0    # 계좌 대비 종목당 최대 비중(%)
+
 # ── SELL SCORE 수익 반납 방지 ─────────────────────────────────
 SELL_SCORE_PROTECTION_PCT = 1.0    # 이 이상 수익 시 SELL SCORE 즉시 매도 적용
 
@@ -123,8 +131,19 @@ class PyramidStrategyManager:
 
     def __init__(self, kis_api, max_per_stock: float, max_total: float):
         self.api           = kis_api
-        self.max_per_stock = max_per_stock   # 종목당 최대 투자금
         self.max_total     = max_total       # 전체 최대 투자금
+
+        # ★ 종목당 최대 투자금 = 계좌자본(max_total)의 MAX_STOCK_WEIGHT_PCT% 로 하드 캡.
+        #   기존엔 max_per_stock == max_total 로 설정되어 단일 종목에 사실상
+        #   전체 자본(≈100%)까지 노출 가능했음(집중 위험). 여기서 20% 로 제한한다.
+        #   호출측에서 더 낮은 한도를 주면 그 값을 존중(min).
+        stock_cap          = max_total * (MAX_STOCK_WEIGHT_PCT / 100.0)
+        self.max_per_stock = min(max_per_stock, stock_cap)   # 종목당 최대 투자금(≤20%)
+        if self.max_per_stock < max_per_stock:
+            logger.info(
+                f"🧱 종목당 한도 {max_per_stock:,.0f}원 → "
+                f"{self.max_per_stock:,.0f}원(계좌 {MAX_STOCK_WEIGHT_PCT:.0f}% 캡) 적용"
+            )
         self.positions     = {}              # {code: PyramidPosition}
         self.compound_pool = 0.0             # 복리 적립금
 
