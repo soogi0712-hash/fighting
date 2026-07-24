@@ -25,9 +25,10 @@ import threading
 BASE = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, BASE)
 
+import dataclasses
 import pytest
 from strategies.pending_orders import (
-    PendingOrder, PendingRegistry,
+    PendingOrder, PendingRegistry, FillApplyResult,
     ACCEPTED, UNFILLED, PARTIAL, FILLED, REJECTED, CANCELED, TIMEOUT,
     TERMINAL_STATUSES,
 )
@@ -219,10 +220,12 @@ def test_invalid_inputs():
     # 음수 델타
     with pytest.raises(ValueError):
         reg.apply_delta("S", -1)
-    # terminal 에 체결 적용 금지
+    # terminal 에 체결 적용 → 예외 아님, no-op Result(applied_delta=0)
     reg.apply_delta("S", 10)           # FILLED
-    with pytest.raises(ValueError):
-        reg.apply_delta("S", 1)
+    r = reg.apply_delta("S", 1)        # terminal → 추가 반영 금지
+    assert r.applied_delta == 0
+    assert r.became_filled is False
+    assert r.is_terminal is True
     # mark_terminal 에 비-terminal status
     _register_buy(reg, order_no="S2", qty=10)
     with pytest.raises(ValueError):
@@ -275,6 +278,149 @@ def test_basic_concurrency():
     assert reg.get("SAME").req_qty == 100
     assert sum(1 for k in [f"ORD-{i}" for i in range(N)] + ["SAME"]
                if reg.get(k)) == N + 1
+
+
+# ══════════════════════════════════════════════════════════════
+# 단계 2-A: apply_delta() → FillApplyResult
+# ══════════════════════════════════════════════════════════════
+
+# ── 2A-1. 정상 delta 반환 ──────────────────────────────────────
+def test_result_normal_delta():
+    reg = _reg()
+    _register_buy(reg, order_no="N", code="005930", qty=100)
+    r = reg.apply_delta("N", 30)
+    assert isinstance(r, FillApplyResult)
+    assert r.order_no == "N"
+    assert r.code == "005930"
+    assert r.side == "BUY"
+    assert r.applied_delta == 30
+    assert r.requested_delta == 30
+    assert r.clamped is False
+    assert r.applied_qty == 30
+    assert r.remaining_qty == 70
+    assert r.status == PARTIAL
+    assert r.is_terminal is False
+    assert r.became_filled is False
+
+
+# ── 2A-2. clamp 시 실제 applied_delta 반환 ─────────────────────
+def test_result_clamped_actual_delta():
+    reg = _reg()
+    _register_buy(reg, order_no="C", qty=100)
+    reg.apply_delta("C", 80)
+    r = reg.apply_delta("C", 50)          # 80+50=130 → 20 만 반영
+    assert r.applied_delta == 20          # ★ 실제 흡수분
+    assert r.requested_delta == 50
+    assert r.clamped is True
+    assert r.applied_qty == 100
+    assert r.remaining_qty == 0
+    assert r.became_filled is True        # 이번 호출로 전량 완료
+    assert r.status == FILLED
+    assert r.is_terminal is True
+
+
+# ── 2A-3. 전량 전환 시 became_filled=True ──────────────────────
+def test_result_became_filled_on_full():
+    reg = _reg()
+    _register_buy(reg, order_no="F", qty=100)
+    r1 = reg.apply_delta("F", 60)
+    assert r1.became_filled is False
+    r2 = reg.apply_delta("F", 40)         # 전량
+    assert r2.became_filled is True
+    assert r2.applied_delta == 40
+    assert r2.status == FILLED
+    # 한 번에 전량인 경우도 True
+    _register_buy(reg, order_no="F2", qty=50)
+    r3 = reg.apply_delta("F2", 50)
+    assert r3.became_filled is True
+
+
+# ── 2A-4. 이미 FILLED 후 재호출은 applied_delta=0 ──────────────
+def test_result_refill_after_filled_is_noop():
+    reg = _reg()
+    _register_buy(reg, order_no="RF", qty=100)
+    reg.apply_delta("RF", 100)            # FILLED
+    r = reg.apply_delta("RF", 10)         # 재호출
+    assert r.applied_delta == 0
+    assert r.became_filled is False       # 이미 FILLED → False
+    assert r.is_terminal is True
+    assert r.status == FILLED
+    assert r.applied_qty == 100           # 불변
+    assert r.remaining_qty == 0
+
+
+# ── 2A-5. CANCELED/TIMEOUT/REJECTED 에서 반영 금지 ─────────────
+def test_result_no_apply_in_terminal_states():
+    for st in (CANCELED, TIMEOUT, REJECTED):
+        reg = _reg()
+        _register_buy(reg, order_no="X", qty=100)
+        reg.apply_delta("X", 30)          # PARTIAL(30)
+        reg.mark_terminal("X", st)
+        r = reg.apply_delta("X", 50)      # terminal → 반영 금지
+        assert r.applied_delta == 0
+        assert r.became_filled is False
+        assert r.is_terminal is True
+        assert r.status == st
+        assert r.applied_qty == 30        # 불변(이전 부분체결 유지)
+        assert r.clamped is True          # 요청분 전혀 반영 안 됨
+
+
+# ── 2A-6. delta=0 no-op ────────────────────────────────────────
+def test_result_zero_delta_noop():
+    reg = _reg()
+    _register_buy(reg, order_no="Z", qty=100)
+    r = reg.apply_delta("Z", 0)
+    assert r.applied_delta == 0
+    assert r.requested_delta == 0
+    assert r.clamped is False
+    assert r.applied_qty == 0
+    assert r.status == ACCEPTED           # 상태 무변화
+    assert r.became_filled is False
+    # 부분체결 후 delta=0 도 무변화
+    reg.apply_delta("Z", 40)
+    r2 = reg.apply_delta("Z", 0)
+    assert r2.applied_delta == 0
+    assert r2.applied_qty == 40
+    assert r2.status == PARTIAL
+
+
+# ── 2A-7. 반환 Result 불변성 ──────────────────────────────────
+def test_result_is_immutable():
+    reg = _reg()
+    _register_buy(reg, order_no="IM", qty=100)
+    r = reg.apply_delta("IM", 10)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        r.applied_delta = 999
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        r.status = FILLED
+
+
+# ── 2A-8. 동시 apply_delta 합계가 req_qty 초과 안 함 ──────────
+def test_concurrent_apply_delta_same_order_no_overflow():
+    reg = _reg()
+    _register_buy(reg, order_no="CC", qty=1_000)
+    total_applied = []
+    lock = threading.Lock()
+
+    def worker():
+        local = 0
+        for _ in range(100):
+            r = reg.apply_delta("CC", 1)   # 100 스레드 × 100회 = 10,000 요청
+            local += r.applied_delta
+        with lock:
+            total_applied.append(local)
+
+    threads = [threading.Thread(target=worker) for _ in range(100)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    po = reg.get("CC")
+    assert po.applied_qty == 1_000        # 초과 없이 정확히 req_qty
+    assert po.status == FILLED
+    # 모든 스레드의 실제 반영합 == req_qty (요청 10,000 중 1,000만 흡수)
+    assert sum(total_applied) == 1_000
 
 
 if __name__ == "__main__":

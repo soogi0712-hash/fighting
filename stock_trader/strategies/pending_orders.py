@@ -13,7 +13,9 @@ pending_orders.py — 미확정 주문(pending) 메모리 레지스트리 (갭2 
     덮어쓰거나 초기화하지 않는다(멱등).
   - 시간은 clock(now_fn) 주입으로 테스트 가능하게 한다.
   - 최종 설계상 루프 선두 poll + 전용 poll 잡이 APScheduler 스레드풀에서
-    동시 실행될 수 있으므로 최소한의 RLock 으로 변이를 보호한다.
+    동시 실행될 수 있으므로 최소한의 Lock 으로 변이를 보호한다.
+    (재진입 없음이 검증되어 RLock 대신 plain Lock 사용.)
+  - apply_delta() 는 불변 FillApplyResult 를 반환한다(내부 객체 미유출).
 
 이 파일은 단계 1 범위: 순수 자료구조/상태머신만. StrategyManager·app.py·
 스케줄러·기존 주문/체결/apply 흐름은 건드리지 않는다.
@@ -65,6 +67,35 @@ class PendingOrder:
         return self.status in TERMINAL_STATUSES
 
 
+@dataclass(frozen=True)
+class FillApplyResult:
+    """
+    apply_delta() 반환용 **불변 스냅샷**.
+    caller(poll_pending_fills)가 apply_buy/apply_sell 을 구동하는 데 필요한
+    '이번 호출의 실제 반영 결과'를 담는다. (레지스트리 내부 객체를 유출하지 않음)
+
+    - applied_delta:  이번 호출에서 실제 흡수된 수량(0이면 no-op)
+    - requested_delta:요청된 델타(감사/로그용)
+    - clamped:        applied_delta < requested_delta (잔량 한도로 잘렸는가)
+    - applied_qty:    반영 후 누적 체결수량
+    - remaining_qty:  반영 후 잔량
+    - status:         반영 후 상태
+    - is_terminal:    반영 후 terminal 여부
+    - became_filled:  '이번 호출'로 FILLED 로 전환됐는가(전량 완료 호출에서만 True)
+    """
+    order_no:        str
+    code:            str
+    side:            str
+    applied_delta:   int
+    requested_delta: int
+    clamped:         bool
+    applied_qty:     int
+    remaining_qty:   int
+    status:          str
+    is_terminal:     bool
+    became_filled:   bool
+
+
 class PendingRegistry:
     """
     미확정 주문 메모리 레지스트리 (order_no 키).
@@ -76,7 +107,8 @@ class PendingRegistry:
     def __init__(self, now_fn=None):
         self._now = now_fn if callable(now_fn) else time.time
         self._orders: dict[str, PendingOrder] = {}
-        self._lock = threading.RLock()
+        # 재진입(락 보유 중 다른 락 메서드 호출) 없음이 검증됨 → plain Lock 으로 충분.
+        self._lock = threading.Lock()
 
     # ── 등록 ────────────────────────────────────────────────
     def register(self, order_no, market, code, name, side, level,
@@ -159,13 +191,22 @@ class PendingRegistry:
             po.last_check_ts = self._now()
             return po
 
-    def apply_delta(self, order_no, delta_qty) -> PendingOrder:
+    def apply_delta(self, order_no, delta_qty) -> FillApplyResult:
         """
-        체결 '델타'를 applied_qty 에 누적. (누적값이 아니라 신규 체결분)
-          - delta_qty 음수 금지.
-          - applied_qty 는 req_qty 를 초과하지 않도록 clamp(초과분 무시).
-          - 이미 terminal 인 주문에는 적용 불가(방어).
-          - 적용 후 remaining==0 이면 FILLED, 그 외 applied>0 이면 PARTIAL 로 전환.
+        체결 '델타'(누적값이 아닌 신규 체결분)를 applied_qty 에 누적하고
+        **불변 FillApplyResult** 를 반환한다. Result 생성과 상태 변경은
+        동일 Lock 임계구역에서 처리한다.
+
+        동작 규칙:
+          - delta_qty 음수 → ValueError.
+          - 존재하지 않는 order_no → KeyError.
+          - 이미 terminal(FILLED/REJECTED/CANCELED/TIMEOUT) → 추가 반영 없음:
+            applied_delta=0, became_filled=False (예외 아님, no-op).
+          - 요청 delta 가 remaining 보다 크면 remaining 까지만 반영 → clamped=True.
+          - 반영 후 remaining==0 이 '이번 호출'로 발생하면 became_filled=True,
+            상태 FILLED. 부분이면 PARTIAL.
+          - delta_qty==0 → applied_delta=0, 상태·수량 무변화(no-op).
+          - clamped == (applied_delta < requested_delta) 로 일관.
         """
         try:
             _dq = int(delta_qty)
@@ -177,19 +218,38 @@ class PendingRegistry:
             po = self._orders.get(order_no)
             if po is None:
                 raise KeyError(order_no)
+
+            # 이미 terminal → 추가 반영 금지(no-op Result)
             if po.is_terminal():
-                raise ValueError(
-                    f"terminal 주문({po.status})에는 체결을 적용할 수 없음: {order_no}")
-            new_applied = po.applied_qty + _dq
-            if new_applied > po.req_qty:
-                new_applied = po.req_qty     # ★ 초과 방지 clamp
-            po.applied_qty = max(0, new_applied)
-            po.last_check_ts = self._now()
-            if po.remaining_qty() == 0:
-                po.status = FILLED
-            elif po.applied_qty > 0:
-                po.status = PARTIAL
-            return po
+                return FillApplyResult(
+                    order_no=po.order_no, code=po.code, side=po.side,
+                    applied_delta=0, requested_delta=_dq,
+                    clamped=(_dq > 0),                 # 요청분이 전혀 반영 안 됨
+                    applied_qty=po.applied_qty, remaining_qty=po.remaining_qty(),
+                    status=po.status, is_terminal=True, became_filled=False,
+                )
+
+            remaining_before = po.remaining_qty()
+            applied = min(_dq, remaining_before)       # ★ 잔량까지만 반영(초과 clamp)
+            became_filled = False
+            if applied > 0:
+                po.applied_qty += applied
+                po.last_check_ts = self._now()
+                if po.remaining_qty() == 0:
+                    po.status = FILLED
+                    became_filled = True
+                else:
+                    po.status = PARTIAL
+            # applied==0(delta 0) → 상태·수량 무변화
+
+            return FillApplyResult(
+                order_no=po.order_no, code=po.code, side=po.side,
+                applied_delta=applied, requested_delta=_dq,
+                clamped=(applied < _dq),
+                applied_qty=po.applied_qty, remaining_qty=po.remaining_qty(),
+                status=po.status, is_terminal=po.is_terminal(),
+                became_filled=became_filled,
+            )
 
     def mark_terminal(self, order_no, status) -> PendingOrder:
         """FILLED/REJECTED/CANCELED/TIMEOUT 중 하나로 종결 처리."""
