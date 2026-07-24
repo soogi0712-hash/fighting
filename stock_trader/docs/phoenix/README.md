@@ -8,6 +8,7 @@
 |---|---|---|
 | 00 | [`00-GAP2-FAILURE-ANALYSIS.md`](./00-GAP2-FAILURE-ANALYSIS.md) | 기존 GAP2 구조 분석 + 6대 실패 원인(코드 근거) |
 | 01 | [`01-PHOENIX-DESIGN.md`](./01-PHOENIX-DESIGN.md) | 아키텍처 / 이벤트 스키마 / 주문 상태머신 / 트랜잭션 모델 / 멱등 모델 / crash matrix(A~I) / replay·reconciliation / 복구 게이트 / position·PnL projection / 테스트·카오스 / 마이그레이션 |
+| 02 | [`02-PHASE-1.5-API-AND-OPS.md`](./02-PHASE-1.5-API-AND-OPS.md) | KIS 국내/미국 주문 상태별 응답 예시 / ODNO·체결번호 영구 ID 실측 분석 / WAL 백업·복구·손상대응 / snapshot 수명주기 / 100만 event replay 추정 / broker vs event 우선순위 / polling TPS 계산 / 장마감 reconciliation / 실계좌 DB손상 fail-safe |
 
 ## 한 줄 요약
 여러 JSON 파일 + 메모리 큐(비원자·비영속)를 **단일 SQLite 이벤트 스토어**로 대체하고,
