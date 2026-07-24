@@ -538,5 +538,108 @@ def test_no_delta_after_confirmed_terminal():
         assert reg.get("X").applied_qty == 20  # 불변
 
 
+# ══════════════════════════════════════════════════════════════
+# 소단계 S2.75: mark_terminal() 원자적 bool 계약 (terminal immutable)
+# ══════════════════════════════════════════════════════════════
+
+# ── S2.75-1. OPEN → CANCELED = True ────────────────────────────
+def test_mark_terminal_first_transition_true():
+    reg = _reg()
+    _register_buy(reg, order_no="M", qty=100)
+    assert reg.get("M").status == ACCEPTED
+    assert reg.mark_terminal("M", CANCELED) is True
+    assert reg.get("M").status == CANCELED
+    assert reg.get("M").is_terminal() is True
+
+
+# ── S2.75-2. 재호출 → False ────────────────────────────────────
+def test_mark_terminal_repeat_false():
+    reg = _reg()
+    _register_buy(reg, order_no="M", qty=100)
+    assert reg.mark_terminal("M", CANCELED) is True
+    assert reg.mark_terminal("M", CANCELED) is False
+    assert reg.get("M").status == CANCELED
+
+
+# ── S2.75-3. FILLED → CANCELED = False, 상태 FILLED 유지 ───────
+def test_mark_terminal_filled_not_overwritten_by_cancel():
+    reg = _reg()
+    _register_buy(reg, order_no="M", qty=100)
+    reg.apply_delta("M", 100)                 # → FILLED
+    fake_ts = reg.get("M").last_check_ts
+    assert reg.mark_terminal("M", CANCELED) is False
+    assert reg.get("M").status == FILLED      # ★ 덮어쓰기 없음
+    assert reg.get("M").last_check_ts == fake_ts  # last_check_ts 미변경
+
+
+# ── S2.75-4. REJECTED → CANCELED = False, 상태 REJECTED 유지 ───
+def test_mark_terminal_rejected_not_overwritten():
+    reg = _reg()
+    _register_buy(reg, order_no="M", qty=100)
+    assert reg.mark_terminal("M", REJECTED) is True
+    assert reg.mark_terminal("M", CANCELED) is False
+    assert reg.get("M").status == REJECTED    # ★ 유지
+
+
+# ── S2.75-5. CANCEL_REQUESTED → CANCELED = True ────────────────
+def test_mark_terminal_from_cancel_requested_true():
+    reg = _reg()
+    _register_buy(reg, order_no="M", qty=100)
+    reg.request_cancel("M")                   # → CANCEL_REQUESTED(비-terminal)
+    assert reg.get("M").status == CANCEL_REQUESTED
+    assert reg.mark_terminal("M", CANCELED) is True
+    assert reg.get("M").status == CANCELED
+
+
+# ── S2.75-6. 없는 주문 → KeyError ─────────────────────────────
+def test_mark_terminal_missing_order_keyerror():
+    reg = _reg()
+    with pytest.raises(KeyError):
+        reg.mark_terminal("NOPE", CANCELED)
+
+
+# ── S2.75-7. 비-terminal status → ValueError ──────────────────
+def test_mark_terminal_non_terminal_status_valueerror():
+    reg = _reg()
+    _register_buy(reg, order_no="M", qty=100)
+    for st in (ACCEPTED, UNFILLED, PARTIAL, CANCEL_REQUESTED):
+        with pytest.raises(ValueError):
+            reg.mark_terminal("M", st)
+    # 검증 실패해도 상태 불변
+    assert reg.get("M").status == ACCEPTED
+
+
+# ── S2.75-8. 동시 mark_terminal → True 1회, False 1회 ─────────
+def test_mark_terminal_concurrent_exactly_one_true():
+    trues, falses = [], []
+    res_lock = threading.Lock()
+    # 여러 시행으로 경합 재현
+    for _ in range(200):
+        reg = _reg()
+        _register_buy(reg, order_no="M", code="005930", qty=100)
+        results = []
+        barrier = threading.Barrier(2)
+
+        def worker(st):
+            barrier.wait()
+            r = reg.mark_terminal("M", st)
+            with res_lock:
+                results.append((st, r))
+
+        # 두 스레드가 서로 다른 terminal 로 동시 시도
+        t1 = threading.Thread(target=worker, args=(CANCELED,))
+        t2 = threading.Thread(target=worker, args=(REJECTED,))
+        t1.start(); t2.start(); t1.join(); t2.join()
+
+        n_true = sum(1 for _, r in results if r is True)
+        n_false = sum(1 for _, r in results if r is False)
+        assert n_true == 1, f"True 는 정확히 1회여야 함: {results}"
+        assert n_false == 1
+        # 최종 상태는 terminal 하나 (True 를 반환한 스레드의 status)
+        winner = next(st for st, r in results if r is True)
+        assert reg.get("M").status == winner
+        assert reg.get("M").is_terminal() is True
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

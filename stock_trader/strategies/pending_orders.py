@@ -285,11 +285,28 @@ class PendingRegistry:
                 became_filled=became_filled,
             )
 
-    def mark_terminal(self, order_no, status) -> PendingOrder:
-        """FILLED/CANCELED/REJECTED 중 하나로 종결 처리."""
+    def mark_terminal(self, order_no, status) -> bool:
+        """
+        FILLED/CANCELED/REJECTED 로 **원자적** 종결 처리. terminal 은 immutable.
+
+        반환:
+          - True  : '이번 호출'로 최초 terminal 전이됨(=이때만 OrderStatusEvent 생성).
+          - False : 이미 terminal → 상태·last_check_ts 변경 없음(멱등, 덮어쓰기 금지).
+
+        일반 status 변경(update_status)과 계약이 다르므로 update_status 를 호출하지
+        않고 단일 Lock 임계구역에서 직접 판별·전이한다.
+        """
         if status not in TERMINAL_STATUSES:
             raise ValueError(f"terminal status 아님: {status!r}")
-        return self.update_status(order_no, status)
+        with self._lock:
+            po = self._orders.get(order_no)
+            if po is None:
+                raise KeyError(order_no)
+            if po.is_terminal():
+                return False                  # 이미 terminal → 변경 금지(immutable)
+            po.status = status
+            po.last_check_ts = self._now()
+            return True                       # 최초 terminal 전이
 
     # ── 정리 ────────────────────────────────────────────────
     def remove(self, order_no) -> bool:
