@@ -444,9 +444,13 @@ def main():
     # 복원된 포지션을 즉각 강제청산 (NKTR/HOOD/CELH 사례 재발 방지)
     _startup_kst = datetime.now(KST)
     _overnight_closed = strategy_us.force_close_overnight_positions(_startup_kst)
-    if _overnight_closed > 0:
+    _oc_result = _overnight_closed if isinstance(_overnight_closed, dict) else {"closed": _overnight_closed, "requested": 0, "total": _overnight_closed}
+    if _oc_result.get("closed", 0) > 0 or _oc_result.get("requested", 0) > 0:
         logger.warning(
-            f"[STARTUP] ⚠️ 오버나이트 강제청산 완료: {_overnight_closed}건 청산 "
+            f"[STARTUP] ⚠️ 오버나이트 강제청산: "
+            f"완료(COMPLETED)={_oc_result['closed']} "
+            f"요청(REQUESTED)={_oc_result['requested']} "
+            f"/ 전체={_oc_result.get('total', 0)}건 "
             f"(재시작 시각 KST {_startup_kst.strftime('%H:%M')})"
         )
 

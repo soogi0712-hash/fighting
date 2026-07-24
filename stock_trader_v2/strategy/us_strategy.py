@@ -2692,7 +2692,7 @@ class USStrategy:
     # 오버나이트 방지 — 서버 재시작 후 마감시간대 포지션 즉각 강제청산
     # ════════════════════════════════════════════════════════════
 
-    def force_close_overnight_positions(self, now_kst: datetime) -> int:
+    def force_close_overnight_positions(self, now_kst: datetime) -> dict:
         """
         서버 재시작 시 US 마감 후 시간대(KST 05:00~09:00)에 잔존하는
         모든 US 포지션을 즉각 시장가(지정가) 강제청산한다.
@@ -2702,8 +2702,16 @@ class USStrategy:
         ▸ 미국장(is_market_open) 여부와 무관하게 강제 실행
           (KIS 지정가로 즉시체결 — 프리마켓/AH 가격 활용)
 
+        GAP2 정책:
+          - SELL/SELL_STOP/SELL_TAKE : 청산완료(COMPLETED) — closed += 1
+          - SELL_ACCEPTED            : 청산요청(REQUESTED — GAP2 체결대기) — requested += 1
+          - 그 외                    : 강제청산 실패
+
         Returns:
-            강제청산 시도 종목 수 (int)
+            {"closed": int, "requested": int, "total": int}
+              closed    — 즉시 체결 완료 건수
+              requested — GAP2 pending 등록 (체결 대기) 건수
+              total     — 전체 시도 건수
         """
         from broker.us_broker import _is_dst_kst as _dst_fn_oc
 
@@ -2723,11 +2731,11 @@ class USStrategy:
                 f"[OVERNIGHT_CLOSE] 강제청산 불필요 — 현재 KST {t.strftime('%H:%M')} "
                 f"(창: {hard_t.strftime('%H:%M')}~{reopen_t.strftime('%H:%M')} 아님)"
             )
-            return 0
+            return {"closed": 0, "requested": 0, "total": 0}
 
         if not self._positions:
             logger.info("[OVERNIGHT_CLOSE] 잔존 포지션 없음 — 강제청산 불필요")
-            return 0
+            return {"closed": 0, "requested": 0, "total": 0}
 
         codes = list(self._positions.keys())
         logger.warning(
@@ -2736,6 +2744,7 @@ class USStrategy:
         )
 
         closed = 0
+        requested = 0  # GAP2 SELL_ACCEPTED: 청산요청(체결 대기)
         for code in codes:
             pg = self._positions.get(code)
             if pg is None:
@@ -2777,12 +2786,20 @@ class USStrategy:
                     now_kst=now_kst,
                 )
                 action = result.get("action", "")
-                if action in ("SELL", "SELL_STOP", "SELL_TAKE", "SELL_ACCEPTED"):
+                if action in ("SELL", "SELL_STOP", "SELL_TAKE"):
+                    # 청산완료(COMPLETED): 즉시 체결 확정
                     logger.warning(
-                        f"[OVERNIGHT_CLOSE] ✅ {name}({code}) 강제청산 성공 "
+                        f"[OVERNIGHT_CLOSE] ✅ {name}({code}) 강제청산 완료(COMPLETED) "
                         f"pnl={result.get('pnl_krw', 0):+,.0f}원"
                     )
                     closed += 1
+                elif action == "SELL_ACCEPTED":
+                    # 청산요청(REQUESTED): GAP2 pending 등록 — 실체결 대기 중
+                    logger.warning(
+                        f"[OVERNIGHT_CLOSE] 📝 {name}({code}) 강제청산 요청(REQUESTED "
+                        f"— GAP2 체결대기) order_no={result.get('order_no', 'N/A')}"
+                    )
+                    requested += 1
                 else:
                     logger.error(
                         f"[OVERNIGHT_CLOSE] ❌ {name}({code}) 강제청산 실패 "
@@ -2794,9 +2811,12 @@ class USStrategy:
                 )
 
         logger.warning(
-            f"[OVERNIGHT_CLOSE] 완료 — {closed}/{len(codes)}건 청산 성공"
+            f"[OVERNIGHT_CLOSE] 완료 — "
+            f"청산완료(COMPLETED):{closed} "
+            f"청산요청(REQUESTED):{requested} "
+            f"/ 전체:{len(codes)}"
         )
-        return closed
+        return {"closed": closed, "requested": requested, "total": len(codes)}
 
 
     # ════════════════════════════════════════════════════════════
