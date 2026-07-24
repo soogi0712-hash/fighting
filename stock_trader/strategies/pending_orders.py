@@ -28,16 +28,22 @@ from dataclasses import dataclass
 
 
 # ── 상태 상수 ──────────────────────────────────────────────────
-ACCEPTED = "ACCEPTED"   # 접수(주문 수락), 아직 체결 확인 전
-UNFILLED = "UNFILLED"   # 조회 결과 미체결(대기)
-PARTIAL  = "PARTIAL"    # 부분체결
-FILLED   = "FILLED"     # 전량체결 (terminal)
-REJECTED = "REJECTED"   # 거부 (terminal)
-CANCELED = "CANCELED"   # 취소 (terminal)
-TIMEOUT  = "TIMEOUT"    # 시간초과 (terminal)
+ACCEPTED         = "ACCEPTED"          # 접수(주문 수락), 아직 체결 확인 전
+UNFILLED         = "UNFILLED"          # 조회 결과 미체결(대기)
+PARTIAL          = "PARTIAL"           # 부분체결
+CANCEL_REQUESTED = "CANCEL_REQUESTED"  # 취소 요청됨(예: timeout). ★비-terminal, open 유지
+FILLED           = "FILLED"            # 전량체결 (terminal)
+REJECTED         = "REJECTED"          # 거부 (terminal)
+CANCELED         = "CANCELED"          # 취소 확정 (terminal)
 
-STATUSES = frozenset({ACCEPTED, UNFILLED, PARTIAL, FILLED, REJECTED, CANCELED, TIMEOUT})
-TERMINAL_STATUSES = frozenset({FILLED, REJECTED, CANCELED, TIMEOUT})
+# ★ timeout 은 더 이상 terminal 상태가 아니다. timeout 판단 결과는
+#   CANCEL_REQUESTED(비-terminal) 전환으로 표현하고, 브로커가 확인하기 전까지
+#   주문은 open 을 유지하며 추가 체결을 계속 반영할 수 있다.
+#   최종 terminal 은 브로커 확인 3종(FILLED/CANCELED/REJECTED)만.
+STATUSES = frozenset({
+    ACCEPTED, UNFILLED, PARTIAL, CANCEL_REQUESTED, FILLED, REJECTED, CANCELED,
+})
+TERMINAL_STATUSES = frozenset({FILLED, CANCELED, REJECTED})
 
 SIDES = frozenset({"BUY", "SELL"})
 
@@ -52,12 +58,13 @@ class PendingOrder:
     level:          int
     req_qty:        int
     req_price:      float
-    applied_qty:    int   = 0
-    status:         str   = ACCEPTED
-    accepted_ts:    float = 0.0
-    last_check_ts:  float = 0.0
-    is_full:        bool  = False
-    using_compound: float = 0.0
+    applied_qty:       int   = 0
+    status:            str   = ACCEPTED
+    accepted_ts:       float = 0.0
+    last_check_ts:     float = 0.0
+    cancel_requested_ts: float = 0.0   # 최초 취소요청 시각(0=미요청). accepted_ts 와 별개.
+    is_full:           bool  = False
+    using_compound:    float = 0.0
 
     def remaining_qty(self) -> int:
         """미반영 잔량 (req_qty - applied_qty), 0 하한."""
@@ -191,6 +198,31 @@ class PendingRegistry:
             po.last_check_ts = self._now()
             return po
 
+    def request_cancel(self, order_no) -> bool:
+        """
+        취소 필요(예: timeout) 표시 → CANCEL_REQUESTED(비-terminal) 전환.
+
+        반환:
+          - True  : '이번 호출'로 최초 CANCEL_REQUESTED 전환됨(=이때만 CancelRequest 생성).
+          - False : 이미 CANCEL_REQUESTED 이거나 terminal → 멱등, 상태·시각 미변경.
+
+        멱등 규칙:
+          - 최초 전환 시에만 cancel_requested_ts 를 기록(clock).
+          - 재요청은 status/cancel_requested_ts/accepted_ts 를 초기화하지 않는다.
+          - accepted_ts(주문 접수시각)와 last_check_ts 는 절대 덮어쓰지 않는다.
+        """
+        with self._lock:
+            po = self._orders.get(order_no)
+            if po is None:
+                raise KeyError(order_no)
+            if po.is_terminal():
+                return False                      # terminal 은 취소요청 무의미
+            if po.status == CANCEL_REQUESTED:
+                return False                      # 이미 요청됨 → 멱등, 미변경
+            po.status = CANCEL_REQUESTED
+            po.cancel_requested_ts = self._now()  # ★ 최초만 기록(accepted/last_check 미변경)
+            return True
+
     def apply_delta(self, order_no, delta_qty) -> FillApplyResult:
         """
         체결 '델타'(누적값이 아닌 신규 체결분)를 applied_qty 에 누적하고
@@ -200,7 +232,7 @@ class PendingRegistry:
         동작 규칙:
           - delta_qty 음수 → ValueError.
           - 존재하지 않는 order_no → KeyError.
-          - 이미 terminal(FILLED/REJECTED/CANCELED/TIMEOUT) → 추가 반영 없음:
+          - 이미 terminal(FILLED/CANCELED/REJECTED) → 추가 반영 없음:
             applied_delta=0, became_filled=False (예외 아님, no-op).
           - 요청 delta 가 remaining 보다 크면 remaining 까지만 반영 → clamped=True.
           - 반영 후 remaining==0 이 '이번 호출'로 발생하면 became_filled=True,
@@ -238,7 +270,9 @@ class PendingRegistry:
                 if po.remaining_qty() == 0:
                     po.status = FILLED
                     became_filled = True
-                else:
+                elif po.status != CANCEL_REQUESTED:
+                    # ★ CANCEL_REQUESTED 는 부분체결이 와도 유지(취소요청 마커 보존).
+                    #   전량체결(remaining==0)일 때만 FILLED 로 전환.
                     po.status = PARTIAL
             # applied==0(delta 0) → 상태·수량 무변화
 
@@ -252,7 +286,7 @@ class PendingRegistry:
             )
 
     def mark_terminal(self, order_no, status) -> PendingOrder:
-        """FILLED/REJECTED/CANCELED/TIMEOUT 중 하나로 종결 처리."""
+        """FILLED/CANCELED/REJECTED 중 하나로 종결 처리."""
         if status not in TERMINAL_STATUSES:
             raise ValueError(f"terminal status 아님: {status!r}")
         return self.update_status(order_no, status)

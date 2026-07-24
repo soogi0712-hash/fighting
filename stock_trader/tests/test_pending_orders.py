@@ -29,7 +29,7 @@ import dataclasses
 import pytest
 from strategies.pending_orders import (
     PendingOrder, PendingRegistry, FillApplyResult,
-    ACCEPTED, UNFILLED, PARTIAL, FILLED, REJECTED, CANCELED, TIMEOUT,
+    ACCEPTED, UNFILLED, PARTIAL, CANCEL_REQUESTED, FILLED, REJECTED, CANCELED,
     TERMINAL_STATUSES,
 )
 
@@ -139,8 +139,8 @@ def test_terminal_excluded_from_has_open():
     assert reg.has_open("005930", "BUY") is False
     assert reg.all_open() == []
 
-    # REJECTED/CANCELED/TIMEOUT 도 제외
-    for st, on in ((REJECTED, "R"), (CANCELED, "C"), (TIMEOUT, "TO")):
+    # REJECTED/CANCELED 도 제외 (TIMEOUT 은 terminal 아님 → 제거됨)
+    for st, on in ((REJECTED, "R"), (CANCELED, "C")):
         reg.register(on, "KR", "111111", "n", "BUY", 1, 10, 100)
         assert reg.has_open("111111", "BUY") is True
         reg.mark_terminal(on, st)
@@ -351,7 +351,7 @@ def test_result_refill_after_filled_is_noop():
 
 # ── 2A-5. CANCELED/TIMEOUT/REJECTED 에서 반영 금지 ─────────────
 def test_result_no_apply_in_terminal_states():
-    for st in (CANCELED, TIMEOUT, REJECTED):
+    for st in (CANCELED, REJECTED):
         reg = _reg()
         _register_buy(reg, order_no="X", qty=100)
         reg.apply_delta("X", 30)          # PARTIAL(30)
@@ -421,6 +421,121 @@ def test_concurrent_apply_delta_same_order_no_overflow():
     assert po.status == FILLED
     # 모든 스레드의 실제 반영합 == req_qty (요청 10,000 중 1,000만 흡수)
     assert sum(total_applied) == 1_000
+
+
+# ══════════════════════════════════════════════════════════════
+# 서브스텝 S1: CANCEL_REQUESTED (timeout → 비-terminal 취소요청)
+# ══════════════════════════════════════════════════════════════
+
+# ── S1-1. CANCEL_REQUESTED 는 terminal 아님 ────────────────────
+def test_cancel_requested_not_terminal():
+    assert CANCEL_REQUESTED not in TERMINAL_STATUSES
+    assert TERMINAL_STATUSES == frozenset({FILLED, CANCELED, REJECTED})
+    reg = _reg()
+    _register_buy(reg, order_no="CR", qty=100)
+    assert reg.request_cancel("CR") is True
+    po = reg.get("CR")
+    assert po.status == CANCEL_REQUESTED
+    assert po.is_terminal() is False
+
+
+# ── S1-2. has_open 에 CANCEL_REQUESTED 포함 ────────────────────
+def test_cancel_requested_counts_as_open():
+    reg = _reg()
+    _register_buy(reg, order_no="CR", code="005930", qty=100)
+    reg.request_cancel("CR")
+    assert reg.has_open("005930", "BUY") is True   # 취소요청 중에도 open
+    assert reg.get("CR") in reg.all_open()
+
+
+# ── S1-3. CANCEL_REQUESTED 후 부분체결 가능(마커 유지) ─────────
+def test_cancel_requested_then_partial_fill():
+    reg = _reg()
+    _register_buy(reg, order_no="CR", qty=100)
+    reg.request_cancel("CR")
+    r = reg.apply_delta("CR", 30)
+    assert r.applied_delta == 30
+    assert r.applied_qty == 30
+    assert r.became_filled is False
+    # ★ 부분체결이 와도 CANCEL_REQUESTED 마커 유지(PARTIAL 로 되돌지 않음)
+    assert reg.get("CR").status == CANCEL_REQUESTED
+    assert r.status == CANCEL_REQUESTED
+
+
+# ── S1-4. CANCEL_REQUESTED 후 전량체결 → FILLED ────────────────
+def test_cancel_requested_then_full_fill_becomes_filled():
+    reg = _reg()
+    _register_buy(reg, order_no="CR", qty=100)
+    reg.request_cancel("CR")
+    reg.apply_delta("CR", 40)
+    r = reg.apply_delta("CR", 60)          # 전량
+    assert r.became_filled is True
+    assert r.status == FILLED
+    assert reg.get("CR").is_terminal() is True
+
+
+# ── S1-5. 최초 취소요청 vs 중복 취소요청 구분 ──────────────────
+def test_request_cancel_idempotent_changed_flag():
+    reg = _reg()
+    _register_buy(reg, order_no="CR", qty=100)
+    assert reg.request_cancel("CR") is True    # 최초 전환
+    assert reg.request_cancel("CR") is False   # 중복 → 변경 없음
+    assert reg.request_cancel("CR") is False
+    # terminal 이면 취소요청 무의미 → False
+    _register_buy(reg, order_no="F", qty=10)
+    reg.apply_delta("F", 10)                   # FILLED
+    assert reg.request_cancel("F") is False
+    # 없는 주문 → KeyError
+    with pytest.raises(KeyError):
+        reg.request_cancel("NOPE")
+
+
+# ── S1-6. 중복 요청 시 accepted_ts 유지 ────────────────────────
+def test_request_cancel_preserves_accepted_ts():
+    fake = {"t": 1000.0}
+    reg = _reg(now_fn=lambda: fake["t"])
+    _register_buy(reg, order_no="CR", qty=100)
+    assert reg.get("CR").accepted_ts == 1000.0
+    fake["t"] = 1050.0
+    reg.request_cancel("CR")
+    fake["t"] = 1099.0
+    reg.request_cancel("CR")                   # 중복
+    po = reg.get("CR")
+    assert po.accepted_ts == 1000.0            # ★ 접수시각 불변
+
+
+# ── S1-7. cancel_requested_ts 최초 값 유지 ─────────────────────
+def test_cancel_requested_ts_records_first_only():
+    fake = {"t": 1000.0}
+    reg = _reg(now_fn=lambda: fake["t"])
+    _register_buy(reg, order_no="CR", qty=100)
+    assert reg.get("CR").cancel_requested_ts == 0.0    # 미요청
+    fake["t"] = 1050.0
+    reg.request_cancel("CR")
+    assert reg.get("CR").cancel_requested_ts == 1050.0  # 최초 기록
+    fake["t"] = 1080.0
+    reg.request_cancel("CR")                            # 중복 → 미변경
+    assert reg.get("CR").cancel_requested_ts == 1050.0  # ★ 최초 값 유지
+    # 부분체결이 와도 cancel_requested_ts 불변
+    fake["t"] = 1090.0
+    reg.apply_delta("CR", 10)
+    assert reg.get("CR").cancel_requested_ts == 1050.0
+
+
+# ── S1-8. CANCELED/REJECTED 후 delta 반영 금지 ─────────────────
+def test_no_delta_after_confirmed_terminal():
+    for st in (CANCELED, REJECTED):
+        reg = _reg()
+        _register_buy(reg, order_no="X", qty=100)
+        reg.request_cancel("X")
+        reg.apply_delta("X", 20)               # CANCEL_REQUESTED 중 부분체결
+        assert reg.get("X").applied_qty == 20
+        reg.mark_terminal("X", st)             # 브로커 확정
+        r = reg.apply_delta("X", 50)           # terminal → no-op
+        assert r.applied_delta == 0
+        assert r.is_terminal is True
+        assert r.status == st
+        assert reg.get("X").applied_qty == 20  # 불변
 
 
 if __name__ == "__main__":
