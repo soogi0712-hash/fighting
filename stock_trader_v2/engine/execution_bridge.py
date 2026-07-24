@@ -75,14 +75,32 @@ class ExecutionBridge:
         self._poll_fail_count = 0
         self._next_allowed_poll_ts = 0.0   # backoff 대기 만료 시각
 
+        # CRITICAL-2: 콜백 실패 시 delta 유실 방지 — retry queue
+        # {order_no: [AppliedFillEvent, ...]}
+        # apply_delta는 이미 확정됐으나 콜백이 실패한 이벤트 보관
+        # 다음 poll 시 retry_queue 우선 처리 → 콜백 재시도
+        self._callback_retry_queue: list = []   # list of (po, ev)
+
     # ── 재시작 복구 ─────────────────────────────────────────
     def restore(self) -> int:
         """
         재시작 시 pending 파일 복구 + FillSource tracker seed.
         seed → 재시작 후 같은 누적을 다시 delta로 방출하지 않음.
+
+        MEDIUM-6: 손상 JSON 시 registry.load_from()이 RuntimeError 발생.
+          - 오류 로그 출력 (RECOVERY_REQUIRED 표시)
+          - 0 반환 → 상위 호출자가 판단 가능
         """
         try:
             n = self.registry.load_from(self.pending_path)
+        except RuntimeError as e:
+            # MEDIUM-6: 손상 JSON — RECOVERY_REQUIRED 로그, 0 반환
+            if self.log:
+                self.log.error(
+                    f"[ExecBridge:{self.market}] RECOVERY_REQUIRED: "
+                    f"pending 파일 손상 — {e}"
+                )
+            return 0
         except Exception as e:
             if self.log:
                 self.log.error(f"[ExecBridge:{self.market}] pending 복구 실패: {e}")
@@ -111,11 +129,13 @@ class ExecutionBridge:
     # ── 접수 등록 (즉시 apply 금지) ─────────────────────────
     def register_accept(self, order_no, code, name, side, level,
                         req_qty, req_price,
-                        using_compound=0.0, is_full=False) -> bool:
+                        using_compound=0.0, is_full=False,
+                        extra=None) -> bool:
         """
         주문 접수 성공 시 호출. 주문번호가 없으면 False.
         동일 종목+방향 pending이 이미 존재하면 중복 등록 차단 → False.
         등록만 하고 포지션은 절대 만들지 않는다.
+        extra: 전략 메타데이터 dict (breakout_low, reason 등)
         """
         if not order_no:
             if self.log:
@@ -136,7 +156,8 @@ class ExecutionBridge:
                 order_no, self.market, code, name, side, level,
                 int(req_qty), float(req_price),
                 is_full=bool(is_full),
-                using_compound=float(using_compound or 0)
+                using_compound=float(using_compound or 0),
+                extra=extra,
             )
         except Exception as e:
             if self.log:
@@ -214,14 +235,61 @@ class ExecutionBridge:
           - 연속 실패: 지수형 backoff (최대 120초)
           - _MAX_FAIL_BEFORE_RECOVERY 초과 → RECOVERY_REQUIRED
           - 실패만으로 pending 삭제/포지션 생성 금지
+
+        CRITICAL-2 delta 유실 방지:
+          - apply_delta는 poll_orchestrator에서 확정됨 (registry 상태 변경)
+          - 콜백 실패 시 (po, ev) 쌍을 _callback_retry_queue에 보관
+          - 다음 poll 시 retry_queue 우선 처리 → 콜백 재시도
+          - 콜백 성공 후에만 retry_queue에서 제거
+          - 이중반영 방지: apply_delta는 1회만 호출됨 (orchestrator에서 처리)
         """
+        if not self.registry:
+            # registry가 비어도 retry_queue는 처리해야 함
+            if not self._callback_retry_queue:
+                return None
+
+        # backoff 중이면 retry_queue만 처리
+        skip_new_poll = self._is_backoff_active()
+
+        result = None
+
+        # ── 1) retry_queue 우선 처리 (이전 콜백 실패분) ────────
+        if self._callback_retry_queue:
+            retry_list = list(self._callback_retry_queue)
+            self._callback_retry_queue.clear()
+            still_failed = []
+            for (po, ev) in retry_list:
+                if ev.applied_qty <= 0:
+                    continue
+                try:
+                    if ev.side == "BUY":
+                        _dispatch(on_buy_fill, po, ev)
+                    elif on_sell_fill is not None:
+                        _dispatch(on_sell_fill, po, ev)
+                    if self.log:
+                        self.log.info(
+                            f"[ExecBridge:{self.market}] retry 콜백 성공 "
+                            f"{ev.side} {ev.code} order_no={ev.order_no} "
+                            f"applied_qty={ev.applied_qty}"
+                        )
+                except Exception as _e:
+                    if self.log:
+                        self.log.error(
+                            f"[ExecBridge:{self.market}] retry 콜백 재실패 "
+                            f"{ev.side} {ev.code}: {_e} — 다음 poll 재시도"
+                        )
+                    still_failed.append((po, ev))
+            self._callback_retry_queue.extend(still_failed)
+            if still_failed:
+                self._save()
+
+        if skip_new_poll:
+            return None
+
         if not self.registry:
             return None
 
-        # backoff 중이면 skip
-        if self._is_backoff_active():
-            return None
-
+        # ── 2) 신규 poll ─────────────────────────────────────
         try:
             result = poll_pending_fills(
                 self.fill_source, self.state_source, self.registry,
@@ -249,7 +317,10 @@ class ExecutionBridge:
         else:
             self._record_success()
 
-        # 체결 콜백 — 1-arg / 2-arg 모두 지원
+        # ── 3) 체결 콜백 — 1-arg / 2-arg 모두 지원 ──────────
+        # apply_delta는 poll_orchestrator에서 이미 확정됨.
+        # 콜백 실패 시 retry_queue에 보관 → 다음 poll에서 재시도.
+        # 이중반영 없음: apply_delta는 1회만 호출됨.
         for ev in result.fills:
             if ev.applied_qty <= 0:
                 continue
@@ -264,8 +335,11 @@ class ExecutionBridge:
                 if self.log:
                     self.log.error(
                         f"[ExecBridge:{self.market}] 체결반영 콜백 오류 "
-                        f"{ev.side} {ev.code}: {e}"
+                        f"{ev.side} {ev.code}: {e} "
+                        f"— retry_queue 보관 (delta 유실 방지, CRITICAL-2)"
                     )
+                # CRITICAL-2: 콜백 실패 → retry_queue 보관 (delta 유실 방지)
+                self._callback_retry_queue.append((po, ev))
 
         # terminal 통지
         if on_terminal:

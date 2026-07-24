@@ -204,7 +204,7 @@ class UsKisFillSource(_SeedMixin, FillSource):
         if not _is_gap2_enabled():
             return []
         try:
-            rows = self.broker.get_us_order_history_raw(days=1)
+            rows = self.broker.get_us_executed_orders_normalized(days=1)
         except Exception:
             return []
         fills = []

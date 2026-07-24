@@ -1085,22 +1085,18 @@ class USBroker(KISBase):
                 continue
         return results
 
-    def get_us_order_history_raw(self, days: int = 1) -> list:
+    def get_us_executed_orders_normalized(self, days: int = 1) -> list:
         """
-        GAP2 UsKisFillSource용 — TTTS3035R 원본 응답 rows 반환 (래퍼).
+        GAP2 UsKisFillSource용 — get_executed_orders() 정규화 결과 반환 (래퍼).
 
-        get_executed_orders()의 정규화된 dict 대신,
-        KIS API 원본 필드(odno, pdno, ft_ccld_qty, ft_ccld_unpr3,
-        sll_buy_dvsn_cd 등)가 필요한 경우에 사용.
+        ★ 명칭 변경 이유 (MEDIUM-5):
+          이전 이름 get_us_order_history_raw()는 "raw" 응답을 암시하지만,
+          실제 반환값은 get_executed_orders()가 정규화한 dict이다.
+          혼동 방지를 위해 get_us_executed_orders_normalized()로 변경.
 
-        실제로는 get_executed_orders()가 이미 원본을 파싱해 반환하므로,
-        UsKisFillSource에서 후보키로 방어적 매핑이 가능하다.
-        이 메서드는 get_executed_orders() 결과를 그대로 반환한다.
-
-        Returns:
-            list[dict] — get_executed_orders() 반환값과 동일한 구조.
-            fields: order_no, code, name, side, qty, price,
-                    filled_qty, filled_price, filled_time, exch_cd, market
+        반환 구조 (get_executed_orders()와 동일):
+          list[dict] — fields: order_no, code, name, side, qty, price,
+                       filled_qty, filled_price, filled_time, exch_cd, market
         """
         from datetime import date as _date
         today = _date.today().strftime("%Y%m%d")
@@ -1110,6 +1106,17 @@ class USBroker(KISBase):
         else:
             start = today
         return self.get_executed_orders(start_date=start, end_date=today)
+
+    # 하위 호환성 alias (deprecated — 사용 금지, get_us_executed_orders_normalized 사용)
+    def get_us_order_history_raw(self, days: int = 1) -> list:
+        """Deprecated alias → get_us_executed_orders_normalized() 호출."""
+        import warnings
+        warnings.warn(
+            "get_us_order_history_raw() is deprecated. "
+            "Use get_us_executed_orders_normalized() instead.",
+            DeprecationWarning, stacklevel=2,
+        )
+        return self.get_us_executed_orders_normalized(days=days)
 
     # ════════════════════════════════════════════════════════════
     # 10. 주문 사전 검증

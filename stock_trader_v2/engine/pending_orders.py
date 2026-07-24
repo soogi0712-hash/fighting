@@ -58,6 +58,11 @@ class PendingOrder:
     cancel_requested_ts: float = 0.0
     is_full:             bool  = False
     using_compound:      float = 0.0
+    extra:               dict  = None  # 전략 메타데이터 (breakout_low, reason 등)
+
+    def __post_init__(self):
+        if self.extra is None:
+            self.extra = {}
 
     def remaining_qty(self) -> int:
         return max(0, self.req_qty - self.applied_qty)
@@ -94,7 +99,8 @@ class PendingRegistry:
 
     # ── 등록 ────────────────────────────────────────────────
     def register(self, order_no, market, code, name, side, level,
-                 req_qty, req_price, is_full=False, using_compound=0.0) -> PendingOrder:
+                 req_qty, req_price, is_full=False, using_compound=0.0,
+                 extra=None) -> PendingOrder:
         if not order_no:
             raise ValueError("order_no 필수")
         _side = str(side).upper()
@@ -121,6 +127,7 @@ class PendingRegistry:
                 applied_qty=0, status=ACCEPTED,
                 accepted_ts=ts, last_check_ts=ts,
                 is_full=bool(is_full), using_compound=float(using_compound or 0.0),
+                extra=dict(extra) if extra else {},
             )
             self._orders[order_no] = po
             return po
@@ -290,20 +297,63 @@ class PendingRegistry:
         os.replace(tmp, path)   # 원자적 교체
 
     def load_from(self, path) -> int:
-        """JSON에서 주문 복원. 반환: 로드된 주문 수. 파일 없으면 0."""
+        """
+        JSON에서 주문 복원. 반환: 로드된 주문 수. 파일 없으면 0.
+
+        MEDIUM-6: 손상 JSON 처리 정책:
+          - 파싱 실패(JSONDecodeError, TypeError 등) → 조용한 0건 복원 금지
+          - 원본 파일을 .corrupt.{TIMESTAMP} 로 백업
+          - RuntimeError 발생 → 호출자(ExecutionBridge.restore)가 오류 상태 결정
+        """
         import json, os
         if not os.path.exists(path):
             return 0
-        with open(path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception as _parse_err:
+            import time as _time_mod, shutil
+            ts = int(_time_mod.time())
+            corrupt_path = f"{path}.corrupt.{ts}"
+            try:
+                shutil.copy2(path, corrupt_path)
+                _backup_msg = f"백업 저장: {corrupt_path}"
+            except Exception as _be:
+                _backup_msg = f"백업 실패: {_be}"
+            raise RuntimeError(
+                f"[PendingRegistry] RECOVERY_REQUIRED: "
+                f"pending JSON 손상 — path={path!r} err={_parse_err!r} "
+                f"{_backup_msg}"
+            ) from _parse_err
+
+        if not isinstance(raw, dict):
+            import time as _time_mod, shutil
+            ts = int(_time_mod.time())
+            corrupt_path = f"{path}.corrupt.{ts}"
+            try:
+                shutil.copy2(path, corrupt_path)
+                _backup_msg = f"백업 저장: {corrupt_path}"
+            except Exception as _be:
+                _backup_msg = f"백업 실패: {_be}"
+            raise RuntimeError(
+                f"[PendingRegistry] RECOVERY_REQUIRED: "
+                f"pending JSON 최상위가 dict 아님 — type={type(raw).__name__!r} "
+                f"path={path!r} {_backup_msg}"
+            )
+
         n = 0
         with self._lock:
             for k, d in (raw or {}).items():
                 try:
+                    # extra 필드 없는 구버전 파일 하위호환
+                    if isinstance(d, dict) and "extra" not in d:
+                        d["extra"] = {}
                     self._orders[k] = PendingOrder(**d)
                     n += 1
                 except Exception:
                     continue
+        return n
         return n
 
     def __len__(self) -> int:

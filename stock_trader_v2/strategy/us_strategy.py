@@ -210,20 +210,47 @@ class USStrategy:
         self._load_positions()
 
         # ── GAP2 ExecutionBridge (US) ─────────────────────────
+        # MEDIUM-7: Feature Flag 시작 시 고정 정책
+        #   - 시작 시 ENABLE_GAP2를 읽어 self._gap2_enabled에 고정
+        #   - 런타임 중 ENABLE_GAP2 변경은 무시됨 (재시작 필요)
+        #   - false 모드 시작 시 pending_us.json에 미처리 주문이 있으면 경고
         self._bridge: Optional["ExecutionBridge"] = None
-        self._gap2_enabled = (
-            os.environ.get("ENABLE_GAP2", "false").lower() == "true"
-            and _GAP2_MODULES_OK
-        )
+        _gap2_raw = os.environ.get("ENABLE_GAP2", "false").lower() == "true"
+        self._gap2_enabled = _gap2_raw and _GAP2_MODULES_OK
+
+        _pending_path = os.path.join(_DATA_DIR, "pending_us.json")
+
+        # MEDIUM-7: false 모드 시작 시 pending 존재 여부 경고
+        if not self._gap2_enabled and os.path.exists(_pending_path):
+            try:
+                import json as _json
+                with open(_pending_path, "r", encoding="utf-8") as _f:
+                    _pdata = _json.load(_f)
+                if isinstance(_pdata, dict) and _pdata:
+                    logger.error(
+                        f"[USStrategy] MEDIUM-7 경고: ENABLE_GAP2=false이나 "
+                        f"pending_us.json에 {len(_pdata)}건 미처리 주문 존재. "
+                        f"GAP2 모드로 재시작하거나 pending 파일 수동 확인 필요. "
+                        f"path={_pending_path}"
+                    )
+            except Exception as _pe:
+                logger.warning(f"[USStrategy] pending_us.json 사전확인 실패(무시): {_pe}")
+
         if self._gap2_enabled:
-            _pending_path = os.path.join(_DATA_DIR, "pending_us.json")
             self._bridge = ExecutionBridge(
                 market       = "US",
                 fill_source  = UsKisFillSource(broker),
                 pending_path = _pending_path,
                 logger       = logger,
             )
-            logger.info("[USStrategy] GAP2 ExecutionBridge(US) 초기화 완료")
+            logger.info(
+                f"[USStrategy] GAP2 ExecutionBridge(US) 초기화 완료 "
+                f"(ENABLE_GAP2=true, 런타임 변경 불가 — 재시작 필요)"
+            )
+        else:
+            logger.info(
+                f"[USStrategy] GAP2=false 모드 (ENABLE_GAP2=false or 모듈 미사용)"
+            )
 
     # ════════════════════════════════════════════════════════════
     # 메인 루프 진입점
@@ -977,10 +1004,62 @@ class USStrategy:
             exch_cd=exch_cd,          # ★ US: exch_cd 전달 (NASD/NYSE)
         )
 
-        # ★ BUG FIX: execute_buy() 성공 시 action="BUY" 반환 ("ok" 키 없음)
+        # ★ BUG FIX: execute_buy() 성공 시 action="BUY"(GAP2=false) 또는
+        #   action="BUY_ACCEPTED"(GAP2=true) 반환.
         #   이전: result.get("ok") → 항상 None → 항상 BUY_FAIL 오판정
-        #   수정: action == "BUY" 로 성공 판별
-        if result.get("action") == "BUY":
+        #   수정: action == "BUY" / "BUY_ACCEPTED" 로 성공 판별
+        _buy_action = result.get("action")
+
+        # ── [GAP2] BUY_ACCEPTED 경로: 접수만 → PendingRegistry 등록, 포지션 생성 금지 ──
+        if _buy_action == "BUY_ACCEPTED" and self._gap2_enabled and self._bridge is not None:
+            order_no = result.get("order_no", "") or ""
+            logger.info(
+                f"[GAP2_US] BUY_ACCEPTED → pending 등록 {name}({code}) "
+                f"qty={qty} @${order_price:.2f} order_no={order_no!r}"
+            )
+            if order_no:
+                _reg_ok = self._bridge.register_accept(
+                    order_no=order_no,
+                    code=code,
+                    name=name,
+                    side="BUY",
+                    level=1,
+                    req_qty=qty,
+                    req_price=float(order_price),
+                    extra={
+                        "breakout_low": breakout_low,
+                        "signal_time": signal_time_iso,
+                        "order_time":  order_time_iso,
+                        "reason":      reason,
+                        "iv":          iv,
+                    },
+                )
+                if not _reg_ok:
+                    logger.warning(
+                        f"[GAP2_US] pending 등록 실패(중복 또는 오류) {name}({code}) "
+                        f"order_no={order_no!r} → BUY_ACCEPTED 유지(포지션 미생성)"
+                    )
+            else:
+                logger.warning(
+                    f"[GAP2_US] BUY_ACCEPTED 이나 order_no 없음 {name}({code}) "
+                    f"→ pending 등록 불가, BUY_ACCEPTED 유지"
+                )
+            # ★ [중복진입 차단] BUY_ACCEPTED 시각 기록
+            import time as _time_mod2
+            self._last_buy_time[code] = _time_mod2.time()
+            return {
+                "action":   "BUY_ACCEPTED",
+                "code":     code,
+                "name":     name,
+                "reason":   reason,
+                "price":    order_price,
+                "qty":      qty,
+                "order_no": order_no,
+                "ok":       True,
+            }
+
+        # ── [비-GAP2] BUY 경로: 즉시 포지션 등록 ───────────────────
+        if _buy_action == "BUY":
             # 포지션 등록
             self._positions[code] = PositionGuard(
                 code=code, name=name,
@@ -1618,8 +1697,36 @@ class USStrategy:
             rt_cd = result.get("rt_cd", "9")
             msg   = result.get("msg", "")
 
-            if result.get("action") == "SELL":
-                # ── 매도 성공 ───────────────────────────────────────
+            if result.get("action") in ("SELL", "SELL_ACCEPTED"):
+                _sell_accepted = (result.get("action") == "SELL_ACCEPTED")
+                # ── [GAP2] SELL_ACCEPTED: pending 등록, 즉시 pop/record 금지 ──
+                if _sell_accepted and self._gap2_enabled and self._bridge is not None:
+                    _order_no_sa = result.get("order_no", "") or ""
+                    logger.warning(
+                        f"[GAP2_US] HARD_STOP SELL_ACCEPTED → pending 등록 "
+                        f"{name}({code}) qty={sell_qty} order_no={_order_no_sa!r}"
+                    )
+                    if _order_no_sa:
+                        self._bridge.register_accept(
+                            order_no=_order_no_sa,
+                            code=code,
+                            name=name,
+                            side="SELL",
+                            level=0,
+                            req_qty=sell_qty,
+                            req_price=float(sell_price),
+                            extra={"reason": sell_reason},
+                        )
+                    return {
+                        "action":   "SELL_ACCEPTED",
+                        "code":     code, "name": name,
+                        "reason":   sell_reason,
+                        "price":    cur_price,
+                        "qty":      sell_qty,
+                        "order_no": _order_no_sa,
+                        "ok":       True,
+                    }
+                # ── [비-GAP2] SELL 즉시 정리 ────────────────────────────────
                 # 내부 포지션 정리 (이미 _do_sell에서 처리됐을 수도 있지만 방어적으로)
                 pg = self._positions.pop(code, None)
                 self._entry_stage.pop(code, None)
@@ -1786,8 +1893,41 @@ class USStrategy:
             exch_cd=exch_cd,                 # ★ US: exch_cd 전달 (NASD/NYSE)
         )
 
-        # ★ BUG FIX: execute_sell() 성공 시 action="SELL" 반환 ("ok" 키 없음)
-        if result.get("action") == "SELL":
+        # ★ BUG FIX: execute_sell() 성공 시 action="SELL"(GAP2=false) 또는
+        #   action="SELL_ACCEPTED"(GAP2=true) 반환.
+        _do_sell_action = result.get("action")
+
+        # ── [GAP2] SELL_ACCEPTED 경로: 접수만 → PendingRegistry 등록 ──────
+        if _do_sell_action == "SELL_ACCEPTED" and self._gap2_enabled and self._bridge is not None:
+            _order_no_ds = result.get("order_no", "") or ""
+            logger.info(
+                f"[GAP2_US] SELL_ACCEPTED → pending 등록 {name}({code}) "
+                f"qty={qty} @${sell_price_usd:.2f} order_no={_order_no_ds!r}"
+            )
+            if _order_no_ds:
+                self._bridge.register_accept(
+                    order_no=_order_no_ds,
+                    code=code,
+                    name=name,
+                    side="SELL",
+                    level=0,
+                    req_qty=qty,
+                    req_price=float(sell_price_usd),
+                    extra={"reason": reason},
+                )
+            action = "SELL_ACCEPTED"
+            return {
+                "action":   action,
+                "code":     code, "name": name,
+                "reason":   reason,
+                "price":    cur_price,
+                "qty":      qty,
+                "order_no": _order_no_ds,
+                "ok":       True,
+            }
+
+        # ── [비-GAP2] SELL 즉시 정리 ─────────────────────────────────────
+        if _do_sell_action == "SELL":
             # 손익 계산 (USD → KRW)
             pg = self._positions.pop(code, None)
             self._entry_stage.pop(code, None)
@@ -1855,6 +1995,7 @@ class USStrategy:
 
             action = "SELL_STOP" if is_stoploss else "SELL_TAKE"
         else:
+            # SELL_FAIL (또는 예상치 못한 action)
             action = "SELL_FAIL"
             logger.warning(
                 f"❌ [US SELL FAIL] {name}({code}) {qty}주 "
@@ -2636,7 +2777,7 @@ class USStrategy:
                     now_kst=now_kst,
                 )
                 action = result.get("action", "")
-                if action == "SELL":
+                if action in ("SELL", "SELL_STOP", "SELL_TAKE", "SELL_ACCEPTED"):
                     logger.warning(
                         f"[OVERNIGHT_CLOSE] ✅ {name}({code}) 강제청산 성공 "
                         f"pnl={result.get('pnl_krw', 0):+,.0f}원"
@@ -2676,21 +2817,25 @@ class USStrategy:
             logger.error(f"[GAP2_US] poll_fills 예외: {_e}")
 
     def _on_us_buy_fill(self, pending, fill) -> None:
-        """US BUY 체결 delta 콜백."""
+        """US BUY 체결 delta 콜백. fill: AppliedFillEvent (applied_qty 필드 사용)."""
         code       = pending.code
         name       = pending.name
-        delta_qty  = fill.qty
+        delta_qty  = fill.applied_qty   # AppliedFillEvent.applied_qty (실 체결 delta)
         fill_price = fill.price or pending.req_price
-        extra      = pending.extra or {}
+        extra      = getattr(pending, "extra", None) or {}
         if delta_qty <= 0:
             return
         existing = self._positions.get(code)
         if existing:
             new_qty = existing.qty + delta_qty
             new_avg = (existing.avg_price * existing.qty + fill_price * delta_qty) / new_qty
-            existing.qty = new_qty
+            existing.qty       = new_qty
             existing.avg_price = new_avg
-            logger.info(f"[GAP2_US] BUY 추가체결 {name}({code}) delta={delta_qty} fill=${fill_price:.4f} new_qty={new_qty}")
+            logger.info(
+                f"[GAP2_US] BUY 추가체결 {name}({code}) "
+                f"delta={delta_qty} fill=${fill_price:.4f} new_qty={new_qty} "
+                f"new_avg=${new_avg:.4f}"
+            )
         else:
             breakout_low = float(extra.get("breakout_low", 0))
             self._positions[code] = PositionGuard(
@@ -2700,37 +2845,60 @@ class USStrategy:
                 breakout_low=breakout_low, market="US",
             )
             self._entry_stage[code] = pending.level or "FULL"
-            logger.info(f"[GAP2_US] BUY 체결→포지션 등록 {name}({code}) qty={delta_qty} fill=${fill_price:.4f}")
+            logger.info(
+                f"[GAP2_US] BUY 체결→포지션 등록 {name}({code}) "
+                f"qty={delta_qty} fill=${fill_price:.4f} "
+                f"became_filled={fill.became_filled}"
+            )
         self._save_positions()
 
     def _on_us_sell_fill(self, pending, fill) -> None:
-        """US SELL 체결 delta 콜백."""
+        """US SELL 체결 delta 콜백. fill: AppliedFillEvent (applied_qty 필드 사용)."""
         code       = pending.code
         name       = pending.name
-        delta_qty  = fill.qty
+        delta_qty  = fill.applied_qty   # AppliedFillEvent.applied_qty (실 체결 delta)
         fill_price = fill.price or 0.0
-        extra      = pending.extra or {}
         if delta_qty <= 0:
             return
         pg = self._positions.get(code)
         if pg is None:
-            logger.warning(f"[GAP2_US] SELL 체결 콜백 — 포지션 없음 {name}({code}) (무시)")
+            logger.warning(
+                f"[GAP2_US] SELL 체결 콜백 — 포지션 없음 {name}({code}) (무시) "
+                f"delta={delta_qty} order_no={pending.order_no}"
+            )
             return
         avg_price = pg.avg_price
-        pnl_usd   = (fill_price - avg_price) * delta_qty if fill_price > 0 else 0.0
-        pnl_krw   = pnl_usd * self.usd_krw
+        # ── NET 손익 계산 (수수료 차감 — _calc_net_pct 기준과 통일) ──
+        # US: gross = (fill_price - avg_price) * delta_qty * usd_krw
+        # net_fee_rate = 매수 0.015% + 매도 0.015% (편도 기준; US는 증권거래세 없음)
+        # executor._calc_net_pct 와 동일 fee=0.015*2+0.20 %p 를 금액으로 환산
+        _net_fee_pct = 0.015 * 2 + 0.20   # % 단위 (executor._calc_net_pct 동일)
+        pnl_usd_gross = (fill_price - avg_price) * delta_qty if fill_price > 0 else 0.0
+        # 수수료 금액 = avg_price * delta_qty * fee_rate / 100  (달러 기준)
+        _fee_usd = avg_price * delta_qty * (_net_fee_pct / 100) if avg_price > 0 else 0.0
+        pnl_usd_net   = pnl_usd_gross - _fee_usd
+        pnl_krw       = pnl_usd_net * self.usd_krw
         if delta_qty >= pg.qty:
             self._positions.pop(code, None)
             self._entry_stage.pop(code, None)
             self._trail_state.pop(code, None)
             self._save_positions()
             self.pnl.record(pnl_krw)
-            logger.info(f"[GAP2_US] SELL 전량체결→포지션 제거 {name}({code}) delta={delta_qty} fill=${fill_price:.4f} pnl_krw={pnl_krw:+,.0f}")
+            logger.info(
+                f"[GAP2_US] SELL 전량체결→포지션 제거 {name}({code}) "
+                f"delta={delta_qty} fill=${fill_price:.4f} "
+                f"pnl_gross=${pnl_usd_gross:+.2f} fee=${_fee_usd:.2f} "
+                f"pnl_net=${pnl_usd_net:+.2f} pnl_krw={pnl_krw:+,.0f}"
+            )
         else:
             pg.qty -= delta_qty
             self._save_positions()
             self.pnl.record(pnl_krw)
-            logger.info(f"[GAP2_US] SELL 부분체결→포지션 유지 {name}({code}) delta={delta_qty} remaining={pg.qty} pnl_krw={pnl_krw:+,.0f}")
+            logger.info(
+                f"[GAP2_US] SELL 부분체결→포지션 유지 {name}({code}) "
+                f"delta={delta_qty} remaining={pg.qty} "
+                f"pnl_net=${pnl_usd_net:+.2f} pnl_krw={pnl_krw:+,.0f}"
+            )
 
     def _on_us_terminal(self, pending) -> None:
         """US pending 종료 콜백."""

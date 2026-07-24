@@ -2,8 +2,9 @@
 tools/verify_us_fill_path.py — US 체결조회 경로(TTTS3035R) 검증 도구
 
 목적:
-  GAP2 UsKisFillSource → us_broker.get_us_order_history_raw() →
+  GAP2 UsKisFillSource → us_broker.get_us_executed_orders_normalized() →
   us_broker.get_executed_orders() → TTTS3035R 응답 필드 매핑 검증.
+  ★ 주의: 실 KIS 응답 없이는 mock 검증임을 명시.
 
 실행 (실계좌 없이도 mock 으로 일부 검증 가능):
   cd stock_trader_v2
@@ -13,6 +14,15 @@ tools/verify_us_fill_path.py — US 체결조회 경로(TTTS3035R) 검증 도구
 출력:
   [PASS] / [FAIL] 항목별 결과
   최종 SUMMARY
+
+검증 항목:
+  - 주문번호(order_no) 존재 여부
+  - 종목코드(code) 매핑
+  - 매수/매도(side) 판별
+  - 누적체결수량(filled_qty) 추출
+  - 평균체결가(filled_price) 추출
+  - 부분체결 추가 delta 방출
+  ★ 실 KIS 연결 없는 mock 검증 — 실계좌 왕복은 --live 옵션 필요
 """
 import os
 import sys
@@ -57,14 +67,18 @@ except ImportError as e:
     check("broker.us_broker import OK", False, str(e))
 
 # ══════════════════════════════════════════════════════════════
-# 2. get_us_order_history_raw 메서드 존재 확인
+# 2. get_us_executed_orders_normalized 메서드 존재 확인 (MEDIUM-5)
 # ══════════════════════════════════════════════════════════════
-print("\n=== [2] us_broker.get_us_order_history_raw 메서드 존재 ===")
+print("\n=== [2] us_broker.get_us_executed_orders_normalized 메서드 존재 ===")
 
 try:
     from broker.us_broker import USBroker
+    has_normalized = hasattr(USBroker, "get_us_executed_orders_normalized")
+    check("USBroker.get_us_executed_orders_normalized 존재", has_normalized)
+
+    # deprecated alias도 하위호환 확인
     has_raw = hasattr(USBroker, "get_us_order_history_raw")
-    check("USBroker.get_us_order_history_raw 존재", has_raw)
+    check("USBroker.get_us_order_history_raw (deprecated alias) 존재", has_raw)
 
     has_exec = hasattr(USBroker, "get_executed_orders")
     check("USBroker.get_executed_orders 존재", has_exec)
@@ -81,10 +95,16 @@ class MockUSBroker:
     def __init__(self, rows):
         self._rows = rows
 
-    def get_us_order_history_raw(self, days=1):
+    def get_us_executed_orders_normalized(self, days=1):
         return self._rows
 
     def get_executed_orders(self, start_date="", end_date=""):
+        return self._rows
+
+    # deprecated alias
+    def get_us_order_history_raw(self, days=1):
+        import warnings
+        warnings.warn("deprecated", DeprecationWarning)
         return self._rows
 
 
@@ -239,8 +259,8 @@ if args.live:
         else:
             check("환경변수 설정됨", True)
             broker = USBroker(app_key, app_secret, acc_no, is_paper=False)
-            rows = broker.get_us_order_history_raw(days=1)
-            check("get_us_order_history_raw() 호출 성공",
+            rows = broker.get_us_executed_orders_normalized(days=1)
+            check("get_us_executed_orders_normalized() 호출 성공",
                   isinstance(rows, list), f"rows 타입={type(rows).__name__}")
             print(f"  → 체결 내역 {len(rows)}건")
             if rows:

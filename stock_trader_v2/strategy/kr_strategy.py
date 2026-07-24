@@ -1450,10 +1450,10 @@ class KRStrategy:
         """
         code       = pending.code
         name       = pending.name
-        delta_qty  = fill.qty
+        delta_qty  = fill.applied_qty   # AppliedFillEvent.applied_qty
         fill_price = fill.price or pending.req_price
         level      = pending.level or "FULL"
-        extra      = pending.extra or {}
+        extra      = getattr(pending, "extra", None) or {}
 
         if delta_qty <= 0:
             return
@@ -1493,12 +1493,13 @@ class KRStrategy:
         """
         KR SELL 체결 delta 콜백.
         delta 수량만큼 포지션 차감, 전량체결 시 포지션 제거 + pnl.record().
+        HIGH-3: NET 손익 계산 — executor._calc_net_pct()와 동일 수수료 기준.
         """
         code       = pending.code
         name       = pending.name
-        delta_qty  = fill.qty
+        delta_qty  = fill.applied_qty   # AppliedFillEvent.applied_qty
         fill_price = fill.price or 0.0
-        extra      = pending.extra or {}
+        extra      = getattr(pending, "extra", None) or {}
 
         if delta_qty <= 0:
             return
@@ -1512,8 +1513,15 @@ class KRStrategy:
             return
 
         avg_price  = pg.avg_price
-        pnl_per    = (fill_price - avg_price) * delta_qty if fill_price > 0 else 0.0
-        net_pct    = (fill_price - avg_price) / avg_price * 100 if avg_price > 0 and fill_price > 0 else 0.0
+        # HIGH-3: NET 손익 — executor._calc_net_pct()와 동일 기준
+        # fee = 매수 0.015% + 매도 0.015% + 증권거래세 0.20% = 0.23%
+        _net_fee_pct = 0.015 * 2 + 0.20   # % 단위 (executor._calc_net_pct 동일)
+        pnl_gross  = (fill_price - avg_price) * delta_qty if fill_price > 0 else 0.0
+        # 수수료 금액 = avg_price * delta_qty * fee_rate / 100
+        _fee_krw   = avg_price * delta_qty * (_net_fee_pct / 100) if avg_price > 0 else 0.0
+        pnl_per    = pnl_gross - _fee_krw   # NET 손익 (원)
+        net_pct    = (fill_price - avg_price) / avg_price * 100 - _net_fee_pct \
+                     if avg_price > 0 and fill_price > 0 else 0.0
 
         if delta_qty >= pg.qty:
             # 전량 체결 → 포지션 제거
@@ -1525,7 +1533,8 @@ class KRStrategy:
             logger.info(
                 f"[GAP2_KR] SELL 전량체결→포지션 제거 {name}({code}) "
                 f"qty={delta_qty} fill_price={fill_price:,.0f} "
-                f"pnl={pnl_per:+,.0f}원 net={net_pct:+.2f}%"
+                f"pnl_gross={pnl_gross:+,.0f}원 fee={_fee_krw:.0f}원 "
+                f"pnl_net={pnl_per:+,.0f}원 net_pct={net_pct:+.2f}%"
             )
         else:
             # 부분 체결 → 수량 차감, 포지션 유지
@@ -1535,7 +1544,7 @@ class KRStrategy:
             logger.info(
                 f"[GAP2_KR] SELL 부분체결→포지션 유지 {name}({code}) "
                 f"delta={delta_qty} remaining={pg.qty} "
-                f"fill_price={fill_price:,.0f} pnl={pnl_per:+,.0f}원"
+                f"fill_price={fill_price:,.0f} pnl_net={pnl_per:+,.0f}원"
             )
 
     def _on_kr_terminal(self, pending) -> None:
