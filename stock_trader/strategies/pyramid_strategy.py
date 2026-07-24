@@ -97,6 +97,12 @@ SELL_SCORE_PROTECTION_PCT = 1.0    # 이 이상 수익 시 SELL SCORE 즉시 매
 BUY_SCORE_EARLY          = 0.40   # 0.60 → 0.40 (빠른 선점 전략)
 BUY_SCORE_FULL           = 0.55   # 0.75 → 0.55 (빠른 선점 전략)
 
+# ── 현금 안전 버퍼 ────────────────────────────────────────────
+# 매수 예산 = 실제 주문가능현금 × CASH_SAFETY_BUFFER.
+# 지정가↔체결가 차이·호가단위·시장가 슬리피지를 흡수해 총 주문금액이
+# 실제 주문가능현금을 절대 초과하지 않도록 한다(신용·미수 미사용).
+CASH_SAFETY_BUFFER       = 0.995   # 0.5% 여유
+
 
 class PyramidStrategyManager:
     """
@@ -542,12 +548,9 @@ class PyramidStrategyManager:
             return {"action": "SKIP", "reason": f"현금 0원 (잔고조회 실패 추정)",
                     "code": code, "name": name}
 
-        # 무차입: 현금 이내 + 복리풀 포함
-        investable = min(
-            self.max_per_stock,
-            self.max_total,
-            cash + self.compound_pool,
-        )
+        # 종목당/전체 투자한도 제거 — 실제 주문가능현금 범위만 제한
+        # (compound_pool 미가산, 신용·미수 금지)
+        investable = max(0.0, cash) * CASH_SAFETY_BUFFER
         invest_amt = investable * cfg["invest_ratio"]   # 30%
 
         # ★ 최소 1주 보장
@@ -565,15 +568,6 @@ class PyramidStrategyManager:
 
         bc = calc_buy_cost(price, qty)
 
-        # 총 투자금 한도 체크
-        total_invested = sum(
-            p.avg_price * p.total_qty for p in self.positions.values()
-        )
-        if total_invested + bc.total_cost > self.max_total:
-            return {"action": "SKIP",
-                    "reason": f"전체 투자 한도 초과 (현재{total_invested:,.0f}원+신규{bc.total_cost:,.0f}원>한도{self.max_total:,.0f}원)",
-                    "code": code, "name": name}
-
         # ★ Early Entry vs Full Entry 구분
         action_label = "BUY_LEVEL1_FULL" if buy_score_norm >= BUY_SCORE_FULL else "BUY_LEVEL1_EARLY"
         entry_type   = "본진입(100%)" if buy_score_norm >= BUY_SCORE_FULL else "Early Entry(30%)"
@@ -585,23 +579,22 @@ class PyramidStrategyManager:
             qty_full = calc_buy_qty(invest_full, price, invest_ratio=1.0)
             if qty_full >= 1:
                 bc_full = calc_buy_cost(price, qty_full)
-                if total_invested + bc_full.total_cost <= self.max_total:
-                    return {
-                        "action":          "BUY_LEVEL1_FULL",
-                        "level":           1,
-                        "qty":             qty_full,
-                        "price":           price,
-                        "amount":          bc_full.buy_amount,
-                        "total_cost":      bc_full.total_cost,
-                        "buy_commission":  round(bc_full.commission, 0),
-                        "code":            code,
-                        "name":            name,
-                        "buy_score_norm":  buy_score_norm,
-                        "reason":          (f"피라미딩 1단계 {entry_type} "
-                                            f"(BUY SCORE {buy_score_norm:.2f}≥{BUY_SCORE_FULL}, "
-                                            f"투자금={bc_full.total_cost:,.0f}원)"),
-                        "using_compound":  min(self.compound_pool, bc_full.total_cost),
-                    }
+                return {
+                    "action":          "BUY_LEVEL1_FULL",
+                    "level":           1,
+                    "qty":             qty_full,
+                    "price":           price,
+                    "amount":          bc_full.buy_amount,
+                    "total_cost":      bc_full.total_cost,
+                    "buy_commission":  round(bc_full.commission, 0),
+                    "code":            code,
+                    "name":            name,
+                    "buy_score_norm":  buy_score_norm,
+                    "reason":          (f"피라미딩 1단계 {entry_type} "
+                                        f"(BUY SCORE {buy_score_norm:.2f}≥{BUY_SCORE_FULL}, "
+                                        f"투자금={bc_full.total_cost:,.0f}원)"),
+                    "using_compound":  0,  # 복리풀 매수여력 미가산(원칙 6)
+                }
 
         # Early Entry: 30% 진입
         return {
@@ -617,8 +610,8 @@ class PyramidStrategyManager:
             "buy_score_norm":  buy_score_norm,
             "reason":          (f"피라미딩 1단계 {entry_type} "
                                 f"(BUY SCORE {buy_score_norm:.2f}≥{BUY_SCORE_EARLY}, "
-                                f"투자금={bc.total_cost:,.0f}원, 복리풀 포함)"),
-            "using_compound":  min(self.compound_pool, bc.total_cost),
+                                f"투자금={bc.total_cost:,.0f}원, 현금기준)"),
+            "using_compound":  0,  # 복리풀 매수여력 미가산(원칙 6)
         }
 
     # ── Full Entry (나머지 70%) 추가 진입 ────────────────────
@@ -629,14 +622,10 @@ class PyramidStrategyManager:
             return {"action": "HOLD", "code": code, "name": name,
                     "level": pos.current_level, "reason": "Full Entry 이미 완료"}
 
-        # 현재 투자된 금액 (Early Entry 30%)
-        current_invested = pos.avg_price * pos.total_qty
-
-        # 나머지 70% 투자 가능 금액 계산
-        # max_per_stock 기준 100%에서 이미 투자한 30%를 뺀 나머지
-        investable      = min(self.max_per_stock, self.max_total)
-        full_invest_amt = investable * 0.70  # 나머지 70%
-        full_invest_amt = min(full_invest_amt, cash + self.compound_pool)
+        # Full 조건 충족 → 종목당/전체 한도 없이 '남은 주문가능현금' 전액 범위에서 추가.
+        # Early(30%) 후 남은 현금 전액까지 사용해 최종 현금 100%에 도달할 수 있게 한다.
+        # (compound_pool 미가산 — 원칙 6 / 신용·미수 금지)
+        full_invest_amt = max(0.0, cash) * CASH_SAFETY_BUFFER
 
         qty = calc_buy_qty(full_invest_amt, price, invest_ratio=1.0)
 
@@ -659,9 +648,9 @@ class PyramidStrategyManager:
             "code":           code,
             "name":           name,
             "net_pct":        round(net_pct, 2),
-            "reason":         (f"Full Entry 나머지 70% 추가 진입 "
+            "reason":         (f"Full Entry 남은현금 추가 진입 "
                                f"(BUY SCORE 달성, 투자금={bc.total_cost:,.0f}원)"),
-            "using_compound": min(self.compound_pool, bc.total_cost),
+            "using_compound": 0,  # 복리풀 매수여력 미가산(원칙 6)
         }
 
     # ── 추가 매수 ─────────────────────────────────────────────
@@ -672,12 +661,10 @@ class PyramidStrategyManager:
             return {"action": "HOLD", "code": code, "name": name,
                     "level": pos.current_level, "reason": f"{level}단계 이미 진입"}
 
-        investable    = min(
-            self.max_per_stock - pos.avg_price * pos.total_qty,
-            cash + self.compound_pool
-        )
-        invest_limit  = min(self.max_per_stock, self.max_total) * cfg["invest_ratio"]
-        invest_amt    = min(invest_limit, investable)
+        # 종목당/전체 한도 제거 — 남은 주문가능현금 × 단계비율만 사용
+        # (compound_pool 미가산 — 원칙 6 / 신용·미수 금지)
+        cash_budget   = max(0.0, cash) * CASH_SAFETY_BUFFER
+        invest_amt    = cash_budget * cfg["invest_ratio"]
 
         qty = calc_buy_qty(invest_amt, price, invest_ratio=1.0)
 
@@ -701,7 +688,7 @@ class PyramidStrategyManager:
             "net_pct":        round(net_pct, 2),
             "reason":         (f"피라미딩 {level}단계 추가 "
                                f"(실질{net_pct:+.2f}%, 지표{indicator_score}개)"),
-            "using_compound": min(self.compound_pool, bc.total_cost),
+            "using_compound": 0,  # 복리풀 매수여력 미가산(원칙 6)
         }
 
     # ── 포지션 반영 ──────────────────────────────────────────

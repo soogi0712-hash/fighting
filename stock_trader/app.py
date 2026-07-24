@@ -60,6 +60,9 @@ _loop_cash: float = 0.0
 _loop_balance: dict = {}
 _loop_balance_ts: float = 0.0
 _LOOP_BALANCE_TTL: float = 60.0   # 60초마다 재조회
+# ★ 실제 주문가능현금(ord_psbl_cash) — 루프 내 매수 시 사용액을 차감해
+#   같은 현금을 여러 종목에 중복 사용(미수)하는 것을 방지
+_loop_orderable_cash: float = 0.0
 
 # ── 해외주식 관심종목 (티커 기반) ──────────────────────────
 _us_watch_list   = []     # [{"symbol":"NVDA","name":"엔비디아","excd":"NASD"}, ...]
@@ -603,7 +606,7 @@ def _trading_loop():
 
     # ── 루프 공용 잔고: 60초 TTL 캐시 ──────────────────────────────
     # 루프 시작 / 60초 경과 시에만 KIS API 호출 (ETF·개별주 모두 재사용)
-    global _loop_cash, _loop_balance, _loop_balance_ts
+    global _loop_cash, _loop_balance, _loop_balance_ts, _loop_orderable_cash
     import time as _time_mod
     _now = _time_mod.time()
     if _now - _loop_balance_ts >= _LOOP_BALANCE_TTL or _loop_cash == 0:
@@ -611,6 +614,12 @@ def _trading_loop():
             _loop_balance    = _strategy_mgr.api.get_balance()
             _loop_cash       = float(_loop_balance.get("cash", 0))
             _loop_balance_ts = _now
+            # ★ 실제 주문가능현금(ord_psbl_cash) 조회 — 실패 시 예수금(cash)로 폴백
+            try:
+                _oc = float(_strategy_mgr.api.get_orderable_cash())
+            except Exception:
+                _oc = -1.0
+            _loop_orderable_cash = _oc if _oc >= 0 else _loop_cash
         except Exception as _be:
             _log(f"⚠️ 루프 잔고 조회 실패: {_be} — 이전 캐시값 유지", "warning")
     # 캐시값 0이면 경고
@@ -643,11 +652,19 @@ def _trading_loop():
                 continue
 
             # ── 개별주식 매매 (기존 로직) ──────────────────────
-            result = _strategy_mgr.run(stock, cached_cash=_loop_cash)
+            # ★ 실제 주문가능현금(루프 내 사용액 차감분)을 예산으로 전달
+            result = _strategy_mgr.run(
+                stock, cached_cash=_loop_orderable_cash,
+            )
             _last_signals[code] = result
             action = result.get("action", "HOLD")
 
             if action == "BUY":
+                # ★ 루프 내 사용액 차감 — 같은 현금을 다음 종목에서 중복 사용(미수) 방지
+                #    (수수료 포함 총주문금액 근사; 다음 루프엔 잔고 재조회로 정합)
+                _spent = float(result.get("price", 0)) * float(result.get("qty", 0))
+                _loop_orderable_cash = max(
+                    0.0, _loop_orderable_cash - _spent * (1.0 + 0.00015))
                 # 주문 직후 잔고 캐시 무효화 → 다음 루프에서 재조회
                 _loop_balance_ts = 0.0
                 _log(

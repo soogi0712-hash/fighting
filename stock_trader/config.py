@@ -16,6 +16,11 @@ class Config:
     KIS_IS_REAL = True
     BASE_URL    = "https://openapi.koreainvestment.com:9443"
 
+    # ── 실주문 전역 킬스위치 ─────────────────────────────────
+    # LIVE_ORDER_ENABLED=false(기본) 이면 KIS 실주문 API를 절대 호출하지 않는다.
+    # (매수/매도/정정취소/해외주문 전부 dry-run 처리 — 조회성 API는 정상 동작)
+    LIVE_ORDER_ENABLED = os.getenv("LIVE_ORDER_ENABLED", "false").lower() == "true"
+
     # ── 텔레그램 ─────────────────────────────────────────────
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")

@@ -520,6 +520,55 @@ class KISApi:
 
         return None  # 모든 검증 통과
 
+    # ══════════════════════════════════════════════════════════
+    # 실주문 전역 킬스위치 + 주문가능현금 조회
+    # ══════════════════════════════════════════════════════════
+    def _live_order_guard(self, desc: str) -> dict | None:
+        """LIVE_ORDER_ENABLED=false 이면 실주문 API 호출 없이 dry-run 응답 반환.
+
+        반환값이 None 이 아니면 호출부는 즉시 그 dict 를 반환해야 한다
+        (requests.post 등 실주문 네트워크 호출에 절대 도달하지 않음).
+        rt_cd='9' 이므로 다운스트림은 '미체결'로 처리 → 포지션/손익 오변경 없음.
+        """
+        if not Config.LIVE_ORDER_ENABLED:
+            logger.warning(f"🚫 [LIVE_ORDER_ENABLED=false] 실주문 미제출(dry-run): {desc}")
+            return {"rt_cd": "9",
+                    "msg1": "LIVE_ORDER_ENABLED=false — 주문 미제출(dry-run)",
+                    "_dry_run": True, "_live_disabled": True}
+        return None
+
+    def get_orderable_cash(self) -> float:
+        """실제 주문가능현금(ord_psbl_cash, 원). 조회 실패 시 -1.
+
+        inquire-psbl-order(TTTC8908R)의 ord_psbl_cash 를 우선 사용한다
+        (예수금 dnca_tot_amt 와 달리 미체결 예약금·정산을 반영한 값)."""
+        return float(self._get_cash_from_psbl_api())
+
+    def _reject_if_cash_exceeded(self, stock_code: str, qty: int,
+                                 price: float) -> dict | None:
+        """BUY 지정가 총주문금액(매수수수료 포함)이 주문가능현금을 초과하면
+        차단 dict 반환, 아니면 None. (신용·미수 미사용 — 현금 초과 원천 차단)"""
+        try:
+            from screener.transaction_cost import BUY_COMMISSION_RATE as _comm
+        except Exception:
+            _comm = 0.00015
+        orderable = self.get_orderable_cash()
+        if orderable is None or orderable < 0:
+            # 조회 실패 → 사이징 계층 방어에 위임(차단하지 않되 경고)
+            logger.warning(
+                f"[현금가드] 주문가능현금 조회 실패 — 사이징 방어에 위임 ({stock_code})")
+            return None
+        order_amt = price * qty * (1 + _comm)
+        if order_amt > orderable:
+            logger.error(
+                f"🚫 [현금초과 차단] {stock_code} 주문금액 {order_amt:,.0f}원 > "
+                f"주문가능현금 {orderable:,.0f}원 — 미수 방지 위해 제출 차단")
+            return {"rt_cd": "9",
+                    "msg1": (f"현금초과 차단(주문 {order_amt:,.0f}원 > "
+                             f"가능 {orderable:,.0f}원)"),
+                    "_cash_guard": True}
+        return None
+
     def _order(self, stock_code: str, order_type: str,
                qty: int, price: int = 0,
                ord_dvsn: str = None) -> dict:
@@ -535,6 +584,18 @@ class KISApi:
         ★ adaptive backoff: 500/EGW00201 발생 시 자동 간격 조정
         ★ 500 재시도: 3초 대기 → 10초 대기 → 종목 스킵 (즉시재시도 없음)
         """
+        # ── 실주문 킬스위치 (LIVE_ORDER_ENABLED=false → 미제출) ──
+        _guard = self._live_order_guard(f"{order_type} {stock_code} {qty}주 @{price}")
+        if _guard is not None:
+            return _guard
+
+        # ── 현금초과(미수) 사전 차단 — BUY 지정가에서만 검증 가능 ──
+        # 신용·미수 미사용: 총 주문금액이 실제 주문가능현금을 초과하면 제출 차단.
+        if order_type == "BUY" and price and price > 0 and qty and qty > 0:
+            _blocked = self._reject_if_cash_exceeded(stock_code, qty, price)
+            if _blocked is not None:
+                return _blocked
+
         # ── 중복 주문 쿨다운 체크 ────────────────────────────────
         last_order_ts = self._order_cooldown.get(stock_code, 0)
         elapsed_since_order = time.time() - last_order_ts
@@ -883,6 +944,9 @@ class KISApi:
         ord_dvsn  : 주문구분 (원래 주문과 동일하게)
         반환: KIS API 응답 dict (rt_cd=="0" 이면 취소 성공)
         """
+        _guard = self._live_order_guard(f"CANCEL {stock_code} odno={order_no}")
+        if _guard is not None:
+            return _guard
         url   = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-rvsecncl"
         tr_id = "TTTC0803U"
         acc_no, acc_prod = self.account_no.split("-") \
@@ -1474,6 +1538,9 @@ class KISApi:
           설정하고 OVRS_ORD_UNPR을 "0"으로 두면 자동환전으로 처리됨.
           단, KIS에서 원화결제 계좌 설정 필요.
         """
+        _guard = self._live_order_guard(f"BUY_US {symbol} {qty}주 @{price}")
+        if _guard is not None:
+            return _guard
         url   = f"{self.base_url}/uapi/overseas-stock/v1/trading/order"
         tr_id = "TTTT1002U"   # 실전 해외주식 매수
         acc_no, acc_prod = self.account_no.split("-") \
@@ -1551,6 +1618,9 @@ class KISApi:
           - 필요 KRW = price(USD) × 환율 × qty × 1.005 (수수료/환전 마진 0.5%)
         ─────────────────────────────────────────────────────────────────────
         """
+        _guard = self._live_order_guard(f"BUY_US_KRW {symbol} {qty}주 @{price}")
+        if _guard is not None:
+            return _guard
         logger.info(
             f"💱 [{symbol}] USD 잔고부족 → 원화 주문 시도 | 원인: {usd_fail_msg}"
         )
@@ -1702,6 +1772,9 @@ class KISApi:
           "00" + price>0 : 지정가 매도 (미국 기본, 현재가 지정)
         ★ KIS 해외주식은 시장가(price=0) 미지원 → 반드시 현재가 지정가로 주문
         """
+        _guard = self._live_order_guard(f"SELL_US {symbol} {qty}주 @{price}")
+        if _guard is not None:
+            return _guard
         url   = f"{self.base_url}/uapi/overseas-stock/v1/trading/order"
         tr_id = "TTTT1006U"   # 실전 해외주식 매도
         acc_no, acc_prod = self.account_no.split("-") \
