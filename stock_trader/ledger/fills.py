@@ -12,6 +12,7 @@ fills.py — 체결(Fill) 확인 소스
                    odno=주문번호)를 사용. LIVE_ORDER_ENABLED=false 면 빈 목록 반환
                    (이 단계에서는 절대 호출되지 않음).
 """
+import threading
 from dataclasses import dataclass
 
 
@@ -59,16 +60,22 @@ class CumulativeFillTracker:
     """
     def __init__(self):
         self._seen = {}   # key -> (cum_qty, cum_amount)
+        # ★ 원자성 보호: 두 poll 스레드가 동일 key 로 동시에 update() 를 호출해도
+        #   read-modify-write(_seen 갱신)를 직렬화하여 '동일 delta Fill 이중 생성'을 방지.
+        #   먼저 임계구역에 든 스레드가 델타를 consume 하면 _seen 이 전진하므로,
+        #   뒤이은 스레드는 dq<=0 → None(no-op) 이 된다.
+        self._lock = threading.Lock()
 
     def update(self, key, cum_qty, cum_amount, order_no=None, ts=None):
-        prev_q, prev_a = self._seen.get(key, (0, 0.0))
-        dq = cum_qty - prev_q
-        if dq <= 0:
-            return None                      # 신규 반영분 없음
-        da = cum_amount - prev_a
-        avg = (da / dq) if dq else 0.0
-        self._seen[key] = (cum_qty, cum_amount)
-        return Fill(order_no=(order_no or str(key)), qty=dq, price=avg, ts=ts)
+        with self._lock:
+            prev_q, prev_a = self._seen.get(key, (0, 0.0))
+            dq = cum_qty - prev_q
+            if dq <= 0:
+                return None                  # 신규 반영분 없음
+            da = cum_amount - prev_a
+            avg = (da / dq) if dq else 0.0   # 이번 delta 평균 체결가(로직 불변)
+            self._seen[key] = (cum_qty, cum_amount)
+            return Fill(order_no=(order_no or str(key)), qty=dq, price=avg, ts=ts)
 
 
 class KisFillSource(FillSource):
