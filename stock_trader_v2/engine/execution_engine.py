@@ -8,6 +8,12 @@ engine/execution_engine.py — 주문 실행 엔진 (V2)
   4. 매도 FAIL: 재진입 차단 선제 등록 (SELL_FAIL_예약)
   5. 이중 주문 방지: 종목별 쿨다운 10초
 
+★ GAP2 Feature Flag (ENABLE_GAP2):
+  - ENABLE_GAP2=true:  접수 성공 → "BUY_ACCEPTED"/"SELL_ACCEPTED" 반환
+                       → ExecutionBridge.register_accept()에 pending 등록
+                       → 포지션·손익은 실체결 delta 후 전략 콜백에서 반영
+  - ENABLE_GAP2=false: 기존 경로 그대로 ("BUY"/"SELL" 반환, 즉시 포지션 반영)
+
 ★ 주문 흐름:
   execute_buy() →  사전검증 → KRBroker.buy() → 결과 처리 → 포지션 등록
   execute_sell() → 사전검증 → KRBroker.sell() → 결과 처리 → guard 등록
@@ -33,6 +39,11 @@ _DATA_DIR    = os.path.join(os.path.dirname(__file__), "..", "data")
 _TRADELOG    = os.path.join(_DATA_DIR, "v2_trade_log.json")
 
 _ORDER_COOLDOWN_SEC = 10   # 동일 종목 주문 쿨다운
+
+
+def _is_gap2_enabled() -> bool:
+    """GAP2 Feature Flag — ENABLE_GAP2=true 이면 체결 기반 경로 활성화."""
+    return os.environ.get("ENABLE_GAP2", "false").lower() == "true"
 
 
 class ExecutionEngine:
@@ -138,8 +149,13 @@ class ExecutionEngine:
             f"[BUY_OK] {name}({code}) "
             f"qty={actual_qty} @{entry_price:,}원 | {reason}"
         )
+        # ── GAP2 Feature Flag ────────────────────────────────────
+        # ENABLE_GAP2=true: 접수 성공 → BUY_ACCEPTED 반환
+        #   포지션은 실체결 delta 콜백(on_buy_fill)에서 등록.
+        # ENABLE_GAP2=false: 기존 경로 → BUY 반환, 전략이 즉시 포지션 등록.
+        _action = "BUY_ACCEPTED" if _is_gap2_enabled() else "BUY"
         return {
-            "action":       "BUY",
+            "action":       _action,
             "code":         code,
             "name":         name,
             "price":        entry_price,
@@ -262,8 +278,13 @@ class ExecutionEngine:
             f"[SELL_OK] {name}({code}) "
             f"qty={sell_qty} net={net_pct:+.2f}% | {reason}"
         )
+        # ── GAP2 Feature Flag ────────────────────────────────────
+        # ENABLE_GAP2=true: 접수 성공 → SELL_ACCEPTED 반환
+        #   포지션 차감·손익은 실체결 delta 콜백(on_sell_fill)에서 반영.
+        # ENABLE_GAP2=false: 기존 경로 → SELL 반환, 전략이 즉시 포지션·손익 처리.
+        _action = "SELL_ACCEPTED" if _is_gap2_enabled() else "SELL"
         return {
-            "action":    "SELL",
+            "action":    _action,
             "code":      code,
             "name":      name,
             "price":     price,

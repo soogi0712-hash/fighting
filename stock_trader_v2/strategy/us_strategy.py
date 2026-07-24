@@ -56,6 +56,14 @@ from utils.v2_logger      import get_logger
 from adaptive.trade_recorder import TradeRecorder
 from adaptive.weight_adjuster import WeightAdjuster
 
+# ── GAP2 imports (Feature Flag 기반) ─────────────────────────
+try:
+    from engine.execution_bridge import ExecutionBridge
+    from engine.fills            import UsKisFillSource
+    _GAP2_MODULES_OK = True
+except ImportError:
+    _GAP2_MODULES_OK = False
+
 logger = get_logger("USStrategy")
 KST    = pytz.timezone("Asia/Seoul")
 
@@ -200,6 +208,22 @@ class USStrategy:
         self._pos_file = os.path.join(_DATA_DIR, "v2_us_positions.json")
         os.makedirs(_DATA_DIR, exist_ok=True)
         self._load_positions()
+
+        # ── GAP2 ExecutionBridge (US) ─────────────────────────
+        self._bridge: Optional["ExecutionBridge"] = None
+        self._gap2_enabled = (
+            os.environ.get("ENABLE_GAP2", "false").lower() == "true"
+            and _GAP2_MODULES_OK
+        )
+        if self._gap2_enabled:
+            _pending_path = os.path.join(_DATA_DIR, "pending_us.json")
+            self._bridge = ExecutionBridge(
+                market       = "US",
+                fill_source  = UsKisFillSource(broker),
+                pending_path = _pending_path,
+                logger       = logger,
+            )
+            logger.info("[USStrategy] GAP2 ExecutionBridge(US) 초기화 완료")
 
     # ════════════════════════════════════════════════════════════
     # 메인 루프 진입점
@@ -2632,3 +2656,88 @@ class USStrategy:
             f"[OVERNIGHT_CLOSE] 완료 — {closed}/{len(codes)}건 청산 성공"
         )
         return closed
+
+
+    # ════════════════════════════════════════════════════════════
+    # ■ GAP2: poll_fills — 실체결 delta → 포지션·손익 반영 (US)
+    # ════════════════════════════════════════════════════════════
+
+    def poll_fills(self) -> None:
+        """GAP2 체결 poll. ENABLE_GAP2=false면 즉시 반환."""
+        if not self._gap2_enabled or self._bridge is None:
+            return
+        try:
+            self._bridge.poll(
+                on_buy_fill  = self._on_us_buy_fill,
+                on_sell_fill = self._on_us_sell_fill,
+                on_terminal  = self._on_us_terminal,
+            )
+        except Exception as _e:
+            logger.error(f"[GAP2_US] poll_fills 예외: {_e}")
+
+    def _on_us_buy_fill(self, pending, fill) -> None:
+        """US BUY 체결 delta 콜백."""
+        code       = pending.code
+        name       = pending.name
+        delta_qty  = fill.qty
+        fill_price = fill.price or pending.req_price
+        extra      = pending.extra or {}
+        if delta_qty <= 0:
+            return
+        existing = self._positions.get(code)
+        if existing:
+            new_qty = existing.qty + delta_qty
+            new_avg = (existing.avg_price * existing.qty + fill_price * delta_qty) / new_qty
+            existing.qty = new_qty
+            existing.avg_price = new_avg
+            logger.info(f"[GAP2_US] BUY 추가체결 {name}({code}) delta={delta_qty} fill=${fill_price:.4f} new_qty={new_qty}")
+        else:
+            breakout_low = float(extra.get("breakout_low", 0))
+            self._positions[code] = PositionGuard(
+                code=code, name=name,
+                avg_price=fill_price, qty=delta_qty,
+                entry_time=datetime.now(KST),
+                breakout_low=breakout_low, market="US",
+            )
+            self._entry_stage[code] = pending.level or "FULL"
+            logger.info(f"[GAP2_US] BUY 체결→포지션 등록 {name}({code}) qty={delta_qty} fill=${fill_price:.4f}")
+        self._save_positions()
+
+    def _on_us_sell_fill(self, pending, fill) -> None:
+        """US SELL 체결 delta 콜백."""
+        code       = pending.code
+        name       = pending.name
+        delta_qty  = fill.qty
+        fill_price = fill.price or 0.0
+        extra      = pending.extra or {}
+        if delta_qty <= 0:
+            return
+        pg = self._positions.get(code)
+        if pg is None:
+            logger.warning(f"[GAP2_US] SELL 체결 콜백 — 포지션 없음 {name}({code}) (무시)")
+            return
+        avg_price = pg.avg_price
+        pnl_usd   = (fill_price - avg_price) * delta_qty if fill_price > 0 else 0.0
+        pnl_krw   = pnl_usd * self.usd_krw
+        if delta_qty >= pg.qty:
+            self._positions.pop(code, None)
+            self._entry_stage.pop(code, None)
+            self._trail_state.pop(code, None)
+            self._save_positions()
+            self.pnl.record(pnl_krw)
+            logger.info(f"[GAP2_US] SELL 전량체결→포지션 제거 {name}({code}) delta={delta_qty} fill=${fill_price:.4f} pnl_krw={pnl_krw:+,.0f}")
+        else:
+            pg.qty -= delta_qty
+            self._save_positions()
+            self.pnl.record(pnl_krw)
+            logger.info(f"[GAP2_US] SELL 부분체결→포지션 유지 {name}({code}) delta={delta_qty} remaining={pg.qty} pnl_krw={pnl_krw:+,.0f}")
+
+    def _on_us_terminal(self, pending) -> None:
+        """US pending 종료 콜백."""
+        code   = pending.code
+        name   = pending.name
+        status = pending.status
+        logger.info(f"[GAP2_US] pending 종료 {name}({code}) status={status} order_no={pending.order_no}")
+        if status in ("CANCELED", "REJECTED") and pending.side == "BUY":
+            self._entry_stage.pop(code, None)
+

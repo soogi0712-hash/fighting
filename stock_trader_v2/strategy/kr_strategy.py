@@ -50,6 +50,14 @@ from adaptive.trade_recorder import TradeRecorder, classify_signal
 from adaptive.weight_adjuster import WeightAdjuster
 from adaptive.trial_manager  import get_trial_manager
 
+# ── GAP2 imports (Feature Flag 기반) ─────────────────────────
+try:
+    from engine.execution_bridge import ExecutionBridge
+    from engine.fills            import KisFillSource
+    _GAP2_MODULES_OK = True
+except ImportError:
+    _GAP2_MODULES_OK = False
+
 logger = get_logger("KRStrategy")
 KST    = pytz.timezone("Asia/Seoul")
 
@@ -138,6 +146,22 @@ class KRStrategy:
         self._pos_file = os.path.join(_DATA_DIR, "v2_kr_positions.json")
         os.makedirs(_DATA_DIR, exist_ok=True)
         self._load_positions()
+
+        # ── GAP2 ExecutionBridge (KR) ─────────────────────────
+        self._bridge: Optional["ExecutionBridge"] = None
+        self._gap2_enabled = (
+            os.environ.get("ENABLE_GAP2", "false").lower() == "true"
+            and _GAP2_MODULES_OK
+        )
+        if self._gap2_enabled:
+            _pending_path = os.path.join(_DATA_DIR, "pending_kr.json")
+            self._bridge = ExecutionBridge(
+                market       = "KR",
+                fill_source  = KisFillSource(broker),
+                pending_path = _pending_path,
+                logger       = logger,
+            )
+            logger.info("[KRStrategy] GAP2 ExecutionBridge(KR) 초기화 완료")
 
     # ════════════════════════════════════════════════════════════
     # 메인 루프 진입점
@@ -482,6 +506,52 @@ class KRStrategy:
                 f"order_no={order_no} | "
                 f"사유={reason}"
             )
+
+        elif result.get("action") == "BUY_ACCEPTED":
+            # ── GAP2: 접수 성공 → PendingRegistry 등록, 포지션 미등록 ──
+            self._entry_stage[code] = stage_next
+            order_no     = result.get("order_no", "") or ""
+            breakout_low = self._get_breakout_low(candles_5m, cur_price)
+            entry_price_log = ord_price if ord_price > 0 else cur_price
+
+            if self._bridge:
+                # 중복 pending 차단 (동일 종목·방향 pending 존재 시 skip)
+                if self._bridge.has_open(code, "BUY"):
+                    logger.warning(
+                        f"[GAP2_KR] BUY pending 중복 차단 {name}({code}) "
+                        f"order_no={order_no}"
+                    )
+                else:
+                    self._bridge.register_accept(
+                        order_no    = order_no,
+                        code        = code,
+                        name        = name,
+                        side        = "BUY",
+                        level       = stage_next,
+                        req_qty     = qty,
+                        req_price   = float(entry_price_log),
+                        extra       = {
+                            "breakout_low": breakout_low,
+                            "strategy":     strategy,
+                        },
+                    )
+                    logger.info(
+                        f"[GAP2_KR] BUY 접수→pending 등록 {name}({code}) "
+                        f"qty={qty} order_no={order_no!r}"
+                    )
+            else:
+                logger.warning("[GAP2_KR] bridge 없음 — BUY_ACCEPTED 포지션 미등록")
+
+            # ★ [BUY_OK] 표준 로그 (접수 기준)
+            logger.info(
+                f"[BUY_ACCEPTED] 종목={name}({code}) | "
+                f"시장=KR | strategy={strategy} | "
+                f"단계={stage_next} | "
+                f"수량={qty}주 | "
+                f"진입가={entry_price_log:,}원 | "
+                f"order_no={order_no} | "
+                f"사유={reason}"
+            )
             # ★ [ENTRY_QUALITY] 진입 품질 상세 로그
             _pg_new = self._positions.get(code)
             _eff_stop = getattr(_pg_new, 'effective_stop', breakout_low)
@@ -755,6 +825,37 @@ class KRStrategy:
                 self._positions.pop(code, None)
                 self._entry_stage.pop(code, None)
                 self._save_positions()
+
+            elif result.get("action") == "SELL_ACCEPTED":
+                # ── GAP2: 접수 성공 → PendingRegistry 등록, 포지션 유지 ──
+                order_no = result.get("order_no", "") or ""
+                if self._bridge:
+                    if self._bridge.has_open(code, "SELL"):
+                        logger.warning(
+                            f"[GAP2_KR] SELL pending 중복 차단 {name}({code})"
+                        )
+                    else:
+                        self._bridge.register_accept(
+                            order_no  = order_no,
+                            code      = code,
+                            name      = name,
+                            side      = "SELL",
+                            level     = action,
+                            req_qty   = held_qty,
+                            req_price = float(cur_price),
+                            extra     = {
+                                "avg_price": avg_price,
+                                "pct":       pct,
+                                "reason":    reason,
+                            },
+                        )
+                        logger.info(
+                            f"[GAP2_KR] SELL 접수→pending 등록 {name}({code}) "
+                            f"qty={held_qty} order_no={order_no!r}"
+                        )
+                else:
+                    logger.warning("[GAP2_KR] bridge 없음 — SELL_ACCEPTED 포지션 유지")
+                # ★ pnl.record()는 체결 콜백(on_sell_fill)에서 호출
             return result
 
         return {
@@ -1291,7 +1392,169 @@ class KRStrategy:
                 except Exception as _re:
                     logger.debug(f"[KRStrategy-B] 진입 기록 실패: {_re}")
 
+        elif result.get("action") == "BUY_ACCEPTED":
+            # ── GAP2: 접수 성공 → PendingRegistry 등록 ──
+            self._entry_stage[code] = "FULL"
+            order_no     = result.get("order_no", "") or ""
+            breakout_low = self._get_breakout_low(candles_5m, cur_price)
+            entry_price_log = ord_price if ord_price > 0 else cur_price
+
+            if self._bridge:
+                if self._bridge.has_open(code, "BUY"):
+                    logger.warning(
+                        f"[GAP2_KR_B] BUY pending 중복 차단 {name}({code})"
+                    )
+                else:
+                    self._bridge.register_accept(
+                        order_no  = order_no,
+                        code      = code,
+                        name      = name,
+                        side      = "BUY",
+                        level     = "FULL",
+                        req_qty   = max_qty,
+                        req_price = float(entry_price_log),
+                        extra     = {"breakout_low": breakout_low, "strategy": "B"},
+                    )
+                    logger.info(
+                        f"[GAP2_KR_B] BUY 접수→pending 등록 {name}({code}) "
+                        f"qty={max_qty} order_no={order_no!r}"
+                    )
+
         return result
+
+    # ════════════════════════════════════════════════════════════
+    # ■ GAP2: poll_fills — 실체결 delta → 포지션·손익 반영
+    # ════════════════════════════════════════════════════════════
+
+    def poll_fills(self) -> None:
+        """
+        GAP2 체결 poll.
+        ENABLE_GAP2=false면 즉시 반환.
+        ExecutionBridge.poll()에 KR 전용 콜백을 주입해 실체결 delta를 처리한다.
+        """
+        if not self._gap2_enabled or self._bridge is None:
+            return
+        try:
+            self._bridge.poll(
+                on_buy_fill  = self._on_kr_buy_fill,
+                on_sell_fill = self._on_kr_sell_fill,
+                on_terminal  = self._on_kr_terminal,
+            )
+        except Exception as _e:
+            logger.error(f"[GAP2_KR] poll_fills 예외: {_e}")
+
+    def _on_kr_buy_fill(self, pending, fill) -> None:
+        """
+        KR BUY 체결 delta 콜백.
+        실체결 qty/price 기준으로 포지션 생성 또는 수량 증가.
+        """
+        code       = pending.code
+        name       = pending.name
+        delta_qty  = fill.qty
+        fill_price = fill.price or pending.req_price
+        level      = pending.level or "FULL"
+        extra      = pending.extra or {}
+
+        if delta_qty <= 0:
+            return
+
+        existing = self._positions.get(code)
+        if existing:
+            # 부분체결 추가 → 평균단가 재계산, 수량 증가
+            new_qty   = existing.qty + delta_qty
+            new_avg   = (existing.avg_price * existing.qty + fill_price * delta_qty) / new_qty
+            existing.qty       = new_qty
+            existing.avg_price = new_avg
+            logger.info(
+                f"[GAP2_KR] BUY 추가체결 {name}({code}) "
+                f"delta={delta_qty} fill_price={fill_price:,.0f} "
+                f"new_qty={new_qty} new_avg={new_avg:,.0f}"
+            )
+        else:
+            # 최초 체결 → PositionGuard 신규 등록
+            breakout_low = float(extra.get("breakout_low", 0))
+            self._positions[code] = PositionGuard(
+                code         = code,
+                name         = name,
+                avg_price    = fill_price,
+                qty          = delta_qty,
+                entry_time   = datetime.now(KST),
+                breakout_low = breakout_low,
+            )
+            self._entry_stage[code] = level
+            logger.info(
+                f"[GAP2_KR] BUY 체결→포지션 등록 {name}({code}) "
+                f"qty={delta_qty} fill_price={fill_price:,.0f} "
+                f"breakout_low={breakout_low:,.0f}"
+            )
+        self._save_positions()
+
+    def _on_kr_sell_fill(self, pending, fill) -> None:
+        """
+        KR SELL 체결 delta 콜백.
+        delta 수량만큼 포지션 차감, 전량체결 시 포지션 제거 + pnl.record().
+        """
+        code       = pending.code
+        name       = pending.name
+        delta_qty  = fill.qty
+        fill_price = fill.price or 0.0
+        extra      = pending.extra or {}
+
+        if delta_qty <= 0:
+            return
+
+        pg = self._positions.get(code)
+        if pg is None:
+            logger.warning(
+                f"[GAP2_KR] SELL 체결 콜백 — 포지션 없음 {name}({code}) "
+                f"delta={delta_qty} (무시)"
+            )
+            return
+
+        avg_price  = pg.avg_price
+        pnl_per    = (fill_price - avg_price) * delta_qty if fill_price > 0 else 0.0
+        net_pct    = (fill_price - avg_price) / avg_price * 100 if avg_price > 0 and fill_price > 0 else 0.0
+
+        if delta_qty >= pg.qty:
+            # 전량 체결 → 포지션 제거
+            reason = extra.get("reason", "GAP2_SELL_FULL")
+            self._positions.pop(code, None)
+            self._entry_stage.pop(code, None)
+            self._save_positions()
+            self.pnl.record(float(pnl_per))
+            logger.info(
+                f"[GAP2_KR] SELL 전량체결→포지션 제거 {name}({code}) "
+                f"qty={delta_qty} fill_price={fill_price:,.0f} "
+                f"pnl={pnl_per:+,.0f}원 net={net_pct:+.2f}%"
+            )
+        else:
+            # 부분 체결 → 수량 차감, 포지션 유지
+            pg.qty -= delta_qty
+            self._save_positions()
+            self.pnl.record(float(pnl_per))
+            logger.info(
+                f"[GAP2_KR] SELL 부분체결→포지션 유지 {name}({code}) "
+                f"delta={delta_qty} remaining={pg.qty} "
+                f"fill_price={fill_price:,.0f} pnl={pnl_per:+,.0f}원"
+            )
+
+    def _on_kr_terminal(self, pending) -> None:
+        """
+        KR pending 종료 콜백 (CANCELED/REJECTED/RECOVERY_REQUIRED).
+        미체결 취소 시 BUY는 포지션 미등록 상태 유지, SELL은 포지션 복원.
+        """
+        code   = pending.code
+        name   = pending.name
+        status = pending.status
+        logger.info(
+            f"[GAP2_KR] pending 종료 {name}({code}) status={status} "
+            f"order_no={pending.order_no}"
+        )
+        if status in ("CANCELED", "REJECTED") and pending.side == "BUY":
+            # BUY 취소: entry_stage 초기화 (포지션 미등록 상태 유지)
+            self._entry_stage.pop(code, None)
+            logger.info(f"[GAP2_KR] BUY 취소→entry_stage 초기화 {name}({code})")
+        # RECOVERY_REQUIRED: 상태 불명 — 포지션 건드리지 않고 로그만
 
     # ── 유틸 ─────────────────────────────────────────────────
 

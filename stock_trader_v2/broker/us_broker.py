@@ -1085,6 +1085,32 @@ class USBroker(KISBase):
                 continue
         return results
 
+    def get_us_order_history_raw(self, days: int = 1) -> list:
+        """
+        GAP2 UsKisFillSource용 — TTTS3035R 원본 응답 rows 반환 (래퍼).
+
+        get_executed_orders()의 정규화된 dict 대신,
+        KIS API 원본 필드(odno, pdno, ft_ccld_qty, ft_ccld_unpr3,
+        sll_buy_dvsn_cd 등)가 필요한 경우에 사용.
+
+        실제로는 get_executed_orders()가 이미 원본을 파싱해 반환하므로,
+        UsKisFillSource에서 후보키로 방어적 매핑이 가능하다.
+        이 메서드는 get_executed_orders() 결과를 그대로 반환한다.
+
+        Returns:
+            list[dict] — get_executed_orders() 반환값과 동일한 구조.
+            fields: order_no, code, name, side, qty, price,
+                    filled_qty, filled_price, filled_time, exch_cd, market
+        """
+        from datetime import date as _date
+        today = _date.today().strftime("%Y%m%d")
+        if days > 1:
+            from datetime import timedelta
+            start = (_date.today() - timedelta(days=days - 1)).strftime("%Y%m%d")
+        else:
+            start = today
+        return self.get_executed_orders(start_date=start, end_date=today)
+
     # ════════════════════════════════════════════════════════════
     # 10. 주문 사전 검증
     # ════════════════════════════════════════════════════════════
