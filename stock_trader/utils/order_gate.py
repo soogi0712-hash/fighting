@@ -28,7 +28,40 @@ _state = {
     "kill_reason": None,
     "cancel_fail_count": 0,
     "last_pending_count": None,
+    # RECONCILIATION_REQUIRED: 계좌↔내부 포지션 불일치 등 불확실 상태.
+    # 신규 BUY 만 차단(매도/보유관리는 계속). 삭제 없이 quarantine.
+    "reconciliation_required": False,
+    "reconciliation_reason": None,
+    "reconciliation_codes": [],
 }
+
+
+def set_reconciliation_required(reason: str, codes=None):
+    """포지션 불일치 등 불확실 상태 표시 → 신규 BUY 차단(삭제 금지)."""
+    with _lock:
+        _state["reconciliation_required"] = True
+        _state["reconciliation_reason"] = str(reason)
+        if codes:
+            cur = set(_state.get("reconciliation_codes") or [])
+            cur.update(codes)
+            _state["reconciliation_codes"] = sorted(cur)
+
+
+def clear_reconciliation():
+    """불일치 해소(근거 확인 후 수동/자동 해제)."""
+    with _lock:
+        _state["reconciliation_required"] = False
+        _state["reconciliation_reason"] = None
+        _state["reconciliation_codes"] = []
+
+
+def reconciliation_status() -> dict:
+    with _lock:
+        return {
+            "required": bool(_state["reconciliation_required"]),
+            "reason":   _state["reconciliation_reason"],
+            "codes":    list(_state["reconciliation_codes"] or []),
+        }
 
 
 def kill_active() -> bool:

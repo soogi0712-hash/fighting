@@ -1821,18 +1821,34 @@ def _watchdog():
     # W4: 포지션 불일치 (내부 있음 + KIS qty=0)
     # ══════════════
     removed_by_watchdog = []
+    _quarantined = []
+    _bal_age = None
+    try:
+        import time as _t3
+        _bal_age = round(_t3.time() - _loop_balance_ts, 1)
+    except Exception:
+        pass
     for code, pos in list(positions.items()):
         kis_q = kis_qty.get(code, 0)
         int_q = pos.total_qty
         if kis_q == 0 and int_q > 0:
+            # ★ 강제 삭제 금지(B). 잔고캐시 지연·API 누락·미체결/부분체결 가능성이
+            #   있으므로 삭제 대신 RECONCILIATION_REQUIRED 로 격리하고 신규 BUY 만 차단.
+            #   근거가 확인된 뒤에만(수동/후속 재조회) 포지션을 조정한다.
+            from utils import order_gate as _og
+            _og.set_reconciliation_required(
+                reason=(f"포지션 불일치: {pos.name}({code}) 내부={int_q}주 KIS=0주 "
+                        f"(잔고캐시경과={_bal_age}s). 삭제하지 않고 격리 — "
+                        f"미체결/부분체결/잔고지연 확인 필요"),
+                codes=[code],
+            )
             _log(
-                f"🚨 [Watchdog W4] 포지션 불일치 감지! "
-                f"{pos.name}({code}) 내부={int_q}주 KIS=0주 "
-                f"→ 내부 포지션 강제 제거 (수동청산 추정)",
+                f"🟠 [Watchdog W4] 포지션 불일치 → 격리(RECONCILIATION_REQUIRED). "
+                f"{pos.name}({code}) 내부={int_q}주 KIS=0주 (캐시경과={_bal_age}s) "
+                f"→ 삭제 안 함, 신규 BUY 차단. 근거 확인 후 수동 해제.",
                 "error"
             )
-            pyramid_obj.positions.pop(code, None)
-            removed_by_watchdog.append(code)
+            _quarantined.append(code)
         elif kis_q > 0 and int_q == 0:
             _log(
                 f"⚠️ [Watchdog W4] 미등록 KIS 보유 감지: "
@@ -2500,7 +2516,20 @@ def api_status():
         "us_watch_list":     _us_watch_list,
         "us_positions":      _us_strategy.positions if _us_strategy else {},
         "us_tradeable":      us_sess["tradeable"],
+        # ── 안전/복구 상태 (운영 통합 확인용) ──
+        "live_order_enabled": Config.LIVE_ORDER_ENABLED,
+        "kill_switch":        _safe_call(lambda: __import__("utils.order_gate", fromlist=["kill_active"]).kill_active()),
+        "reconciliation":     _safe_call(lambda: __import__("utils.order_gate", fromlist=["reconciliation_status"]).reconciliation_status()),
+        "recovery_mode":      _safe_call(lambda: __import__("strategies.recovery_mode", fromlist=["get_recovery_gate"]).get_recovery_gate().snapshot()),
+        "daily_pnl":          _safe_call(lambda: _strategy_mgr.get_daily_pnl_status() if _strategy_mgr else None),
     })
+
+
+def _safe_call(fn):
+    try:
+        return fn()
+    except Exception as _e:
+        return {"error": str(_e)}
 
 @app.route("/api/session")
 def api_session():

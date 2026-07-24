@@ -1714,6 +1714,58 @@ class USStrategyManager:
             return {"action": "BUY_FAIL", "symbol": symbol, "name": name,
                     "reason": f"잔고부족: {capacity_msg}", "session": sess["session"]}
 
+        # ── ★ RECONCILIATION_REQUIRED: 불확실 상태 시 신규 BUY 차단 ──
+        try:
+            from utils import order_gate as _og
+            _rec = _og.reconciliation_status()
+            if _rec["required"]:
+                logger.warning(f"🟠 [Reconciliation] 미국 신규매수 차단 {symbol}: {_rec['reason']}")
+                return {"action": "BUY_FAIL", "symbol": symbol, "name": name,
+                        "reason": f"RECONCILIATION_REQUIRED: {_rec['reason']}",
+                        "session": sess["session"]}
+        except Exception:
+            pass
+
+        # ── ★ Recovery Mode: 미국 신규매수 게이트 ─────────────
+        try:
+            from strategies.recovery_mode import get_recovery_gate, BuyContext
+            _rg = get_recovery_gate()
+            if _rg.config.enabled:
+                # 계좌평가액(USD) + 환율(strict; 미확보 시 차단)
+                try:
+                    _bal = self.api.get_us_balance() or {}
+                    _equity_usd = float(_bal.get("total_eval_usd",
+                                         _bal.get("eval_usd", _bal.get("usd", 0))) or 0)
+                except Exception:
+                    _equity_usd = 0.0
+                _fx = None
+                try:
+                    _fx = self.api.get_usd_exchange_rate(strict=True)
+                except Exception:
+                    _fx = None
+                _fx_ok = (_fx is not None and _fx > 0)
+                _krw_limit_usd = (_rg.config.daily_loss_krw / _fx) if _fx_ok else None
+                _has_pos = symbol in getattr(self, "positions", {})
+                _ctx = BuyContext(
+                    market="US", code=symbol, has_position=_has_pos,
+                    open_position_count=len(getattr(self, "positions", {})),
+                    intended_cost=float(qty) * float(cur_price),
+                    account_equity=_equity_usd,
+                    is_averaging_down=_has_pos,
+                    daily_realized_loss=float(getattr(self.pnl_guard, "realized_pnl", 0.0)),
+                    fx_ok=_fx_ok, daily_loss_limit_ccy=_krw_limit_usd,
+                )
+                _ok, _why = _rg.check_new_buy(_ctx)
+                if not _ok:
+                    logger.warning(f"🛟 [Recovery] 미국 신규매수 차단 {symbol}: {_why}")
+                    return {"action": "BUY_FAIL", "symbol": symbol, "name": name,
+                            "reason": _why, "session": sess["session"]}
+        except Exception as _re:
+            logger.error(f"[Recovery] 미국 게이트 오류 → 안전차단 {symbol}: {_re}")
+            return {"action": "BUY_FAIL", "symbol": symbol, "name": name,
+                    "reason": f"Recovery 게이트 오류 → 안전차단: {_re}",
+                    "session": sess["session"]}
+
         # allow_krw_order=True → USD 실패 시 KIS 내부에서 원화 자동환전 재시도
         result   = self.api.buy_us(symbol, qty, cur_price, excd, allow_krw_order=True)
         order_ok = result.get("rt_cd") == "0"
@@ -1787,6 +1839,17 @@ class USStrategyManager:
             avg_p   = pos.avg_price if pos else cur_price
             pnl_usd = (cur_price - avg_p) * qty
             pnl_pct = (cur_price - avg_p) / avg_p * 100 if avg_p > 0 else 0.0
+
+            # ★ Recovery Mode 손익 반영 (미국이 recovery 시장일 때).
+            #   전량매도(왕복 완결) 시에만 record_sell — 부분매도는 왕복 미완결.
+            try:
+                from strategies.recovery_mode import get_recovery_gate
+                _rg = get_recovery_gate()
+                if _rg.config.enabled and _rg.config.market == "US" and not (
+                        is_partial and pos and pos.qty > qty):
+                    _rg.state.record_sell(symbol, pnl_usd)
+            except Exception:
+                pass
 
             if is_partial and pos and pos.qty > qty:
                 # 부분 익절: 수량만 줄이고 포지션 유지

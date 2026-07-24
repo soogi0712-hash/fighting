@@ -427,6 +427,48 @@ class StrategyManager:
                 "peak_pnl":    self.pnl_guard.peak_pnl,
             }
 
+        # ── ★ RECONCILIATION_REQUIRED: 불확실 상태 시 신규 BUY 차단 ──
+        if action.startswith("BUY"):
+            try:
+                from utils import order_gate as _og
+                _rec = _og.reconciliation_status()
+                if _rec["required"]:
+                    logger.warning(f"🟠 [Reconciliation] 신규매수 차단 {name}({code}): {_rec['reason']}")
+                    return {"action": "SKIP", "code": code, "name": name,
+                            "reason": f"RECONCILIATION_REQUIRED: {_rec['reason']}",
+                            "session": sess["session"]}
+            except Exception:
+                pass
+
+        # ── ★ Recovery Mode: 신규 매수 게이트 (KR) ─────────────
+        # RECOVERY_MODE=true 이고 허용시장이 US 면 국내 신규매수 전면 차단.
+        # (매도/보유관리는 영향 없음 — BUY 계열에만 적용)
+        if action.startswith("BUY"):
+            try:
+                from strategies.recovery_mode import get_recovery_gate, BuyContext
+                _rg = get_recovery_gate()
+                if _rg.config.enabled:
+                    _ctx = BuyContext(
+                        market="KR", code=code, has_position=(pos is not None),
+                        open_position_count=len(self.pyramid.positions),
+                        intended_cost=float(decision.get("total_cost", 0) or 0),
+                        account_equity=float(cash) + sum(
+                            p.avg_price * p.total_qty for p in self.pyramid.positions.values()),
+                        is_averaging_down=(pos is not None),
+                        daily_realized_loss=float(self.pnl_guard.realized_pnl),
+                        fx_ok=True, daily_loss_limit_ccy=_rg.config.daily_loss_krw,
+                    )
+                    _ok, _why = _rg.check_new_buy(_ctx)
+                    if not _ok:
+                        logger.warning(f"🛟 [Recovery] 국내 신규매수 차단 {name}({code}): {_why}")
+                        return {"action": "SKIP", "code": code, "name": name,
+                                "reason": _why, "session": sess["session"]}
+            except Exception as _re:
+                logger.error(f"Recovery 게이트 오류(무시하지 않고 차단): {_re}")
+                return {"action": "SKIP", "code": code, "name": name,
+                        "reason": f"Recovery 게이트 오류 → 안전차단: {_re}",
+                        "session": sess["session"]}
+
         # ── ★ 15:20 이후 신규 매수 절대 차단 (세션 + 시각 이중 방어) ──
         if action.startswith("BUY"):
             _sess_allow = sess.get("allow_new_buy", False)
@@ -764,6 +806,15 @@ class StrategyManager:
                 # ★ DailyPnLGuard 손익 기록 (상태 자동 평가)
                 self.pnl_guard.record(net_profit_amt)
                 pnl_status = self.pnl_guard.status_dict()
+
+                # ★ Recovery Mode 손익 반영 (해당 시장이 recovery 시장일 때만)
+                try:
+                    from strategies.recovery_mode import get_recovery_gate
+                    _rg = get_recovery_gate()
+                    if _rg.config.enabled and _rg.config.market == "KR":
+                        _rg.state.record_sell(code, net_profit_amt)
+                except Exception:
+                    pass
 
                 # ── 매도 로그 (매도 사유 포함 14항목) ─
                 logger.info(

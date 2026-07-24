@@ -325,6 +325,35 @@ class PendingRegistry:
         with self._lock:
             self._orders.clear()
 
+    # ── 영속(재시작 복구용) ─────────────────────────────────
+    def save_to(self, path) -> None:
+        """전체 주문을 JSON 으로 저장(재시작 복구용). 비-종결·종결 모두 저장."""
+        import json, os
+        with self._lock:
+            data = {k: vars(v).copy() for k, v in self._orders.items()}
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)   # 원자적 교체
+
+    def load_from(self, path) -> int:
+        """JSON 에서 주문 복원. 반환: 로드된 주문 수. 파일 없으면 0."""
+        import json, os
+        if not os.path.exists(path):
+            return 0
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        n = 0
+        with self._lock:
+            for k, d in (raw or {}).items():
+                try:
+                    self._orders[k] = PendingOrder(**d)
+                    n += 1
+                except Exception:
+                    continue
+        return n
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._orders)

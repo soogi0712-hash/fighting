@@ -1908,9 +1908,12 @@ class KISApi:
             logger.error(f"해외 잔고 조회 실패: {e}")
             return {"holdings": [], "total_eval": 0, "cash_usd": 0, "total_profit": 0}
 
-    def get_usd_exchange_rate(self) -> float:
+    def get_usd_exchange_rate(self, strict: bool = False):
         """
         USD/KRW 환율 조회 (KST 기준 당일 환율)
+
+        strict=True 이면 모든 조회 실패 시 임의 기본값(1300)을 쓰지 않고
+        None 을 반환한다(Recovery Mode 의 '환율 미확보 시 신규주문 차단' 용).
 
         방법 1: KIS API  inquire-daily-chartprice
           - TR_ID : FHKST03030100
@@ -1990,6 +1993,9 @@ class KISApi:
         except Exception as e:
             logger.warning(f"⚠️ ExchangeRate-API 실패: {e}")
 
+        if strict:
+            logger.error("❌ 모든 환율 조회 실패 → strict 모드: None 반환(신규주문 차단용)")
+            return None
         logger.error("❌ 모든 환율 조회 실패 → 기본값 1300 사용")
         return 1300.0    # 최후 안전 기본값
 
