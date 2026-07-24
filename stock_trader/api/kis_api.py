@@ -2032,3 +2032,46 @@ class KISApi:
         except Exception as e:
             logger.error(f"체결 내역 조회 실패: {e}")
             return []
+
+    def get_us_order_history_raw(self, days: int = 1, ccld_dvsn: str = "00") -> list[dict]:
+        """
+        해외주식 주문체결내역 원본(output) 반환 — TTTS3035R (inquire-ccnl).
+
+        ★ 필드명을 추측해 매핑하지 않는다: KIS 원본 dict 리스트를 그대로 돌려주고,
+          체결 delta 매핑은 UsKisFillSource 가 후보키로 방어적으로 수행한다.
+          verify_us_fill_path.py 가 이 원본(민감정보 제거)을 출력해 로컬에서
+          실제 필드명을 확인할 수 있게 한다.
+        읽기 전용(주문 아님) — LIVE 게이트 없음. 실패 시 [].
+        """
+        url   = f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-ccnl"
+        tr_id = "TTTS3035R"   # 실전 해외주식 주문체결내역
+        acc_no, acc_prod = self.account_no.split("-") \
+            if "-" in self.account_no else (self.account_no, "01")
+        start = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+        end   = datetime.now().strftime("%Y%m%d")
+        params = {
+            "CANO":            acc_no,
+            "ACNT_PRDT_CD":    acc_prod,
+            "PDNO":            "",
+            "ORD_STRT_DT":     start,
+            "ORD_END_DT":      end,
+            "SLL_BUY_DVSN_CD": "00",       # 00 전체
+            "CCLD_NCCS_DVSN":  ccld_dvsn,  # 00 전체 / 01 체결 / 02 미체결
+            "OVRS_EXCG_CD":    "",         # 전체 거래소
+            "SORT_SQN":        "DS",
+            "ORD_DT":          "",
+            "ORD_GNO_BRNO":    "",
+            "ODNO":            "",
+            "CTX_AREA_NK200":  "",
+            "CTX_AREA_FK200":  "",
+        }
+        try:
+            resp = requests.get(url, headers=self._headers(tr_id),
+                                params=params, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            out = data.get("output") or data.get("output1") or []
+            return out if isinstance(out, list) else []
+        except Exception as e:
+            logger.error(f"해외주식 체결내역 조회 실패(TTTS3035R): {e}")
+            return []

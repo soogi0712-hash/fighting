@@ -655,6 +655,65 @@ class USStrategyManager:
             "prime_scan_done": set(),  # 완료된 초기 스캔 타임 (22:31, 22:33, 22:35, 22:40)
         }
 
+        # ── ★ GAP2 실행 배선: 접수→pending→체결 delta 반영 (미국) ──
+        self.exec_bridge = None
+        try:
+            import os as _os
+            from strategies.execution_bridge import ExecutionBridge
+            from ledger.fills import UsKisFillSource
+            _pend = _os.path.join(_os.path.dirname(__file__), "..", "data", "pending_us.json")
+            self.exec_bridge = ExecutionBridge("US", UsKisFillSource(self.api), _pend, logger=logger)
+            n = self.exec_bridge.restore()
+            if n:
+                logger.info(f"🔁 [US] pending 주문 {n}건 복구")
+        except Exception as e:
+            logger.error(f"ExecutionBridge(US) 초기화 실패: {e}")
+
+    # ── ★ GAP2: 매 tick 체결 폴링 → 실제 체결 delta 만 반영 (미국) ──
+    def poll_fills(self):
+        if self.exec_bridge is None:
+            return None
+
+        def _on_buy(ev):
+            cur = self.pos_mgr.positions.get(ev.code)
+            if cur is None:
+                self.pos_mgr.add(USPosition(ev.code, ev.name, "", ev.applied_qty, ev.price))
+            else:
+                new_qty = cur.qty + ev.applied_qty
+                new_avg = (cur.avg_price * cur.qty + ev.price * ev.applied_qty) / new_qty
+                self.pos_mgr.update(ev.code, new_qty, new_avg, cur.current_level)
+            logger.info(f"✅ [US체결-BUY] {ev.code} +{ev.applied_qty}주 @${ev.price:.2f} "
+                        f"(잔여 {ev.remaining_qty}, 전량={ev.became_filled})")
+
+        def _on_sell(ev):
+            cur = self.pos_mgr.positions.get(ev.code)
+            avg_p = cur.avg_price if cur else ev.price
+            pnl_usd = (ev.price - avg_p) * ev.applied_qty
+            if cur is not None:
+                if ev.became_filled or cur.qty <= ev.applied_qty:
+                    self.pos_mgr.remove(ev.code)
+                else:
+                    self.pos_mgr.update(ev.code, cur.qty - ev.applied_qty, avg_p, cur.current_level)
+            try:
+                self.pnl_guard.record(pnl_usd)
+            except Exception:
+                pass
+            try:
+                from strategies.recovery_mode import get_recovery_gate
+                _rg = get_recovery_gate()
+                if _rg.config.enabled and _rg.config.market == "US" and ev.became_filled:
+                    _rg.state.record_sell(ev.code, pnl_usd)
+            except Exception:
+                pass
+            logger.info(f"✅ [US체결-SELL] {ev.code} -{ev.applied_qty}주 @${ev.price:.2f} "
+                        f"PnL ${pnl_usd:+.2f} (잔여 {ev.remaining_qty}, 전량={ev.became_filled})")
+
+        try:
+            return self.exec_bridge.poll(_on_buy, _on_sell, timeout_sec=15)
+        except Exception as e:
+            logger.error(f"[US] poll_fills 오류: {e}")
+            return None
+
     def set_realtime_cache(self, cache: dict):
         self._rt_cache = cache or {}
 
@@ -1714,6 +1773,12 @@ class USStrategyManager:
             return {"action": "BUY_FAIL", "symbol": symbol, "name": name,
                     "reason": f"잔고부족: {capacity_msg}", "session": sess["session"]}
 
+        # ── ★ 미체결 매수주문 존재 시 중복 매수 차단(pending) ──
+        if self.exec_bridge is not None and self.exec_bridge.has_open(symbol, "BUY"):
+            logger.info(f"⏳ [US pending] {symbol} 미체결 매수주문 존재 → 신규 매수 보류")
+            return {"action": "BUY_FAIL", "symbol": symbol, "name": name,
+                    "reason": "미확정 매수주문 존재(체결대기)", "session": sess["session"]}
+
         # ── ★ RECONCILIATION_REQUIRED: 불확실 상태 시 신규 BUY 차단 ──
         try:
             from utils import order_gate as _og
@@ -1784,36 +1849,31 @@ class USStrategyManager:
                 logger.warning(f"💸 {symbol} 원화환전 후에도 잔고부족: {fail_msg}")
                 return {"action": "BUY_FAIL", "symbol": symbol, "name": name,
                         "reason": f"잔고부족(원화시도후): {fail_msg}", "session": sess["session"]}
-            # 기타 오류 → 잔고 재확인
-            logger.warning(f"⚠️ {symbol} 주문실패 → 잔고재확인: {fail_msg}")
-            try:
-                bal   = self.api.get_us_balance()
-                h_map = {h["symbol"]: h for h in bal.get("holdings", [])}
-                if symbol in h_map:
-                    h  = h_map[symbol]
-                    aq = int(h.get("qty", qty));  ap = float(h.get("avg_price", cur_price))
-                    pos = USPosition(symbol, name, excd, aq, ap)
-                    self.pos_mgr.add(pos)
-                    logger.info(f"✅ {symbol} 잔고확인 자동등록 {aq}주")
-                    return self._buy_result(symbol, name, excd, ap, aq, 1, sess, iv,
-                                            entry_reason, "[잔고확인자동등록]")
-                return {"action": "BUY_FAIL", "symbol": symbol, "name": name,
-                        "reason": fail_msg or "주문실패", "session": sess["session"]}
-            except Exception as e2:
-                return {"action": "BUY_FAIL", "symbol": symbol, "name": name,
-                        "reason": str(e2), "session": sess["session"]}
+            # 접수 실패 → 내부 상태 변경 없음(포지션/pending 미생성). 잔고자동등록 제거.
+            logger.warning(f"⚠️ {symbol} 매수 접수 실패 → 상태 변경 없음: {fail_msg}")
+            return {"action": "BUY_FAIL", "symbol": symbol, "name": name,
+                    "reason": fail_msg or "주문실패", "session": sess["session"]}
 
-        pos = USPosition(symbol, name, excd, qty, cur_price)
-        self.pos_mgr.add(pos)
-        # ── [US OPEN SCAN] 첫 매수 기록 ──────────────────────
+        # ── ★ GAP2: 접수(rt_cd==0)는 체결 아님 → pos_mgr.add 금지, pending 등록만 ──
+        _ono = self.api._extract_order_no(result) if hasattr(self.api, "_extract_order_no") else \
+               (result.get("output", {}).get("ODNO") if isinstance(result.get("output"), dict) else result.get("ODNO"))
+        _ono = str(_ono).strip() if _ono else None
+        registered = self.exec_bridge.register_accept(
+            order_no=_ono, code=symbol, name=name, side="BUY", level=1,
+            req_qty=qty, req_price=cur_price, is_full=False) if self.exec_bridge else False
+        if not registered:
+            logger.error(f"❌ {symbol} 매수 접수했으나 주문번호 없음 → 체결추적 불가(상태 변경 없음)")
+            return {"action": "BUY_FAIL", "symbol": symbol, "name": name,
+                    "reason": "주문번호 없음(체결추적 불가)", "session": sess["session"]}
         self._record_first_buy()
         logger.info(
-            f"🟢 US매수 {name}({symbol}) ${cur_price:.2f}×{qty}주 [{ratio_label}]\n"
-            f"   진입사유: {entry_reason}\n"
-            f"   잔고상태: {capacity_msg}"
+            f"🧾 US매수 접수 {name}({symbol}) ${cur_price:.2f}×{qty}주 order_no={_ono} "
+            f"→ pending 등록(체결대기)"
         )
-        return self._buy_result(symbol, name, excd, cur_price, qty, 1, sess, iv,
-                                entry_reason, "")
+        _r = self._buy_result(symbol, name, excd, cur_price, qty, 1, sess, iv,
+                              entry_reason, "[접수—체결대기]")
+        _r["action"] = "BUY_ACCEPTED"
+        return _r
 
     def _do_add_buy(self, symbol, name, excd, pos, cur_price, sess, iv) -> dict:
         add_qty = max(1, int(INVEST_PER_TRADE_USD * ADD_BUY_RATIO / cur_price))
@@ -1822,110 +1882,55 @@ class USStrategyManager:
         if result.get("rt_cd") != "0":
             return {"action": "BUY_FAIL", "symbol": symbol, "name": name,
                     "reason": result.get("msg1", "추가매수실패"), "session": sess["session"]}
-        new_qty = pos.qty + add_qty
-        new_avg = (pos.avg_price * pos.qty + cur_price * add_qty) / new_qty
-        self.pos_mgr.update(symbol, new_qty, new_avg, 2)
-        reason = (f"모멘텀추가매수: 수익{pos.net_pct(cur_price):+.1f}% "
-                  f"vol{iv['vol_ratio']:.1f}x VWAP위 등락{iv['intraday_pct']:+.1f}%")
-        logger.info(f"🟢 US추가매수 {symbol} {add_qty}주 ${cur_price:.2f} | {reason}")
-        return self._buy_result(symbol, name, excd, cur_price, add_qty, 2, sess, iv,
-                                reason, "[모멘텀추가]")
+        # ★ GAP2: 접수만 → pending 등록(체결 시 poll 이 pos_mgr 갱신)
+        _ono = str(result.get("output", {}).get("ODNO") if isinstance(result.get("output"), dict)
+                   else result.get("ODNO") or "").strip() or None
+        if self.exec_bridge:
+            self.exec_bridge.register_accept(order_no=_ono, code=symbol, name=name, side="BUY",
+                                             level=2, req_qty=add_qty, req_price=cur_price, is_full=False)
+        reason = (f"모멘텀추가매수(접수): vol{iv['vol_ratio']:.1f}x")
+        logger.info(f"🧾 US추가매수 접수 {symbol} {add_qty}주 ${cur_price:.2f} order_no={_ono}")
+        _r = self._buy_result(symbol, name, excd, cur_price, add_qty, 2, sess, iv, reason, "[접수—체결대기]")
+        _r["action"] = "BUY_ACCEPTED"
+        return _r
 
     def _do_sell(self, symbol, name, excd, qty, cur_price, reason, sess,
                  is_partial: bool = False) -> dict:
+        # ★ 미체결 매도주문 존재 시 중복 매도 차단(pending)
+        if self.exec_bridge is not None and self.exec_bridge.has_open(symbol, "SELL"):
+            logger.info(f"⏳ [US pending] {symbol} 미체결 매도주문 존재 → 신규 매도 보류")
+            return {"action": "HOLD", "symbol": symbol, "name": name,
+                    "reason": "미확정 매도주문 존재(체결대기)", "session": sess["session"]}
         result  = self.api.sell_us(symbol, qty, cur_price, excd)
         if result.get("rt_cd") == "0":
-            pos     = self.pos_mgr.positions.get(symbol)
-            avg_p   = pos.avg_price if pos else cur_price
-            pnl_usd = (cur_price - avg_p) * qty
-            pnl_pct = (cur_price - avg_p) / avg_p * 100 if avg_p > 0 else 0.0
-
-            # ★ Recovery Mode 손익 반영 (미국이 recovery 시장일 때).
-            #   전량매도(왕복 완결) 시에만 record_sell — 부분매도는 왕복 미완결.
-            try:
-                from strategies.recovery_mode import get_recovery_gate
-                _rg = get_recovery_gate()
-                if _rg.config.enabled and _rg.config.market == "US" and not (
-                        is_partial and pos and pos.qty > qty):
-                    _rg.state.record_sell(symbol, pnl_usd)
-            except Exception:
-                pass
-
-            if is_partial and pos and pos.qty > qty:
-                # 부분 익절: 수량만 줄이고 포지션 유지
-                new_qty = pos.qty - qty
-                self.pos_mgr.update(symbol, new_qty, avg_p, pos.current_level)
-                action_tag = "SELL_PARTIAL"
-                logger.info(
-                    f"💰 US부분익절 {name}({symbol}) ${cur_price:.2f}×{qty}주"
-                    f"→ 잔여{new_qty}주 PnL ${pnl_usd:+.2f} ({pnl_pct:+.1f}%)\n"
-                    f"   매도사유: {reason}"
-                )
-                logger.info(
-                    f"[US SELL] 종목={name}({symbol}) | "
-                    f"매수가=${avg_p:.2f} | 매도가=${cur_price:.2f} | "
-                    f"수량={qty}주(부분) | "
-                    f"실현손익=${pnl_usd:+.2f}({pnl_pct:+.1f}%) | "
-                    f"매도사유={reason}"
-                )
-            else:
-                # 전량 매도
-                self.pos_mgr.remove(symbol)
-                action_tag = "SELL"
-                emoji = "💰" if pnl_usd >= 0 else "🔴"
-                logger.info(
-                    f"{emoji} US매도 {name}({symbol}) ${cur_price:.2f}×{qty}주 "
-                    f"PnL ${pnl_usd:+.2f} ({pnl_pct:+.1f}%)\n"
-                    f"   매도사유: {reason}"
-                )
-                logger.info(
-                    f"[US SELL] 종목={name}({symbol}) | "
-                    f"매수가=${avg_p:.2f} | 매도가=${cur_price:.2f} | "
-                    f"수량={qty}주(전량) | "
-                    f"실현손익=${pnl_usd:+.2f}({pnl_pct:+.1f}%) | "
-                    f"매도사유={reason}"
-                )
-
-            # ★ DailyPnLGuard에 실현 손익 기록 (USD → KRW 환산)
-            try:
-                fx = self.api.get_usd_exchange_rate() or 1350.0
-            except Exception:
-                fx = 1350.0
-            pnl_krw = pnl_usd * fx
-            self.pnl_guard.record(pnl_krw)
-            pnl_st = self.pnl_guard.status_dict()
-            logger.info(
-                f"[미국장 PnL] 💱 ${pnl_usd:+.2f} × {fx:.0f} = {pnl_krw:+,.0f}원 | "
-                f"일일실현={pnl_st['realized_pnl']:+,.0f}원 | "
-                f"최고={pnl_st['peak_pnl']:+,.0f}원 | "
-                f"상태={pnl_st['state']}"
-            )
-
-            # ── ★ 재진입 차단 등록 (SELL 체결 완료 직후) ──────
-            # 부분 익절은 포지션 유지이므로 전량 매도일 때만 등록
-            if action_tag == "SELL":
-                _is_sl = _is_stoploss_reason(reason)
-                self.reentry.record_sell(
-                    market     = "US",
-                    code       = symbol,
-                    name       = name,
-                    reason     = reason,
-                    is_stoploss= _is_sl,
-                )
-
-            sell_res = {
-                "action":      action_tag,
-                "symbol":      symbol, "name": name, "excd": excd,
-                "price":       cur_price, "qty": qty,
-                "pnl_usd":     round(pnl_usd, 2), "pnl_pct": round(pnl_pct, 2),
-                "pnl_krw":     round(pnl_krw, 0),
-                "reason":      reason, "session": sess["session"], "currency": "USD",
-                "realized_pnl": pnl_st["realized_pnl"],
-                "peak_pnl":    pnl_st["peak_pnl"],
-                "pnl_state":   pnl_st["state"],
+            # ── ★ GAP2: 매도 접수(rt_cd==0)는 체결 아님 → pos_mgr 변경·pnl 금지.
+            #    pending 등록만; 실제 체결 delta 는 poll_fills() 가 pos_mgr/pnl 반영.
+            _ono = str(result.get("output", {}).get("ODNO") if isinstance(result.get("output"), dict)
+                       else result.get("ODNO") or "").strip() or None
+            _is_full_order = not is_partial
+            registered = self.exec_bridge.register_accept(
+                order_no=_ono, code=symbol, name=name, side="SELL", level=1,
+                req_qty=qty, req_price=cur_price, is_full=_is_full_order) if self.exec_bridge else False
+            if not registered:
+                logger.error(f"❌ {symbol} 매도 접수했으나 주문번호 없음 → 체결추적 불가(포지션 변경 없음)")
+                return {"action": "SELL_FAIL", "symbol": symbol, "name": name,
+                        "reason": "주문번호 없음(체결추적 불가)", "session": sess["session"]}
+            # 전량매도 접수 시 재진입 차단 보수 등록
+            if _is_full_order:
+                try:
+                    self.reentry.record_sell(market="US", code=symbol, name=name,
+                                             reason=reason, is_stoploss=_is_stoploss_reason(reason))
+                except Exception:
+                    pass
+            logger.info(f"🧾 US매도 접수 {name}({symbol}) ${cur_price:.2f}×{qty}주 order_no={_ono} "
+                        f"→ pending 등록(체결대기). 손익/포지션은 체결 시 반영")
+            return {
+                "action":  "SELL_ACCEPTED",
+                "symbol":  symbol, "name": name, "excd": excd,
+                "price":   cur_price, "qty": qty,
+                "reason":  reason + " [접수—체결대기]", "session": sess["session"],
+                "currency": "USD", "order_no": _ono,
             }
-            self._ledger_record(sell_res)   # 실거래 원장 이중기록 (US 매도 관문)
-            return sell_res
         # ★ 매도 실패 시 — '가능수량보다 큽니다' 오류 = KIS에 실제 잔고 없음
         # → 유령 포지션으로 판단하고 봇 포지션에서도 제거
         fail_msg = result.get('msg1', '매도실패')

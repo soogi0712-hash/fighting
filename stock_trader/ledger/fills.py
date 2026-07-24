@@ -66,6 +66,11 @@ class CumulativeFillTracker:
         #   뒤이은 스레드는 dq<=0 → None(no-op) 이 된다.
         self._lock = threading.Lock()
 
+    def seed(self, key, cum_qty, cum_amount):
+        """재시작 복구 시 이미 반영된 누적값을 주입 — 이후 delta 만 방출되게."""
+        with self._lock:
+            self._seen[key] = (int(cum_qty), float(cum_amount))
+
     def update(self, key, cum_qty, cum_amount, order_no=None, ts=None):
         with self._lock:
             prev_q, prev_a = self._seen.get(key, (0, 0.0))
@@ -78,7 +83,16 @@ class CumulativeFillTracker:
             return Fill(order_no=(order_no or str(key)), qty=dq, price=avg, ts=ts)
 
 
-class KisFillSource(FillSource):
+class _SeedMixin:
+    """재시작 복구용 tracker seed 노출(내부 _tracker 보유 소스 공통)."""
+    def seed(self, market, order_no, cum_qty, cum_amount):
+        try:
+            self._tracker.seed((market, order_no), cum_qty, cum_amount)
+        except Exception:
+            pass
+
+
+class KisFillSource(_SeedMixin, FillSource):
     """
     실환경 어댑터 (PHASE 5). 실 API 호출을 포함하므로 이 단계에서는 사용 금지.
     LIVE_ORDER_ENABLED=false 면 네트워크 호출 없이 빈 목록을 반환한다.
@@ -116,4 +130,88 @@ class KisFillSource(FillSource):
                     fills.append(f)
         except Exception:
             return []
+        return fills
+
+
+def _first_num(d: dict, keys, default=0):
+    """후보 키들 중 처음 발견되는 숫자를 반환(방어적 매핑)."""
+    for k in keys:
+        v = d.get(k)
+        if v is None or v == "":
+            continue
+        try:
+            return int(float(v))
+        except (TypeError, ValueError):
+            continue
+    return default
+
+
+def _us_row_side(d: dict):
+    """행의 매수/매도 구분을 방어적으로 판별. 불명이면 None."""
+    for k in ("sll_buy_dvsn_cd", "sll_buy_dvsn_cd_name", "trad_dvsn_name"):
+        v = str(d.get(k, "")).strip()
+        if not v:
+            continue
+        if v in ("02",) or "매수" in v or v.upper() in ("BUY",):
+            return "BUY"
+        if v in ("01",) or "매도" in v or v.upper() in ("SELL",):
+            return "SELL"
+    return None
+
+
+class UsKisFillSource(_SeedMixin, FillSource):
+    """
+    해외주식 실체결 어댑터 (PHASE5). 격리 구현 — 필드명을 단정하지 않고 후보키로
+    방어적 매핑. 확신할 수 없으면 체결로 간주하지 않고 빈 목록(=pending 유지).
+
+    - LIVE_ORDER_ENABLED=false 면 실 API 미호출(빈 목록).
+    - 누적 체결수량/금액을 CumulativeFillTracker 로 delta 방출(중복/부분체결 안전).
+    - 실제 필드명 확인은 verify_us_fill_path.py 가 원본 응답을 덤프해 지원.
+    """
+    QTY_KEYS   = ("ft_ccld_qty", "ccld_qty", "tot_ccld_qty")
+    AMT_KEYS   = ("ft_ccld_amt3", "ft_ccld_amt", "tot_ccld_amt", "ccld_amt")
+    PRICE_KEYS = ("ft_ccld_unpr3", "ft_ccld_unpr", "avg_prvs", "ccld_unpr")
+    CODE_KEYS  = ("pdno", "ovrs_pdno", "symb")
+    ODNO_KEYS  = ("odno", "ODNO", "order_no")
+
+    def __init__(self, api):
+        self.api = api
+        self._tracker = CumulativeFillTracker()
+
+    def get_fills(self, market, code, side, requested_qty=None,
+                  requested_price=None, order_hint=None, ts=None):
+        try:
+            from config import Config
+        except Exception:
+            from ..config import Config
+        if not getattr(Config, "LIVE_ORDER_ENABLED", False):
+            return []
+        try:
+            rows = self.api.get_us_order_history_raw(days=1)
+        except Exception:
+            return []
+        fills = []
+        for od in (rows or []):
+            # 종목 일치(후보키)
+            _code = next((str(od.get(k)) for k in self.CODE_KEYS if od.get(k)), None)
+            if _code != code:
+                continue
+            # 방향 일치(불명이면 skip — 체결로 간주 금지)
+            _side = _us_row_side(od)
+            if _side is None or _side != side:
+                continue
+            cum_qty = _first_num(od, self.QTY_KEYS, 0)
+            if cum_qty <= 0:
+                continue
+            cum_amt = _first_num(od, self.AMT_KEYS, 0)
+            if cum_amt <= 0:
+                price = _first_num(od, self.PRICE_KEYS, 0)
+                cum_amt = price * cum_qty
+            order_no = next((str(od.get(k)) for k in self.ODNO_KEYS if od.get(k)),
+                            f"{code}:{side}")
+            key = (market, order_no)
+            f = self._tracker.update(key, cum_qty, float(cum_amt),
+                                     order_no=order_no, ts=od.get("ord_tmd") or od.get("ord_dt"))
+            if f:
+                fills.append(f)
         return fills

@@ -617,6 +617,13 @@ def _trading_loop():
     if _loop_cash == 0:
         _log("⚠️ 잔고 0원 확인됨 — 매수는 SKIP됩니다", "warning")
 
+    # ── ★ GAP2: 전략 판단 전에 미체결 주문 체결 delta 반영 (국내) ──
+    try:
+        if _strategy_mgr and hasattr(_strategy_mgr, "poll_fills"):
+            _strategy_mgr.poll_fills()
+    except Exception as _pe:
+        _log(f"⚠️ [KR] poll_fills 오류(무시하고 계속): {_pe}", "warning")
+
     for stock in list(_watch_list):
         try:
             code       = stock["code"]
@@ -1292,6 +1299,13 @@ def _us_trading_loop():
 
     # _us_strategy에 캐시 주입 (run() 내부 _fetch_realtime이 캐시 우선 사용)
     _us_strategy.set_realtime_cache(rt_cache)
+
+    # ── ★ GAP2: 전략 판단 전에 미체결 주문 체결 delta 반영 (미국) ──
+    try:
+        if hasattr(_us_strategy, "poll_fills"):
+            _us_strategy.poll_fills()
+    except Exception as _pe:
+        _log(f"⚠️ [US] poll_fills 오류(무시하고 계속): {_pe}", "warning")
 
     for stock in watch:
         symbol = stock.get("symbol", "")

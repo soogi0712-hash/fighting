@@ -116,6 +116,65 @@ class StrategyManager:
             except Exception:
                 self._fill_source = None
 
+        # ── ★ GAP2 실행 배선: 접수→pending→체결 delta 반영 (국내) ──
+        self.exec_bridge = None
+        try:
+            from strategies.execution_bridge import ExecutionBridge
+            _pend_path = os.path.join(os.path.dirname(TRADE_LOG_FILE), "pending_kr.json")
+            _fs = self._fill_source or KisFillSource(self.api)
+            self.exec_bridge = ExecutionBridge("KR", _fs, _pend_path, logger=logger)
+            n = self.exec_bridge.restore()   # 재시작 시 pending 복구
+            if n:
+                logger.info(f"🔁 [KR] pending 주문 {n}건 복구")
+        except Exception as e:
+            logger.error(f"ExecutionBridge(KR) 초기화 실패: {e}")
+
+    # ── ★ GAP2: 매 tick 체결 폴링 → 실제 체결 delta 만 포지션/손익 반영 ──
+    def poll_fills(self):
+        """전략 판단 전에 호출. 실제 체결 delta 만 apply_buy/apply_sell 로 반영."""
+        if self.exec_bridge is None:
+            return None
+
+        def _on_buy(ev):
+            self.pyramid.apply_buy(
+                ev.code, ev.name, ev.level, ev.applied_qty, ev.price,
+                using_compound=ev.using_compound, is_full_add=ev.is_full,
+            )
+            logger.info(f"✅ [체결반영-BUY] {ev.name}({ev.code}) +{ev.applied_qty}주 @{ev.price:,.0f} "
+                        f"(잔여 {ev.remaining_qty}, 전량={ev.became_filled})")
+            self._log_trade("BUY", ev.code, ev.name, ev.price, ev.applied_qty,
+                            "체결반영", "정규장",
+                            extra={"order_no": ev.order_no, "level": ev.level,
+                                   "compound_pool": self.pyramid.compound_pool})
+
+        def _on_sell(ev):
+            _is_full = bool(ev.is_full and ev.became_filled)
+            profit = self.pyramid.apply_sell(ev.code, ev.applied_qty, ev.price,
+                                             level=ev.level, is_full=_is_full)
+            net_amt = profit.get("net_profit", 0.0)
+            self.pnl_guard.record(net_amt)
+            try:
+                from strategies.recovery_mode import get_recovery_gate
+                _rg = get_recovery_gate()
+                if _rg.config.enabled and _rg.config.market == "KR" and ev.became_filled:
+                    _rg.state.record_sell(ev.code, net_amt)
+            except Exception:
+                pass
+            logger.info(f"✅ [체결반영-SELL] {ev.name}({ev.code}) -{ev.applied_qty}주 @{ev.price:,.0f} "
+                        f"순손익={net_amt:,.0f} (잔여 {ev.remaining_qty}, 전량={ev.became_filled})")
+            self._log_trade("SELL", ev.code, ev.name, ev.price, ev.applied_qty,
+                            "체결반영", "정규장",
+                            extra={"order_no": ev.order_no, "level": ev.level,
+                                   "profit": profit,
+                                   "compound_pool": self.pyramid.compound_pool,
+                                   "realized_pnl": self.pnl_guard.realized_pnl})
+
+        try:
+            return self.exec_bridge.poll(_on_buy, _on_sell, timeout_sec=15)
+        except Exception as e:
+            logger.error(f"[KR] poll_fills 오류: {e}")
+            return None
+
     # ── 하위 호환: daily_loss_krw 프로퍼티 ──────────────────
     @property
     def daily_loss_krw(self) -> float:
@@ -427,6 +486,19 @@ class StrategyManager:
                 "peak_pnl":    self.pnl_guard.peak_pnl,
             }
 
+        # ── ★ 미체결 BUY/SELL 존재 시 같은 종목 중복 주문 차단 (pending) ──
+        if self.exec_bridge is not None:
+            if action.startswith("BUY") and self.exec_bridge.has_open(code, "BUY"):
+                logger.info(f"⏳ [pending] {name}({code}) 미체결 매수주문 존재 → 신규 매수 보류")
+                return {"action": "SKIP", "code": code, "name": name,
+                        "reason": "미확정 매수주문 존재(체결대기) — 신규 BUY 보류",
+                        "session": sess["session"]}
+            if action in ("SELL_ALL", "SELL_PARTIAL") and self.exec_bridge.has_open(code, "SELL"):
+                logger.info(f"⏳ [pending] {name}({code}) 미체결 매도주문 존재 → 신규 매도 보류")
+                return {"action": "HOLD", "code": code, "name": name,
+                        "reason": "미확정 매도주문 존재(체결대기) — 신규 SELL 보류",
+                        "session": sess["session"]}
+
         # ── ★ RECONCILIATION_REQUIRED: 불확실 상태 시 신규 BUY 차단 ──
         if action.startswith("BUY"):
             try:
@@ -608,138 +680,49 @@ class StrategyManager:
 
             result = self.api.buy(code, qty, use_price, ord_dvsn=ord_dvsn)
             order_ok = result.get("rt_cd") == "0"
+            order_no = self._extract_order_no(result)
 
-            if not order_ok:
-                logger.warning(
-                    f"⚠️ {code} 주문 응답 이상 "
-                    f"rt_cd={result.get('rt_cd','?')} "
-                    f"msg_cd={result.get('msg_cd','?')} "
-                    f"msg1={result.get('msg1','?')!r} "
-                    f"— 3초 후 잔고 재확인..."
-                )
-                time.sleep(3)
-                try:
-                    balance  = self.api.get_balance()
-                    holdings = {h["code"]: h for h in balance.get("holdings", [])}
-                    if code in holdings:
-                        h = holdings[code]
-                        actual_qty   = int(h.get("qty", qty))
-                        actual_price = float(h.get("avg_price", price))
-                        logger.info(
-                            f"✅ {code}({name}) 잔고 확인 → 실제 체결됨 "
-                            f"{actual_qty}주 @{actual_price:,.0f}원 — 포지션 자동 등록"
-                        )
-                        if code not in self.pyramid.positions:
-                            is_full_add = (action == "BUY_LEVEL1_FULL_ADD")
-                            self.pyramid.apply_buy(
-                                code, name, level, actual_qty, actual_price,
-                                using_compound=decision.get("using_compound", 0),
-                                is_full_add=is_full_add,
-                            )
-                            self._log_trade(
-                                "BUY", code, name, actual_price, actual_qty,
-                                decision["reason"] + " [잔고확인 자동등록]",
-                                sess["session"],
-                                extra={
-                                    "order_no":       self._extract_order_no(result),
-                                    "level":          level,
-                                    "buy_score":      buy_score,
-                                    "sell_score":     sell_score,
-                                    "ind_score":      ind_score,
-                                    "trend_score":    trend_score,
-                                    "compound_pool":  self.pyramid.compound_pool,
-                                    "realized_pnl":   self.pnl_guard.realized_pnl,
-                                    "pnl_state":      self.pnl_guard.state,
-                                }
-                            )
-                            return {
-                                "action":        "BUY",
-                                "code":          code, "name": name,
-                                "price":         actual_price, "qty": actual_qty,
-                                "level":         level,
-                                "amount":        actual_price * actual_qty,
-                                "buy_score":     buy_score,
-                                "sell_score":    sell_score,
-                                "ind_score":     ind_score,
-                                "trend_score":   trend_score,
-                                "strong_trend":  strong_trend,
-                                "reason":        decision["reason"] + " [잔고확인 자동등록]",
-                                "session":       sess["session"],
-                                "order_label":   sess["order_label"],
-                                "indicators":    iv,
-                                "compound_pool": self.pyramid.compound_pool,
-                                "realized_pnl":  self.pnl_guard.realized_pnl,
-                                "pnl_state":     self.pnl_guard.state,
-                            }
-                        else:
-                            logger.info(f"ℹ️ {code} 이미 포지션 존재 — 중복 등록 스킵")
-                    else:
-                        logger.warning(f"❌ {code} 잔고 재확인 결과 미보유 — 주문 실패 처리")
-                except Exception as e2:
-                    logger.error(f"잔고 재확인 실패 {code}: {e2}")
-                return {
-                    "action":       "BUY_FAIL",
-                    "code":         code,
-                    "name":         name,
-                    "session":      sess["session"],
-                    "reason":       result.get("msg1"),
-                    # ── KIS 응답 상세 (웹 화면 출력용) — app.py _log 키와 일치 ──
-                    "rt_cd":        result.get("rt_cd", "?"),
-                    "msg_cd":       result.get("msg_cd", ""),
-                    "msg1":         result.get("msg1", ""),
-                    "_http_status": result.get("_http_status", 500 if result.get("rt_cd") == "9" else "?"),
-                    "_response_body": result.get("_response_body", ""),
-                    "_ord_dvsn":    ord_dvsn,
-                    "_ord_unpr":    use_price,
-                    "order_qty":    qty,
-                    "order_amt":    (use_price if use_price > 0 else int(cur_price)) * qty,
-                    "_tr_id":       "TTTC0802U",
-                    "account":      Config.KIS_ACCOUNT_NO,
-                    "_kst":         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                }
-
-            # ── 명확한 성공(rt_cd==0) ──────────────────────
+            # ── ★ GAP2: 접수 성공(rt_cd==0)은 '체결'이 아님 → 즉시 apply 금지.
+            #    PendingRegistry 에 등록만 하고, 실제 체결은 poll_fills() 가 반영한다.
             if order_ok:
                 is_full_add = (action == "BUY_LEVEL1_FULL_ADD")
-                self.pyramid.apply_buy(
-                    code, name, level, qty, price,
+                registered = self.exec_bridge.register_accept(
+                    order_no=order_no, code=code, name=name, side="BUY", level=level,
+                    req_qty=qty, req_price=price,
                     using_compound=decision.get("using_compound", 0),
-                    is_full_add=is_full_add,
+                    is_full=is_full_add,
                 )
-                self._log_trade(
-                    "BUY", code, name, price, qty,
-                    decision["reason"], sess["session"],
-                    extra={
-                        "order_no":       self._extract_order_no(result),
-                        "level":          level,
-                        "buy_score":      buy_score,
-                        "sell_score":     sell_score,
-                        "ind_score":      ind_score,
-                        "trend_score":    trend_score,
-                        "compound_pool":  self.pyramid.compound_pool,
-                        "realized_pnl":   self.pnl_guard.realized_pnl,
-                        "pnl_state":      self.pnl_guard.state,
-                    }
-                )
+                if not registered:
+                    # 주문번호 없음 → 체결추적 불가. 안전: 상태 변경 없이 실패 처리.
+                    logger.error(f"❌ {code} 매수 접수했으나 주문번호 없음 → 체결추적 불가(상태 변경 없음)")
+                    return {"action": "BUY_FAIL", "code": code, "name": name,
+                            "session": sess["session"], "reason": "주문번호 없음(체결추적 불가)",
+                            "order_qty": qty, "_tr_id": "TTTC0802U"}
+                logger.info(f"🧾 {name}({code}) 매수 접수 order_no={order_no} {qty}주 @{price:,}원 "
+                            f"→ pending 등록(체결대기)")
                 return {
-                    "action":        "BUY",
+                    "action":        "BUY_ACCEPTED",   # 포지션은 아직 없음 — 체결 시 poll 이 생성
                     "code":          code, "name": name,
-                    "price":         price, "qty": qty,
-                    "level":         level,
+                    "price":         price, "qty": qty, "level": level,
+                    "order_no":      order_no,
                     "amount":        price * qty,
-                    "buy_score":     buy_score,
-                    "sell_score":    sell_score,
-                    "ind_score":     ind_score,
-                    "trend_score":   trend_score,
+                    "buy_score":     buy_score, "sell_score": sell_score,
+                    "ind_score":     ind_score, "trend_score": trend_score,
                     "strong_trend":  strong_trend,
-                    "reason":        decision["reason"],
-                    "session":       sess["session"],
-                    "order_label":   sess["order_label"],
+                    "reason":        decision["reason"] + " [접수—체결대기]",
+                    "session":       sess["session"], "order_label": sess["order_label"],
                     "indicators":    iv,
                     "compound_pool": self.pyramid.compound_pool,
                     "realized_pnl":  self.pnl_guard.realized_pnl,
                     "pnl_state":     self.pnl_guard.state,
                 }
+
+            # ── 접수 실패(rt_cd!=0) → 내부 상태 변경 없음(포지션/pending 미생성) ──
+            logger.warning(
+                f"⚠️ {code} 매수 접수 실패 rt_cd={result.get('rt_cd','?')} "
+                f"msg_cd={result.get('msg_cd','?')} msg1={result.get('msg1','?')!r} "
+                f"— 상태 변경 없음"
+            )
             return {
                 "action":       "BUY_FAIL",
                 "code":         code,
@@ -797,107 +780,34 @@ class StrategyManager:
             result = self.api.sell(code, qty, use_price, ord_dvsn=ord_dvsn)
 
             if result.get("rt_cd") == "0":
-                profit  = self.pyramid.apply_sell(
-                    code, qty, price, level=level, is_full=is_full
+                # ── ★ GAP2: 매도 접수(rt_cd==0)는 '체결' 아님 → 즉시 apply_sell/pnl 금지.
+                #    PendingRegistry 에 SELL 등록만 하고, 실제 체결 delta 는 poll_fills() 가
+                #    apply_sell + pnl_guard.record + compound_pool 에 반영한다.
+                order_no = self._extract_order_no(result)
+                registered = self.exec_bridge.register_accept(
+                    order_no=order_no, code=code, name=name, side="SELL", level=level,
+                    req_qty=qty, req_price=price, is_full=is_full,
                 )
-                net_pct_actual = profit.get("net_profit_pct", 0.0)
-                net_profit_amt = profit.get("net_profit", 0.0)
-
-                # ★ DailyPnLGuard 손익 기록 (상태 자동 평가)
-                self.pnl_guard.record(net_profit_amt)
-                pnl_status = self.pnl_guard.status_dict()
-
-                # ★ Recovery Mode 손익 반영 (해당 시장이 recovery 시장일 때만)
-                try:
-                    from strategies.recovery_mode import get_recovery_gate
-                    _rg = get_recovery_gate()
-                    if _rg.config.enabled and _rg.config.market == "KR":
-                        _rg.state.record_sell(code, net_profit_amt)
-                except Exception:
-                    pass
-
-                # ── 매도 로그 (매도 사유 포함 14항목) ─
-                logger.info(
-                    f"[SELL] {name}({code}) | "
-                    f"매수가={avg_price:,.0f}원 → 매도가={price:,.0f}원 | "
-                    f"실질수익={net_pct_actual:+.2f}% | 최고수익={max_net_pct:+.2f}% | "
-                    f"BUY_SCORE={buy_score:.2f} | SELL_SCORE={sell_score}/27 | "
-                    f"거래량변화={vol_change_pct:+.1f}% | 체결강도={strength:.1f} | "
-                    f"OBV={obv_state} | VWAP={vwap_state} | BB={bb_state} | "
-                    f"매도사유={reason} | 보유시간={elapsed_min:.0f}분 | "
-                    f"일일손익={pnl_status['realized_pnl']:+,.0f}원 "
-                    f"(최고={pnl_status['peak_pnl']:+,.0f}원, 상태={pnl_status['state']})"
-                )
-
-                self._log_trade(
-                    "SELL", code, name, price, qty,
-                    reason, sess["session"],
-                    extra={
-                        "order_no":       self._extract_order_no(result),
-                        "level":          level,
-                        "profit":         profit,
-                        "net_pct":        net_pct_actual,
-                        "is_forced":      is_forced,
-                        "buy_score":      buy_score,
-                        "sell_score":     sell_score,
-                        "sell_urgent":    sell_urgent,
-                        "trend_score":    trend_score,
-                        "strength":       strength,
-                        "obv_state":      obv_state,
-                        "vwap_state":     vwap_state,
-                        "bb_state":       bb_state,
-                        "elapsed_min":    elapsed_min,
-                        "compound_pool":   self.pyramid.compound_pool,
-                        "realized_pnl":    pnl_status["realized_pnl"],
-                        "peak_pnl":        pnl_status["peak_pnl"],
-                        "pnl_state":       pnl_status["state"],
-                    }
-                )
-
-                # ── ★ 재진입 차단 등록 (SELL 체결 완료 직후) ──────
-                # is_forced + "손절" 포함 여부로 손절 판단
+                if not registered:
+                    logger.error(f"❌ {code} 매도 접수했으나 주문번호 없음 → 체결추적 불가(포지션 변경 없음)")
+                    return {"action": "SELL_FAIL", "code": code, "name": name,
+                            "session": sess["session"], "reason": "주문번호 없음(체결추적 불가)"}
+                # 재진입 차단은 접수 시점에 보수적으로 등록(재매수 방지).
                 _is_sl = is_forced and "손절" in reason
-                self.reentry.record_sell(
-                    market     = "KR",
-                    code       = code,
-                    name       = name,
-                    reason     = reason,
-                    is_stoploss= _is_sl,
-                )
-
-                sell_result = {
-                    "action":        "SELL",
-                    "code":          code, "name": name,
-                    "price":         price, "qty": qty,
-                    "profit":        profit,
-                    "net_pct":       net_pct_actual,
-                    "is_full":       is_full,
-                    "level":         level,
-                    "reason":        reason,
-                    "is_forced":     is_forced,
-                    "buy_score":     buy_score,
-                    "sell_score":    sell_score,
-                    "session":       sess["session"],
-                    "order_label":   sess["order_label"],
-                    "compound_pool": self.pyramid.compound_pool,
-                    "indicators":    iv,
-                    "trend_score":   trend_score,
-                    "elapsed_min":   elapsed_min,
-                    "realized_pnl":  pnl_status["realized_pnl"],
-                    "peak_pnl":      pnl_status["peak_pnl"],
-                    "pnl_state":     pnl_status["state"],
+                self.reentry.record_sell(market="KR", code=code, name=name,
+                                         reason=reason, is_stoploss=_is_sl)
+                logger.info(f"🧾 {name}({code}) 매도 접수 order_no={order_no} {qty}주 @{price:,}원 "
+                            f"→ pending 등록(체결대기). 손익/포지션은 체결 시 반영")
+                return {
+                    "action":      "SELL_ACCEPTED",   # 포지션 차감은 체결 시 poll 이 수행
+                    "code":        code, "name": name,
+                    "price":       price, "qty": qty, "level": level,
+                    "order_no":    order_no, "is_full": is_full,
+                    "reason":      reason + " [접수—체결대기]",
+                    "is_forced":   is_forced,
+                    "buy_score":   buy_score, "sell_score": sell_score,
+                    "session":     sess["session"], "order_label": sess["order_label"],
                 }
-
-                # ★ 손절 후 즉시 재배분
-                if is_forced and "손절" in reason and is_full:
-                    recycled = profit.get("net_proceeds", 0.0)
-                    realloc  = self._try_recycle_to_strong(
-                        recycled, sess, ind_score, ind_cutoff
-                    )
-                    sell_result["recycled_cash"]     = recycled
-                    sell_result["realloc_attempted"] = realloc
-
-                return sell_result
 
             logger.warning(
                 f"⚠️ {code} SELL 실패 "
@@ -1068,23 +978,16 @@ class StrategyManager:
                 use_price = cur_price if ord_dvsn == "05" else 0
                 res       = self.api.buy(code, qty, use_price, ord_dvsn=ord_dvsn)
                 if res.get("rt_cd") == "0":
-                    self.pyramid.apply_buy(
-                        code, tgt["name"],
-                        add_dec["level"], qty, cur_price,
-                        using_compound=add_dec.get("using_compound", 0)
-                    )
-                    self._log_trade(
-                        "ADD_BUY", code, tgt["name"],
-                        cur_price, qty,
-                        f"손절재배분→{tgt['reason']}",
-                        sess["session"],
-                        extra={
-                            "order_no":       self._extract_order_no(res),
-                            "recycled_cash":  recycled_cash,
-                            "alloc_amount":   alloc,
-                            "trend_score":    tgt["trend_score"],
-                            "compound_pool":  self.pyramid.compound_pool,
-                        }
+                    # ★ GAP2: 즉시 apply 금지 → pending 등록(체결은 poll_fills 가 반영)
+                    _ono = self._extract_order_no(res)
+                    if self.exec_bridge is not None:
+                        self.exec_bridge.register_accept(
+                            order_no=_ono, code=code, name=tgt["name"], side="BUY",
+                            level=add_dec["level"], req_qty=qty, req_price=cur_price,
+                            using_compound=add_dec.get("using_compound", 0), is_full=False)
+                    logger.info(
+                        f"♻️ 손절재배분 접수: {tgt['name']} {qty}주 "
+                        f"@{cur_price:,}원 order_no={_ono} (체결대기)"
                     )
                     realloc_results.append({
                         "code":    code,
