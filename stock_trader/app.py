@@ -3783,6 +3783,71 @@ def favicon():
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 거래 저널 조회 API (3개)
+# ─────────────────────────────────────────────────────────────────────────────
+try:
+    import journal.trading_journal as _app_jnl
+    _APP_JOURNAL_ENABLED = True
+except Exception:
+    _APP_JOURNAL_ENABLED = False
+
+@app.route("/api/trading/journal")
+def api_journal():
+    """거래 저널 목록 조회.
+    Query params: market(KR/US), code, state(OPEN/CLOSED/REJECTED), date_from, date_to, limit, offset
+    """
+    if not _APP_JOURNAL_ENABLED:
+        return jsonify({"error": "journal module unavailable"}), 503
+    try:
+        rows = _app_jnl.query_journal(
+            market    = request.args.get("market"),
+            code      = request.args.get("code"),
+            state     = request.args.get("state"),
+            date_from = request.args.get("date_from"),
+            date_to   = request.args.get("date_to"),
+            limit     = int(request.args.get("limit", 50)),
+            offset    = int(request.args.get("offset", 0)),
+        )
+        return jsonify({"ok": True, "count": len(rows), "data": rows})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/trading/journal/<trade_id>")
+def api_journal_detail(trade_id):
+    """특정 trade_id 상세 조회."""
+    if not _APP_JOURNAL_ENABLED:
+        return jsonify({"error": "journal module unavailable"}), 503
+    try:
+        detail = _app_jnl.query_journal_detail(trade_id)
+        if detail is None:
+            return jsonify({"ok": False, "error": "trade_id not found"}), 404
+        return jsonify({"ok": True, "data": detail})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/trading/daily-summary")
+def api_daily_summary():
+    """일별 손익 요약 조회.
+    Query params: date(YYYY-MM-DD, 기본=오늘), market(KR/US/ALL), limit
+    """
+    if not _APP_JOURNAL_ENABLED:
+        return jsonify({"error": "journal module unavailable"}), 503
+    try:
+        from datetime import date as _date
+        date_str = request.args.get("date", _date.today().isoformat())
+        rows = _app_jnl.query_daily_summary(
+            date   = date_str,
+            market = request.args.get("market"),
+            limit  = int(request.args.get("limit", 30)),
+        )
+        return jsonify({"ok": True, "date": date_str, "count": len(rows), "data": rows})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("  📈 주식 자동매매 시스템")

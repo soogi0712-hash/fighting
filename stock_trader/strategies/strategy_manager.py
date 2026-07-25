@@ -53,6 +53,17 @@ from strategies.reentry_guard       import ReentryGuard
 from screener.trade_decision        import TradeDecisionEngine
 from screener.transaction_cost      import net_profit_pct_from_cost
 
+# ── 거래 저널 import (기록 실패 시 매매 루프 무영향) ──────────
+try:
+    import journal.trading_journal as _jnl
+    _JOURNAL_ENABLED = True
+except Exception as _je:
+    _JOURNAL_ENABLED = False
+    import logging as _logging
+    _logging.getLogger("StrategyManager").warning(
+        f"[Journal] import 실패 — 저널 기록 비활성화: {_je}"
+    )
+
 logger = get_logger("StrategyManager")
 
 TRADE_LOG_FILE = os.path.join(
@@ -281,6 +292,12 @@ class StrategyManager:
             cash    = float(balance.get("cash", 0))
 
         # 5) 피라미딩 전략 판단 (buy_score_norm + sell_score 전달)
+        # ── [훅 14 준비] evaluate 전 고가/저가 스냅샷 (PRICE_HIGH/LOW_UPDATED 감지용) ──
+        _pre_eval_pos  = self.pyramid.positions.get(code)
+        _pre_highest   = _pre_eval_pos.highest_price if _pre_eval_pos else 0.0
+        _pre_lowest    = _pre_eval_pos.lowest_price  if _pre_eval_pos else float("inf")
+        _pre_trade_id  = _pre_eval_pos.trade_id      if _pre_eval_pos else ""
+
         decision  = self.pyramid.evaluate(
             code, name, cur_price, ind_score, cash,
             today_high=today_high,
@@ -289,6 +306,31 @@ class StrategyManager:
         )
         action    = decision.get("action", "HOLD")
         net_pct   = decision.get("net_pct", 0.0)
+
+        # ── [훅 14] PRICE_HIGH_UPDATED / PRICE_LOW_UPDATED ──
+        if _JOURNAL_ENABLED and _pre_trade_id:
+            _post_pos = self.pyramid.positions.get(code)
+            if _post_pos:
+                try:
+                    if _post_pos.highest_price > _pre_highest:
+                        # ★ prev_high 전달 → 1호가 미만 갱신 시 이벤트 기록 생략
+                        _jnl.record_price_high(
+                            _pre_trade_id, "KR", code,
+                            new_high  = _post_pos.highest_price,
+                            prev_high = _pre_highest,
+                        )
+                except Exception as _je:
+                    _jnl._inc_error("kr_price_high", _je)
+                try:
+                    if _post_pos.lowest_price < _pre_lowest:
+                        # ★ prev_low 전달 → 1호가 미만 갱신 시 이벤트 기록 생략
+                        _jnl.record_price_low(
+                            _pre_trade_id, "KR", code,
+                            new_low  = _post_pos.lowest_price,
+                            prev_low = _pre_lowest,
+                        )
+                except Exception as _je:
+                    _jnl._inc_error("kr_price_low", _je)
 
         # ── ★ 신규 매수 시 필수 조건 차단 ────────────────────
         # 기존 보유 포지션 매도/홀드는 차단하지 않음 — BUY 계열만 차단
@@ -539,10 +581,86 @@ class StrategyManager:
                     "session": sess["session"],
                 }
 
+            # ── [훅 1/2] SIGNAL_CONFIRMED + trade_id 생성 ────────
+            _trade_id = ""
+            if _JOURNAL_ENABLED:
+                try:
+                    _trade_id = _jnl.make_trade_id("KR", code)
+                    # screener 데이터 조회 (실패해도 NULL 저장)
+                    _ai_score, _rs_val = None, None
+                    try:
+                        from screener.screener_db import ScreenerDB as _SDB
+                        _sdb = _SDB()
+                        _row = _sdb.get_today_score(code)
+                        if _row:
+                            _ai_score = _row.get("total_score")
+                            _rs_val   = _row.get("rs_value")
+                    except Exception:
+                        pass
+                    _detail = iv.get("detail", {})
+                    _rsi_v  = _detail.get("RSI", {}).get("value", {}).get("RSI")
+                    _bb_v   = _detail.get("BB",  {}).get("value", {})
+                    _atr_v  = _detail.get("ATR", {}).get("value", {})
+                    _vol_r  = iv5.get("vol_ratio_5m") if iv5 else None
+                    _jnl.record_signal(
+                        trade_id        = _trade_id,
+                        market          = "KR",
+                        code            = code,
+                        name            = name,
+                        entry_type      = action,
+                        signal_price    = cur_price,
+                        buy_score       = buy_score,
+                        sell_score      = sell_score,
+                        rsi             = _rsi_v,
+                        bb_upper        = _bb_v.get("상단"),
+                        bb_middle       = _bb_v.get("중심"),
+                        bb_lower        = _bb_v.get("하단"),
+                        atr             = _atr_v.get("ATR14"),
+                        volume          = cur_volume,
+                        volume_ratio    = _vol_r,
+                        ai_total_score  = _ai_score,
+                        rs_value        = _rs_val,
+                        orderable_cash  = cash,
+                        session         = sess["session"],
+                        entry_reason    = decision["reason"],
+                    )
+                except Exception as _je:
+                    _jnl._inc_error("kr_signal", _je)
+
+            # ── [훅 3] ORDER_SUBMITTED: api.buy() 호출 직전 ───────
+            if _JOURNAL_ENABLED and _trade_id:
+                try:
+                    _jnl.record_order_submitted(
+                        trade_id    = _trade_id,
+                        market      = "KR",
+                        code        = code,
+                        order_price = use_price,
+                        order_qty   = qty,
+                        payload     = {"ord_dvsn": ord_dvsn, "action": action},
+                    )
+                except Exception as _je:
+                    _jnl._inc_error("kr_order_submitted", _je)
+
             result = self.api.buy(code, qty, use_price, ord_dvsn=ord_dvsn)
             order_ok = result.get("rt_cd") == "0"
 
             if not order_ok:
+                # ── [훅 4] ORDER_REJECTED ────────────────────────
+                if _JOURNAL_ENABLED and _trade_id:
+                    try:
+                        _is_dry = result.get("_dry_run", False)
+                        _jnl.record_order_rejected(
+                            trade_id = _trade_id,
+                            market   = "KR",
+                            code     = code,
+                            rt_cd    = result.get("rt_cd", "?"),
+                            msg1     = result.get("msg1", ""),
+                            payload  = {"_dry_run": _is_dry,
+                                        "_live_disabled": result.get("_live_disabled", False)},
+                        )
+                    except Exception as _je:
+                        _jnl._inc_error("kr_order_rejected", _je)
+
                 logger.warning(
                     f"⚠️ {code} 주문 응답 이상 "
                     f"rt_cd={result.get('rt_cd','?')} "
@@ -569,6 +687,10 @@ class StrategyManager:
                                 using_compound=decision.get("using_compound", 0),
                                 is_full_add=is_full_add,
                             )
+                            # trade_id → 포지션에 저장
+                            if _trade_id and code in self.pyramid.positions:
+                                self.pyramid.positions[code].trade_id = _trade_id
+                                self.pyramid._save()
                             self._log_trade(
                                 "BUY", code, name, actual_price, actual_qty,
                                 decision["reason"] + " [잔고확인 자동등록]",
@@ -584,6 +706,26 @@ class StrategyManager:
                                     "pnl_state":      self.pnl_guard.state,
                                 }
                             )
+                            # ── [훅 5] ORDER_ACCEPTED (잔고 재확인 = 체결 확인됨) ─
+                            if _JOURNAL_ENABLED and _trade_id:
+                                try:
+                                    _jnl.record_order_accepted(
+                                        _trade_id, "KR", code, "0",
+                                        "잔고재확인체결",
+                                    )
+                                    _pos_r = self.pyramid.positions.get(code)
+                                    _jnl.record_order_filled(
+                                        trade_id       = _trade_id,
+                                        market         = "KR",
+                                        code           = code,
+                                        fill_price     = actual_price,
+                                        fill_qty       = actual_qty,
+                                        avg_price      = _pos_r.avg_price if _pos_r else actual_price,
+                                        buy_commission = decision.get("buy_commission"),
+                                        fill_confirmed = True,   # ★ 잔고 재확인 = 체결 확인
+                                    )
+                                except Exception as _je:
+                                    _jnl._inc_error("kr_fill_balance", _je)
                             return {
                                 "action":        "BUY",
                                 "code":          code, "name": name,
@@ -638,6 +780,10 @@ class StrategyManager:
                     using_compound=decision.get("using_compound", 0),
                     is_full_add=is_full_add,
                 )
+                # trade_id → 포지션에 저장 (재시작 후 매도 연결용)
+                if _trade_id and code in self.pyramid.positions:
+                    self.pyramid.positions[code].trade_id = _trade_id
+                    self.pyramid._save()
                 self._log_trade(
                     "BUY", code, name, price, qty,
                     decision["reason"], sess["session"],
@@ -652,6 +798,20 @@ class StrategyManager:
                         "pnl_state":      self.pnl_guard.state,
                     }
                 )
+                # ── [훅 6] ORDER_ACCEPTED (rt_cd=0 접수 성공, 체결 미확인) ──
+                # ★ ORDER_FILLED 는 실체결 확인 후에만 기록. rt_cd=0 은 접수이지 체결이 아님.
+                # ★ fill_price / fill_time 은 NULL 유지. 잔고 재확인 후에 ORDER_FILLED 기록.
+                if _JOURNAL_ENABLED and _trade_id:
+                    try:
+                        _jnl.record_order_accepted(
+                            _trade_id, "KR", code,
+                            result.get("rt_cd", "0"),
+                            result.get("msg1", "주문접수성공"),
+                        )
+                        # ORDER_FILLED 는 생략 — 실체결 확인 연동 미구현
+                        # (KIS 체결조회 또는 잔고 재확인 후 별도 호출 필요)
+                    except Exception as _je:
+                        _jnl._inc_error("kr_accepted_rtcd0", _je)
                 return {
                     "action":        "BUY",
                     "code":          code, "name": name,
@@ -725,9 +885,49 @@ class StrategyManager:
                     "session": sess["session"],
                 }
 
+            # ── [훅 8] SELL_SIGNAL_CONFIRMED — 포지션에서 trade_id 조회 ──
+            _sell_trade_id = ""
+            if _JOURNAL_ENABLED:
+                try:
+                    _sp = self.pyramid.positions.get(code)
+                    _sell_trade_id = _sp.trade_id if (_sp and _sp.trade_id) else ""
+                    _jnl.record_sell_signal(
+                        _sell_trade_id, "KR", code,
+                        sell_price  = price,
+                        sell_score  = sell_score,
+                        exit_reason = reason,
+                        payload     = {"is_forced": is_forced, "is_full": is_full,
+                                       "level": level, "session": sess["session"]},
+                    )
+                except Exception as _je:
+                    _jnl._inc_error("kr_sell_signal", _je)
+
+            # ── [훅 9] SELL_ORDER_SUBMITTED — api.sell() 직전 ──
+            if _JOURNAL_ENABLED:
+                try:
+                    _jnl.record_sell_order_submitted(
+                        _sell_trade_id, "KR", code,
+                        sell_price = use_price,
+                        sell_qty   = qty,
+                        payload    = {"ord_dvsn": ord_dvsn},
+                    )
+                except Exception as _je:
+                    _jnl._inc_error("kr_sell_submitted", _je)
+
             result = self.api.sell(code, qty, use_price, ord_dvsn=ord_dvsn)
 
             if result.get("rt_cd") == "0":
+                # ── [훅 10] SELL_ORDER_ACCEPTED — rt_cd=0 수신 후 ──
+                if _JOURNAL_ENABLED:
+                    try:
+                        _jnl.record_sell_order_accepted(
+                            _sell_trade_id, "KR", code,
+                            rt_cd = result.get("rt_cd", "0"),
+                            msg1  = result.get("msg1", "매도주문접수성공"),
+                        )
+                    except Exception as _je:
+                        _jnl._inc_error("kr_sell_accepted", _je)
+
                 profit  = self.pyramid.apply_sell(
                     code, qty, price, level=level, is_full=is_full
                 )
@@ -786,6 +986,15 @@ class StrategyManager:
                     is_stoploss= _is_sl,
                 )
 
+                # ── [훅 12/13 삭제] SELL_ORDER_FILLED + TRADE_CLOSED — 접수만으로는 기록 금지 ──
+                # ★ rt_cd=0 은 접수 성공이지 체결 확인이 아님.
+                # ★ SELL_ORDER_FILLED / TRADE_CLOSED 는 실체결 확인 후에만 기록한다.
+                # ★ 현재 KIS 매도 체결조회 미연동 → 훅 12/13 은 의도적으로 비어 있음.
+                # ★ 엔진은 이미 apply_sell()로 포지션 삭제 + pnl_guard.record() 완료.
+                #    저널은 SELL_ORDER_ACCEPTED 까지만 기록하고 체결 확인을 대기한다.
+                # (향후 KIS 체결조회 연동 시 이 위치에 record_sell_order_filled +
+                #  record_trade_closed 호출 추가 예정)
+
                 sell_result = {
                     "action":        "SELL",
                     "code":          code, "name": name,
@@ -826,6 +1035,16 @@ class StrategyManager:
                 f"msg_cd={result.get('msg_cd','?')} "
                 f"msg1={result.get('msg1','?')!r}"
             )
+            # ── [훅 11] SELL_ORDER_REJECTED ──
+            if _JOURNAL_ENABLED:
+                try:
+                    _jnl.record_sell_order_rejected(
+                        _sell_trade_id, "KR", code,
+                        rt_cd = result.get("rt_cd", "?"),
+                        msg1  = result.get("msg1", ""),
+                    )
+                except Exception as _je:
+                    _jnl._inc_error("kr_sell_rejected", _je)
             # ── ★ SELL_FAIL 경로에서도 재진입 차단 등록 ──────────
             # 이유: ORDER PRICE CHECK 차단 등 첫 시도 실패 후 재시도로
             # 나중에 체결될 수 있음 → 선제적으로 차단 등록 (오늘 자정까지)

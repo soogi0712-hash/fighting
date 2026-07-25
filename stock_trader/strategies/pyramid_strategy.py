@@ -230,6 +230,8 @@ class PyramidStrategyManager:
         # ★ 장중 고가까지 반영해 highest_price 정확히 갱신
         effective_high = max(cur_price, today_high) if today_high > 0 else cur_price
         pos.update_high(effective_high)
+        # ★ lowest_price 갱신 (거래 복기·max_drawdown_pct 용, 매매 판단 미사용)
+        pos.update_low(cur_price)
 
         # ★ 실질 수익률 계산 (수수료·세금 차감)
         net_pct = net_profit_pct_from_cost(pos.avg_price, cur_price)
@@ -790,12 +792,16 @@ class PyramidPosition:
         self.name          = name
         self.entry_price   = entry_price   # 최초 진입가 (순수 주가)
         self.highest_price = entry_price   # 고가 (트레일링 스탑용)
+        # ★ lowest_price: 거래 복기 및 max_drawdown_pct 계산용 (매매 판단에 미사용)
+        self.lowest_price  = entry_price   # 저가 (보유 중 최저가 추적)
         self.current_level = 0
         self.level_entries = {}            # {level: {price, avg_price, qty, remaining}}
         self.total_qty     = 0
         # ★ avg_price = 수수료 포함 주당 취득원가 (total_cost / total_qty)
         self.avg_price     = entry_price
         self.created_at    = datetime.now().isoformat()
+        # ★ trade_id: 거래 저널 연결용 (재시작 후에도 매수·매도 연결 유지)
+        self.trade_id: str = ""           # journal.make_trade_id()로 설정
 
     def add_level(self, level: int, qty: int, price: float,
                   total_cost: float = None):
@@ -841,6 +847,11 @@ class PyramidPosition:
         if price > self.highest_price:
             self.highest_price = price
 
+    def update_low(self, price: float):
+        """보유 중 최저가 갱신 (거래 복기·max_drawdown_pct 계산용, 매매 판단 미사용)."""
+        if price < self.lowest_price:
+            self.lowest_price = price
+
     def unrealized_pct(self, cur_price: float) -> float:
         """실질 미실현 수익률 (수수료·세금 차감)"""
         return net_profit_pct_from_cost(self.avg_price, cur_price)
@@ -852,10 +863,12 @@ class PyramidPosition:
             "entry_price":   self.entry_price,
             "avg_price":     round(self.avg_price, 4),
             "highest_price": self.highest_price,
+            "lowest_price":  self.lowest_price,
             "current_level": self.current_level,
             "total_qty":     self.total_qty,
             "levels":        self.level_entries,
             "created_at":    self.created_at,
+            "trade_id":      self.trade_id,
         }
 
     def to_dict(self) -> dict:
@@ -864,20 +877,26 @@ class PyramidPosition:
             "name":          self.name,
             "entry_price":   self.entry_price,
             "highest_price": self.highest_price,
+            "lowest_price":  self.lowest_price,
             "current_level": self.current_level,
             "avg_price":     self.avg_price,
             "total_qty":     self.total_qty,
             "level_entries": self.level_entries,
             "created_at":    self.created_at,
+            "trade_id":      self.trade_id,
         }
 
     @classmethod
     def from_dict(cls, d: dict):
         obj = cls(d["code"], d["name"], d["entry_price"])
         obj.highest_price = d.get("highest_price", d["entry_price"])
+        # ★ 하위 호환: 기존 저장 데이터에 lowest_price 없어도 정상 로드
+        obj.lowest_price  = d.get("lowest_price", d["entry_price"])
         obj.current_level = d.get("current_level", 0)
         obj.avg_price     = d.get("avg_price", d["entry_price"])
         obj.total_qty     = d.get("total_qty", 0)
         obj.level_entries = d.get("level_entries", {})
         obj.created_at    = d.get("created_at", datetime.now().isoformat())
+        # ★ 하위 호환: 기존 저장 데이터에 trade_id 없어도 정상 로드
+        obj.trade_id      = d.get("trade_id", "")
         return obj

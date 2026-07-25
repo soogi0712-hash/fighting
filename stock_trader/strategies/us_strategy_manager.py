@@ -57,6 +57,17 @@ from utils.market_session     import (
 from strategies.daily_pnl_guard import DailyPnLGuard
 from strategies.reentry_guard   import ReentryGuard, _is_stoploss_reason
 
+# ── Trading Journal (선택적 로드 — 실패 시 매매 루프 중단 없음) ──
+try:
+    import journal.trading_journal as _us_jnl
+    _US_JOURNAL_ENABLED = True
+except Exception as _uje:
+    _US_JOURNAL_ENABLED = False
+    import logging as _uj_logging
+    _uj_logging.getLogger("USStrategy").warning(
+        f"[US Journal] 로드 실패 — 저널 비활성화(매매 영향 없음): {_uje}"
+    )
+
 logger = get_logger("USStrategy")
 
 US_POSITIONS_FILE = os.path.join(
@@ -516,6 +527,7 @@ class USPosition:
         self.highest_price = avg_price
         self.current_level = 1
         self.created_at    = datetime.now().isoformat()
+        self.trade_id: str = ""   # ★ journal 연결용 (재시작 후 매수-매도 연결 유지)
 
     def update_high(self, price: float):
         if price > self.highest_price:
@@ -537,6 +549,7 @@ class USPosition:
             "current_level": self.current_level,
             "created_at":    self.created_at,
             "is_overseas":   True,
+            "trade_id":      self.trade_id,   # ★ 재시작 후 journal 연결 유지
         }
 
 
@@ -555,6 +568,7 @@ class USPositionManager:
                     p.highest_price = d.get("highest_price", d["avg_price"])
                     p.current_level = d.get("current_level", 1)
                     p.created_at    = d.get("created_at", "")
+                    p.trade_id      = d.get("trade_id", "")  # ★ 하위호환
                     self.positions[sym] = p
                 logger.info(f"[US포지션] {len(self.positions)}개 로드")
         except Exception as e:
@@ -1700,11 +1714,58 @@ class USStrategyManager:
                     "reason": f"잔고부족: {capacity_msg}", "session": sess["session"]}
 
         # allow_krw_order=True → USD 실패 시 KIS 내부에서 원화 자동환전 재시도
+        # ── [US 훅 A] SIGNAL_CONFIRMED + trade_id 생성 ──
+        _us_trade_id = ""
+        if _US_JOURNAL_ENABLED:
+            try:
+                _us_trade_id = _us_jnl.make_trade_id("US", symbol)
+                _us_jnl.record_signal(
+                    _us_trade_id, "US", symbol, name,
+                    entry_type    = "FULL" if entry_ratio >= 1.0 else "EARLY",
+                    signal_price  = cur_price,
+                    buy_score     = iv.get("buy_score", 0.0),
+                    sell_score    = 0.0,
+                    rsi           = iv.get("rsi"),
+                    bb_upper      = None, bb_middle = None, bb_lower = None,
+                    atr           = None,
+                    volume        = None, volume_ratio = iv.get("vol_ratio"),
+                    ai_total_score= None, rs_value = None,
+                    orderable_cash= None,
+                    session       = sess.get("session", ""),
+                    entry_reason  = entry_reason,
+                    payload       = {"excd": excd, "entry_ratio": entry_ratio,
+                                     "budget_usd": budget_usd, "qty": qty},
+                )
+            except Exception as _uje:
+                _us_jnl._inc_error("us_signal", _uje)
+
+        # ── [US 훅 B] ORDER_SUBMITTED — api.buy_us() 직전 ──
+        if _US_JOURNAL_ENABLED and _us_trade_id:
+            try:
+                _us_jnl.record_order_submitted(
+                    _us_trade_id, "US", symbol,
+                    order_price = cur_price,
+                    order_qty   = qty,
+                    payload     = {"excd": excd},
+                )
+            except Exception as _uje:
+                _us_jnl._inc_error("us_submitted", _uje)
+
         result   = self.api.buy_us(symbol, qty, cur_price, excd, allow_krw_order=True)
         order_ok = result.get("rt_cd") == "0"
         fail_msg = result.get("msg1", "")
 
         if not order_ok:
+            # ── [US 훅 C] ORDER_REJECTED ──
+            if _US_JOURNAL_ENABLED and _us_trade_id:
+                try:
+                    _us_jnl.record_order_rejected(
+                        _us_trade_id, "US", symbol,
+                        rt_cd = result.get("rt_cd", "?"),
+                        msg1  = fail_msg,
+                    )
+                except Exception as _uje:
+                    _us_jnl._inc_error("us_rejected", _uje)
             # KIS 거래불가 → 영구 블랙리스트
             if "해당종목" in fail_msg or "종목정보" in fail_msg or "해당 종목" in fail_msg:
                 logger.warning(f"🚫 {symbol} KIS거래불가 → 블랙리스트 등록: {fail_msg}")
@@ -1738,6 +1799,22 @@ class USStrategyManager:
 
         pos = USPosition(symbol, name, excd, qty, cur_price)
         self.pos_mgr.add(pos)
+        # ── [US 훅 D] ORDER_ACCEPTED (접수 성공, 체결 미확인) ──
+        # ★ ORDER_FILLED 는 실체결 확인 훅에만 기록. rt_cd=0 은 접수이지 체결이 아님.
+        # ★ US 체결조회 미연동 → ORDER_FILLED 는 의도적으로 비워 둔.
+        if _US_JOURNAL_ENABLED and _us_trade_id:
+            try:
+                _us_jnl.record_order_accepted(
+                    _us_trade_id, "US", symbol,
+                    rt_cd = result.get("rt_cd", "0"),
+                    msg1  = result.get("msg1", "US매수접수성공_체결미확인"),
+                )
+                # trade_id를 포지션에 저장 (매도 연결용)
+                _us_pos_saved = self.pos_mgr.positions.get(symbol)
+                if _us_pos_saved and hasattr(_us_pos_saved, "trade_id"):
+                    _us_pos_saved.trade_id = _us_trade_id
+            except Exception as _uje:
+                _us_jnl._inc_error("us_accepted", _uje)
         # ── [US OPEN SCAN] 첫 매수 기록 ──────────────────────
         self._record_first_buy()
         logger.info(
@@ -1751,8 +1828,47 @@ class USStrategyManager:
     def _do_add_buy(self, symbol, name, excd, pos, cur_price, sess, iv) -> dict:
         add_qty = max(1, int(INVEST_PER_TRADE_USD * ADD_BUY_RATIO / cur_price))
         # allow_krw_order=True → 추가매수도 원화환전 허용
+
+        # ── [US 훅 E] 추가매수 SIGNAL + SUBMITTED ──
+        _us_add_trade_id = ""
+        if _US_JOURNAL_ENABLED:
+            try:
+                _us_add_trade_id = _us_jnl.make_trade_id("US", symbol)
+                _us_jnl.record_signal(
+                    _us_add_trade_id, "US", symbol, name,
+                    entry_type    = "ADD",
+                    signal_price  = cur_price,
+                    buy_score     = iv.get("buy_score", 0.0),
+                    sell_score    = 0.0,
+                    rsi           = iv.get("rsi"),
+                    bb_upper=None, bb_middle=None, bb_lower=None, atr=None,
+                    volume=None, volume_ratio=iv.get("vol_ratio"),
+                    ai_total_score=None, rs_value=None, orderable_cash=None,
+                    session       = sess.get("session", ""),
+                    entry_reason  = "모멘텀추가매수",
+                    payload       = {"excd": excd, "qty": add_qty},
+                )
+                _us_jnl.record_order_submitted(
+                    _us_add_trade_id, "US", symbol,
+                    order_price = cur_price,
+                    order_qty   = add_qty,
+                    payload     = {"excd": excd, "add_buy": True},
+                )
+            except Exception as _uje:
+                _us_jnl._inc_error("us_add_signal", _uje)
+
         result  = self.api.buy_us(symbol, add_qty, cur_price, excd, allow_krw_order=True)
         if result.get("rt_cd") != "0":
+            # ── [US 훅 F] 추가매수 ORDER_REJECTED ──
+            if _US_JOURNAL_ENABLED and _us_add_trade_id:
+                try:
+                    _us_jnl.record_order_rejected(
+                        _us_add_trade_id, "US", symbol,
+                        rt_cd = result.get("rt_cd", "?"),
+                        msg1  = result.get("msg1", "추가매수실패"),
+                    )
+                except Exception as _uje:
+                    _us_jnl._inc_error("us_add_rejected", _uje)
             return {"action": "BUY_FAIL", "symbol": symbol, "name": name,
                     "reason": result.get("msg1", "추가매수실패"), "session": sess["session"]}
         new_qty = pos.qty + add_qty
@@ -1760,14 +1876,66 @@ class USStrategyManager:
         self.pos_mgr.update(symbol, new_qty, new_avg, 2)
         reason = (f"모멘텀추가매수: 수익{pos.net_pct(cur_price):+.1f}% "
                   f"vol{iv['vol_ratio']:.1f}x VWAP위 등락{iv['intraday_pct']:+.1f}%")
+        # ── [US 훅 G] 추가매수 ORDER_ACCEPTED (접수, 체결 미확인) ──
+        # ★ ORDER_FILLED 는 실체결 확인 훅에만 기록. US 체결조회 미연동 → 비워 둔.
+        if _US_JOURNAL_ENABLED and _us_add_trade_id:
+            try:
+                _us_jnl.record_order_accepted(
+                    _us_add_trade_id, "US", symbol,
+                    rt_cd = result.get("rt_cd", "0"),
+                    msg1  = result.get("msg1", "US추가매수접수성공_체결미확인"),
+                )
+            except Exception as _uje:
+                _us_jnl._inc_error("us_add_accepted", _uje)
         logger.info(f"🟢 US추가매수 {symbol} {add_qty}주 ${cur_price:.2f} | {reason}")
         return self._buy_result(symbol, name, excd, cur_price, add_qty, 2, sess, iv,
                                 reason, "[모멘텀추가]")
 
     def _do_sell(self, symbol, name, excd, qty, cur_price, reason, sess,
                  is_partial: bool = False) -> dict:
+        # ── [US 훅 H] SELL_SIGNAL_CONFIRMED — 포지션에서 trade_id 조회 ──
+        _us_sell_trade_id = ""
+        if _US_JOURNAL_ENABLED:
+            try:
+                _us_sell_pos = self.pos_mgr.positions.get(symbol)
+                if _us_sell_pos and hasattr(_us_sell_pos, "trade_id"):
+                    _us_sell_trade_id = _us_sell_pos.trade_id or ""
+                _us_jnl.record_sell_signal(
+                    _us_sell_trade_id, "US", symbol,
+                    sell_price  = cur_price,
+                    sell_score  = 0.0,
+                    exit_reason = reason,
+                    payload     = {"is_partial": is_partial, "qty": qty,
+                                   "session": sess.get("session", "")},
+                )
+            except Exception as _uje:
+                _us_jnl._inc_error("us_sell_signal", _uje)
+
+        # ── [US 훅 I] SELL_ORDER_SUBMITTED ──
+        if _US_JOURNAL_ENABLED:
+            try:
+                _us_jnl.record_sell_order_submitted(
+                    _us_sell_trade_id, "US", symbol,
+                    sell_price = cur_price,
+                    sell_qty   = qty,
+                    payload    = {"excd": excd},
+                )
+            except Exception as _uje:
+                _us_jnl._inc_error("us_sell_submitted", _uje)
+
         result  = self.api.sell_us(symbol, qty, cur_price, excd)
         if result.get("rt_cd") == "0":
+            # ── [US 훅 J] SELL_ORDER_ACCEPTED ──
+            if _US_JOURNAL_ENABLED:
+                try:
+                    _us_jnl.record_sell_order_accepted(
+                        _us_sell_trade_id, "US", symbol,
+                        rt_cd = result.get("rt_cd", "0"),
+                        msg1  = result.get("msg1", "US매도주문접수성공"),
+                    )
+                except Exception as _uje:
+                    _us_jnl._inc_error("us_sell_accepted", _uje)
+
             pos     = self.pos_mgr.positions.get(symbol)
             avg_p   = pos.avg_price if pos else cur_price
             pnl_usd = (cur_price - avg_p) * qty
@@ -1835,6 +2003,15 @@ class USStrategyManager:
                     is_stoploss= _is_sl,
                 )
 
+            # ── [US 훅 K 삭제] SELL_ORDER_FILLED + TRADE_CLOSED — 접수만으로는 기록 금지 ──
+            # ★ rt_cd=0 은 접수 성공이지 체결 확인이 아님.
+            # ★ SELL_ORDER_FILLED / TRADE_CLOSED 는 실체결 확인 훅에만 기록한다.
+            # ★ US 체결조회 미연동 → 훅 K는 의도적으로 비워 둔.
+            # (향후 US KIS 체결조회 연동 시 이 위치에
+            #  record_sell_order_filled + record_trade_closed 호출 추가 예정)
+            if False:  # placeholder — never executes
+                pass
+
             return {
                 "action":      action_tag,
                 "symbol":      symbol, "name": name, "excd": excd,
@@ -1849,6 +2026,16 @@ class USStrategyManager:
         # ★ 매도 실패 시 — '가능수량보다 큽니다' 오류 = KIS에 실제 잔고 없음
         # → 유령 포지션으로 판단하고 봇 포지션에서도 제거
         fail_msg = result.get('msg1', '매도실패')
+        # ── [US 훅 L] SELL_ORDER_REJECTED ──
+        if _US_JOURNAL_ENABLED:
+            try:
+                _us_jnl.record_sell_order_rejected(
+                    _us_sell_trade_id, "US", symbol,
+                    rt_cd = result.get("rt_cd", "?"),
+                    msg1  = fail_msg,
+                )
+            except Exception as _uje:
+                _us_jnl._inc_error("us_sell_rejected", _uje)
         if '가능수량' in fail_msg or '수량' in fail_msg:
             if symbol in self.pos_mgr.positions:
                 self.pos_mgr.remove(symbol)
