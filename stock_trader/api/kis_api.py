@@ -609,7 +609,11 @@ class KISApi:
             return {"rt_cd": "9", "msg1": f"쿨다운 중 ({remain:.1f}s 남음)"}
 
         url   = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-cash"
-        tr_id = "TTTC0802U" if order_type == "BUY" else "TTTC0801U"
+        from config import Config as _cfg
+        if _cfg.KIS_IS_REAL:
+            tr_id = "TTTC0012U" if order_type == "BUY" else "TTTC0011U"
+        else:
+            tr_id = "VTTC0012U" if order_type == "BUY" else "VTTC0011U"
 
         acc_no, acc_prod = self.account_no.split("-") \
             if "-" in self.account_no else (self.account_no, "01")
@@ -884,7 +888,14 @@ class KISApi:
                 "ord_dvsn_name": str, "ord_time": str}, ...]
         """
         url   = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl"
-        tr_id = "TTTC8036R"
+        from config import Config as _cfg
+        if not _cfg.KIS_IS_REAL:
+            logger.warning(
+                "[미체결조회] 모의투자 환경에서는 inquire-psbl-rvsecncl 미지원"
+                " — 빈 리스트 반환"
+            )
+            return []
+        tr_id = "TTTC0084R"
         acc_no, acc_prod = self.account_no.split("-") \
             if "-" in self.account_no else (self.account_no, "01")
 
@@ -948,7 +959,8 @@ class KISApi:
         if _guard is not None:
             return _guard
         url   = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-rvsecncl"
-        tr_id = "TTTC0803U"
+        from config import Config as _cfg
+        tr_id = "TTTC0013U" if _cfg.KIS_IS_REAL else "VTTC0013U"
         acc_no, acc_prod = self.account_no.split("-") \
             if "-" in self.account_no else (self.account_no, "01")
 
@@ -1007,7 +1019,8 @@ class KISApi:
         성공 시 주문 가능 현금(원) 반환, 실패 시 -1 반환
         """
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-psbl-order"
-        tr_id = "TTTC8908R"
+        from config import Config as _cfg
+        tr_id = "TTTC8908R" if _cfg.KIS_IS_REAL else "VTTC8908R"
         acc_no, acc_prod = self.account_no.split("-") \
             if "-" in self.account_no else (self.account_no, "01")
         params = {
@@ -1038,7 +1051,8 @@ class KISApi:
         ★ 캐시도 없으면 예수금 전용 API로 cash만 가져와서 합성 반환
         """
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
-        tr_id = "TTTC8434R"  # 실전 전용
+        from config import Config as _cfg
+        tr_id = "TTTC8434R" if _cfg.KIS_IS_REAL else "VTTC8434R"
         acc_no, acc_prod = self.account_no.split("-") \
             if "-" in self.account_no else (self.account_no, "01")
         params = {
@@ -1401,10 +1415,11 @@ class KISApi:
                    (USD 예수금 부족해도 원화 자동환전으로 주문 가능한 금액)
 
         KIS API 경로: /uapi/overseas-stock/v1/trading/inquire-psamount
-        TR_ID       : TTTS3007R (실전)
+        TR_ID       : TTTS3007R (실전), VTTS3007R (모의)
         """
         url   = f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-psamount"
-        tr_id = "TTTS3007R"
+        from config import Config as _cfg
+        tr_id = "TTTS3007R" if _cfg.KIS_IS_REAL else "VTTS3007R"
         acc_no, acc_prod = self.account_no.split("-") \
             if "-" in self.account_no else (self.account_no, "01")
         # ★ ITEM_CD 필수: 빈값이면 APBN0746 ('상품이 없습니다') 에러
@@ -1469,7 +1484,8 @@ class KISApi:
         반환: {"krw": float, "usd": float, "raw": dict}
         """
         url   = f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-psamount"
-        tr_id = "TTTS3007R"
+        from config import Config as _cfg
+        tr_id = "TTTS3007R" if _cfg.KIS_IS_REAL else "VTTS3007R"
         acc_no, acc_prod = self.account_no.split("-") \
             if "-" in self.account_no else (self.account_no, "01")
 
@@ -1542,7 +1558,8 @@ class KISApi:
         if _guard is not None:
             return _guard
         url   = f"{self.base_url}/uapi/overseas-stock/v1/trading/order"
-        tr_id = "TTTT1002U"   # 실전 해외주식 매수
+        from config import Config as _cfg
+        tr_id = "TTTT1002U" if _cfg.KIS_IS_REAL else "VTTT1002U"   # 해외주식 매수
         acc_no, acc_prod = self.account_no.split("-") \
             if "-" in self.account_no else (self.account_no, "01")
 
@@ -1650,6 +1667,8 @@ class KISApi:
 
         # ovrs_ord_psbl_amt=0 이지만 frcr_ord_psbl_amt1>0 이면 USD 주문으로 진행
         # (이 경우 _buy_us_krw_fallback이 아닌 일반 USD 주문으로 처리됨)
+        from config import Config as _cfg
+        _tr_id_buy = "TTTT1002U" if _cfg.KIS_IS_REAL else "VTTT1002U"
         if krw_avail <= 0 and usd_avail > 0:
             logger.info(
                 f"💱 [{symbol}] ovrs_ord_psbl=0 but frcr_ord_psbl=${usd_avail:.2f} → USD직접 재시도"
@@ -1673,7 +1692,7 @@ class KISApi:
             }
             try:
                 r2 = requests.post(url2,
-                                   headers=self._headers("TTTT1002U", use_hash=True, body=body2),
+                                   headers=self._headers(tr_id, use_hash=True, body=body2),
                                    json=body2, timeout=10)
                 r2.raise_for_status()
                 result2 = r2.json()
@@ -1718,11 +1737,11 @@ class KISApi:
             )
             qty = max_qty
 
-        # ③ 원화 자동환전 주문 (KIS: TTTT1002U, 원화결제 모드)
+        # ③ 원화 자동환전 주문 (KIS: TTTT1002U/VTTT1002U, 원화결제 모드)
         #    KIS에서 원화결제 주문: ORD_DVSN="00", OVRS_ORD_UNPR=지정가 그대로
         #    (KIS 서버가 원화잔고에서 자동환전 처리)
         url   = f"{self.base_url}/uapi/overseas-stock/v1/trading/order"
-        tr_id = "TTTT1002U"
+        tr_id = _tr_id_buy   # 이미 위에서 실전/모의 분기 완료
         ord_price = f"{price:.2f}" if price > 0 else "0"
 
         body = {
@@ -1776,7 +1795,8 @@ class KISApi:
         if _guard is not None:
             return _guard
         url   = f"{self.base_url}/uapi/overseas-stock/v1/trading/order"
-        tr_id = "TTTT1006U"   # 실전 해외주식 매도
+        from config import Config as _cfg
+        tr_id = "TTTT1006U" if _cfg.KIS_IS_REAL else "VTTT1001U"   # 해외주식 매도 (모의: 1001, 실전: 1006)
         acc_no, acc_prod = self.account_no.split("-") \
             if "-" in self.account_no else (self.account_no, "01")
 
@@ -1819,7 +1839,8 @@ class KISApi:
         해외주식 보유잔고 + 예수금 조회 (실전)
         """
         url   = f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-balance"
-        tr_id = "TTTS3012R"   # 실전 해외주식 잔고
+        from config import Config as _cfg
+        tr_id = "TTTS3012R" if _cfg.KIS_IS_REAL else "VTTS3012R"   # 해외주식 잔고
         acc_no, acc_prod = self.account_no.split("-") \
             if "-" in self.account_no else (self.account_no, "01")
         params = {
@@ -1995,7 +2016,7 @@ class KISApi:
     def get_order_history(self, days: int = 7) -> list[dict]:
         """최근 체결 내역 조회"""
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
-        tr_id = "TTTC8001R"  # 실전 전용
+        tr_id = "TTTC0081R"  # 3개월이내 실전 (신버전, UI 전용)
         acc_no, acc_prod = self.account_no.split("-") \
             if "-" in self.account_no else (self.account_no, "01")
         start = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
@@ -2065,11 +2086,11 @@ class KISApi:
           응답 없거나 오류 시 {} 반환.
 
         실전/모의 TR_ID:
-          KIS_IS_REAL=True  → TTTC8001R
-          KIS_IS_REAL=False → VTTC8001R
+          KIS_IS_REAL=True  → TTTC0081R
+          KIS_IS_REAL=False → VTTC0081R
         """
         from config import Config as _Cfg
-        tr_id = "TTTC8001R" if _Cfg.KIS_IS_REAL else "VTTC8001R"
+        tr_id = "TTTC0081R" if _Cfg.KIS_IS_REAL else "VTTC0081R"
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
         acc_no, acc_prod = self.account_no.split("-") \
             if "-" in self.account_no else (self.account_no, "01")
