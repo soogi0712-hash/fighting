@@ -7,14 +7,28 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Config:
-    # ── KIS API (실전 전용) ───────────────────────────────────
+    # ── KIS API ───────────────────────────────────────────────
     KIS_APP_KEY    = os.getenv("KIS_APP_KEY", "")
     KIS_APP_SECRET = os.getenv("KIS_APP_SECRET", "")
     KIS_ACCOUNT_NO = os.getenv("KIS_ACCOUNT_NO", "")
 
-    # ★ 실전 투자 전용 — 모의투자 없음
-    KIS_IS_REAL = True
-    BASE_URL    = "https://openapi.koreainvestment.com:9443"
+    # ── KIS 투자 모드 (환경변수로 제어) ──────────────────────
+    # paper: 모의투자 (기본값, 안전)
+    # real:  실전투자 (명시적으로 KIS_MODE=real 설정 필요)
+    KIS_MODE = os.getenv("KIS_MODE", "paper")
+    _VALID_MODES = {"paper", "real"}
+    if KIS_MODE not in _VALID_MODES:
+        raise ValueError(
+            f"[config] KIS_MODE='{KIS_MODE}' 은 허용되지 않는 값입니다. "
+            f"허용값: {sorted(_VALID_MODES)} "
+            f"(예: KIS_MODE=paper 또는 KIS_MODE=real)"
+        )
+    KIS_IS_REAL = (KIS_MODE == "real")
+    BASE_URL = (
+        "https://openapi.koreainvestment.com:9443"
+        if KIS_IS_REAL else
+        "https://openapivts.koreainvestment.com:29443"
+    )
 
     # ── 실주문 전역 킬스위치 ─────────────────────────────────
     # LIVE_ORDER_ENABLED=false(기본) 이면 KIS 실주문 API를 절대 호출하지 않는다.

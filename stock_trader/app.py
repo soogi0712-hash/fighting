@@ -2470,11 +2470,11 @@ def setup():
     if request.method == "POST":
         env_path = os.path.join(os.path.dirname(__file__), ".env")
         with open(env_path, "w") as f:
-            # KIS API (실전 전용 — KIS_IS_REAL 항상 true)
+            # KIS API
             f.write(f"KIS_APP_KEY={request.form['app_key']}\n")
             f.write(f"KIS_APP_SECRET={request.form['app_secret']}\n")
             f.write(f"KIS_ACCOUNT_NO={request.form['account_no']}\n")
-            f.write("KIS_IS_REAL=true\n")
+            f.write("KIS_MODE=real\n")
             # 텔레그램
             f.write(f"TELEGRAM_BOT_TOKEN={request.form.get('tg_token','')}\n")
             f.write(f"TELEGRAM_CHAT_ID={request.form.get('tg_chat_id','')}\n")
@@ -3887,6 +3887,19 @@ if __name__ == "__main__":
     print("  📈 주식 자동매매 시스템")
     print(f"  🌐 http://0.0.0.0:{Config.DASHBOARD_PORT}")
     print("=" * 60)
+
+    # ── 기동 시 투자 모드/설정 로그 ──────────────────────────
+    _key_masked  = (f"{Config.KIS_APP_KEY[:4]}****{Config.KIS_APP_KEY[-4:]}"
+                   if len(Config.KIS_APP_KEY) > 8 else "****")
+    _acct_masked = (f"{Config.KIS_ACCOUNT_NO[:4]}****"
+                   if len(Config.KIS_ACCOUNT_NO) > 4 else "****")
+    logger.info(
+        f"[STARTUP] MODE={Config.KIS_MODE} | "
+        f"BASE_URL={Config.BASE_URL} | "
+        f"LIVE_ORDER_ENABLED={Config.LIVE_ORDER_ENABLED} | "
+        f"APP_KEY={_key_masked} | "
+        f"ACCOUNT={_acct_masked}"
+    )
 
     env_path = os.path.join(os.path.dirname(__file__), ".env")
     if os.path.exists(env_path) and os.path.getsize(env_path) > 10:
