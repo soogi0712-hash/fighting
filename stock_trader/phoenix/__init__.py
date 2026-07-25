@@ -35,6 +35,7 @@ from .lifecycle import (
     OrderLifecycleManager,
     make_order_lifecycle_id,
 )
+from .execution_driven import ExecutionDrivenPositionUpdater
 
 __all__ = [
     "Event", "EventType", "OrderSide", "OrderState", "IntentKind",
@@ -47,6 +48,8 @@ __all__ = [
     "LifecycleState", "LifecycleTransitionError", "LifecycleNotFoundError",
     "DuplicateClientOrderIdError", "TransitionValidator",
     "OrderLifecycle", "OrderLifecycleManager", "make_order_lifecycle_id",
+    # execution-driven position update
+    "ExecutionDrivenPositionUpdater",
 ]
 
 SCHEMA_VERSION = 1

@@ -53,6 +53,32 @@ from strategies.reentry_guard       import ReentryGuard
 from screener.trade_decision        import TradeDecisionEngine
 from screener.transaction_cost      import net_profit_pct_from_cost
 
+# ── Phoenix OrderLifecycle + Execution-driven position update ──────────
+try:
+    from phoenix.lifecycle import OrderLifecycleManager, make_order_lifecycle_id
+    from phoenix.execution_driven import ExecutionDrivenPositionUpdater
+    _LIFECYCLE_ENABLED = True
+except Exception as _lce:
+    _LIFECYCLE_ENABLED = False
+    import logging as _logging
+    _logging.getLogger("StrategyManager").warning(
+        f"[Lifecycle] import 실패 — lifecycle 비활성화: {_lce}"
+    )
+
+# ── FillObserver + PendingOrderRegistry (Phase 4) ──────────────────────
+try:
+    from journal.fill_observer import (
+        FillObserver, PendingOrderRegistry, PendingStatus,
+        poll_pending_orders_once,
+    )
+    _FILL_OBSERVER_ENABLED = True
+except Exception as _foe:
+    _FILL_OBSERVER_ENABLED = False
+    import logging as _logging
+    _logging.getLogger("StrategyManager").warning(
+        f"[FillObserver] import 실패 — fill observer 비활성화: {_foe}"
+    )
+
 # ── 거래 저널 import (기록 실패 시 매매 루프 무영향) ──────────
 try:
     import journal.trading_journal as _jnl
@@ -102,6 +128,56 @@ class StrategyManager:
         # ★ 재진입 차단 (국내장/미국장 공통 파일 기반)
         self.reentry = ReentryGuard()
 
+        # ★ Phoenix OrderLifecycle 관리 + Execution-driven 포지션 업데이트
+        # apply_buy() / apply_sell() 은 FILLED 전이 시에만 정확히 1회 실행.
+        self._lifecycle_mgr = None
+        self._updater       = None
+        # 미체결 대기 BUY meta: order_lifecycle_id → {name, level, using_compound, is_full_add,
+        #                                               buy_score, sell_score, ind_score,
+        #                                               trend_score, session, reason, trade_id}
+        self._pending_buy_meta: dict  = {}
+        # 미체결 대기 SELL meta: order_lifecycle_id → {code, name, qty, price, level, is_full,
+        #                                               reason, is_forced, buy_score, sell_score,
+        #                                               sell_urgent, trend_score, strength,
+        #                                               obv_state, vwap_state, bb_state,
+        #                                               elapsed_min, avg_price, max_net_pct,
+        #                                               vol_change_pct, session, order_label,
+        #                                               indicators, trade_id}
+        self._pending_sell_meta: dict = {}
+        # ★ Phase 4: PendingOrderRegistry + FillObserver (polling 대상 관리)
+        self._pending_registry = None
+        self._fill_observer    = None
+        if _LIFECYCLE_ENABLED:
+            try:
+                _jnl_db = os.path.join(
+                    os.path.dirname(__file__), "..", "data", "trading_journal.db"
+                )
+                self._lifecycle_mgr = OrderLifecycleManager(_jnl_db)
+                self._updater = ExecutionDrivenPositionUpdater(
+                    on_buy_filled  = self._handle_buy_filled,
+                    on_sell_filled = self._handle_sell_filled,
+                )
+                logger.info("[Lifecycle] OrderLifecycleManager 초기화 완료")
+            except Exception as _le:
+                logger.warning(f"[Lifecycle] 초기화 실패 — lifecycle 비활성화: {_le}")
+                self._lifecycle_mgr = None
+                self._updater       = None
+
+        if _FILL_OBSERVER_ENABLED:
+            try:
+                self._pending_registry = PendingOrderRegistry()
+                self._fill_observer    = FillObserver(
+                    kis_api         = kis_api,
+                    phoenix_db_path = None,
+                )
+                logger.info("[FillObserver] PendingOrderRegistry + FillObserver 초기화 완료")
+                # ★ 재시작 복원: load_all_active() → pending meta 재구성
+                self._restore_pending_meta_from_lifecycle()
+            except Exception as _foe2:
+                logger.warning(f"[FillObserver] 초기화 실패: {_foe2}")
+                self._pending_registry = None
+                self._fill_observer    = None
+
     # ── 하위 호환: daily_loss_krw 프로퍼티 ──────────────────
     @property
     def daily_loss_krw(self) -> float:
@@ -112,6 +188,513 @@ class StrategyManager:
     def positions(self) -> dict:
         return {code: pos.to_dict()
                 for code, pos in self.pyramid.positions.items()}
+
+    # ══════════════════════════════════════════════════════════
+    # Phoenix Execution-driven 콜백 (FILLED 시 호출)
+    # ══════════════════════════════════════════════════════════
+
+    def _handle_buy_filled(self, lc) -> None:
+        """BUY FILLED 시 apply_buy() 정확히 1회 호출.
+
+        OrderLifecycleManager.full_fill(on_filled=updater) 경유로만 호출된다.
+        이미 FILLED → OrderLifecycle.full_fill() 멱등 → on_filled 미호출 → 중복 없음.
+        """
+        meta = self._pending_buy_meta.pop(lc.order_lifecycle_id, None)
+        if meta is None:
+            logger.warning(
+                "[BUY FILLED] pending_buy_meta 없음 — apply_buy 스킵: "
+                "order_lifecycle_id=%s code=%s",
+                lc.order_lifecycle_id, lc.code,
+            )
+            return
+
+        code       = lc.code
+        name       = meta.get("name", code)
+        level      = meta.get("level", 1)
+        qty        = lc.filled_qty if lc.filled_qty > 0 else meta.get("qty", 0)
+        price      = lc.avg_fill_price if lc.avg_fill_price else meta.get("price", 0.0)
+        using_cmpd = meta.get("using_compound", 0)
+        is_full_add= meta.get("is_full_add", False)
+
+        if qty <= 0 or price <= 0:
+            logger.error(
+                "[BUY FILLED] 수량/가격 이상 — apply_buy 스킵: "
+                "order_lifecycle_id=%s qty=%s price=%s",
+                lc.order_lifecycle_id, qty, price,
+            )
+            return
+
+        # ── ★ 포지션 반영 ──────────────────────────────────
+        self.pyramid.apply_buy(
+            code, name, level, qty, price,
+            using_compound=using_cmpd,
+            is_full_add=is_full_add,
+        )
+
+        # trade_id → 포지션에 저장
+        _trade_id = meta.get("trade_id", "")
+        if _trade_id and code in self.pyramid.positions:
+            self.pyramid.positions[code].trade_id = _trade_id
+            self.pyramid._save()
+
+        logger.info(
+            "[BUY FILLED] apply_buy 완료: code=%s qty=%s @%s level=%s "
+            "order_lifecycle_id=%s",
+            code, qty, price, level, lc.order_lifecycle_id,
+        )
+
+        # ── 거래 로그 (FILLED 시각 기준) ──────────────────
+        self._log_trade(
+            "BUY", code, name, price, qty,
+            meta.get("reason", "BUY FILLED"),
+            meta.get("session", ""),
+            extra={
+                "level":         level,
+                "buy_score":     meta.get("buy_score"),
+                "sell_score":    meta.get("sell_score"),
+                "ind_score":     meta.get("ind_score"),
+                "trend_score":   meta.get("trend_score"),
+                "compound_pool": self.pyramid.compound_pool,
+                "realized_pnl":  self.pnl_guard.realized_pnl,
+                "pnl_state":     self.pnl_guard.state,
+                "fill_driven":   True,
+            },
+        )
+
+    def _handle_sell_filled(self, lc) -> None:
+        """SELL FILLED 시 apply_sell() + DailyPnLGuard + Cooldown + 실현손익 +
+        Pyramid 정리 + JSON 저장 정확히 1회 수행.
+
+        OrderLifecycleManager.full_fill(on_filled=updater) 경유로만 호출된다.
+        """
+        meta = self._pending_sell_meta.pop(lc.order_lifecycle_id, None)
+        if meta is None:
+            logger.warning(
+                "[SELL FILLED] pending_sell_meta 없음 — apply_sell 스킵: "
+                "order_lifecycle_id=%s code=%s",
+                lc.order_lifecycle_id, lc.code,
+            )
+            return
+
+        code    = lc.code
+        name    = meta.get("name", code)
+        qty     = lc.filled_qty if lc.filled_qty > 0 else meta.get("qty", 0)
+        price   = lc.avg_fill_price if lc.avg_fill_price else meta.get("price", 0.0)
+        level   = meta.get("level")
+        is_full = meta.get("is_full", True)
+        reason  = meta.get("reason", "SELL FILLED")
+        is_forced = meta.get("is_forced", False)
+
+        if qty <= 0 or price <= 0:
+            logger.error(
+                "[SELL FILLED] 수량/가격 이상 — apply_sell 스킵: "
+                "order_lifecycle_id=%s qty=%s price=%s",
+                lc.order_lifecycle_id, qty, price,
+            )
+            return
+
+        # ── ★ 포지션 반영 ──────────────────────────────────
+        profit = self.pyramid.apply_sell(
+            code, qty, price, level=level, is_full=is_full
+        )
+        net_pct_actual = profit.get("net_profit_pct", 0.0)
+        net_profit_amt = profit.get("net_profit", 0.0)
+
+        # ── ★ DailyPnLGuard 손익 기록 (상태 자동 평가) ────
+        self.pnl_guard.record(net_profit_amt)
+        pnl_status = self.pnl_guard.status_dict()
+
+        # ── ★ 재진입 차단 등록 (SELL FILLED 직후) ─────────
+        _is_sl = is_forced and "손절" in reason
+        self.reentry.record_sell(
+            market      = "KR",
+            code        = code,
+            name        = name,
+            reason      = reason,
+            is_stoploss = _is_sl,
+        )
+
+        logger.info(
+            "[SELL FILLED] apply_sell 완료: "
+            "code=%s qty=%s @%s level=%s "
+            "net_pct=%+.2f%% net_profit=%+.0f원 "
+            "pnl_state=%s order_lifecycle_id=%s",
+            code, qty, price, level,
+            net_pct_actual, net_profit_amt,
+            pnl_status["state"], lc.order_lifecycle_id,
+        )
+
+        # ── 매도 로그 ─────────────────────────────────────
+        self._log_trade(
+            "SELL", code, name, price, qty,
+            reason, meta.get("session", ""),
+            extra={
+                "level":        level,
+                "profit":       profit,
+                "net_pct":      net_pct_actual,
+                "is_forced":    is_forced,
+                "buy_score":    meta.get("buy_score"),
+                "sell_score":   meta.get("sell_score"),
+                "sell_urgent":  meta.get("sell_urgent"),
+                "trend_score":  meta.get("trend_score"),
+                "strength":     meta.get("strength"),
+                "obv_state":    meta.get("obv_state"),
+                "vwap_state":   meta.get("vwap_state"),
+                "bb_state":     meta.get("bb_state"),
+                "elapsed_min":  meta.get("elapsed_min"),
+                "compound_pool":  self.pyramid.compound_pool,
+                "realized_pnl":   pnl_status["realized_pnl"],
+                "peak_pnl":       pnl_status["peak_pnl"],
+                "pnl_state":      pnl_status["state"],
+                "fill_driven":    True,
+            },
+        )
+
+        # ★ Phase 4: SELL FILLED → 재배분 허용
+        # 전량 매도(is_full=True) + pnl_guard가 TRADING 상태이면 재배분 신호 발생
+        if is_full and self.pnl_guard.can_buy:
+            recycled_cash = net_profit_amt + (price * qty * 0.9975)  # 수수료 제거 근사
+            try:
+                self._try_recycle_to_strong(
+                    recycled_cash = recycled_cash,
+                    sold_code     = code,
+                    reason        = f"SELL_FILLED_RECYCLE:{reason[:60]}",
+                )
+            except Exception as _re:
+                logger.debug("[SELL FILLED] 재배분 스킵 (오류): %s", _re)
+
+    def dispatch_fill(
+        self,
+        order_lifecycle_id: str,
+        filled_qty: int,
+        avg_fill_price: float,
+        is_full: bool = True,
+    ) -> None:
+        """FillObserver → ExecutionObservation 수신 후 lifecycle 전이를 트리거.
+
+        FillObserver.poll_pending_orders_once() 가 수집한 ExecutionObservation 을
+        처리하기 위해 app.py 의 메인 루프 (또는 별도 폴링 스레드) 에서 호출한다.
+
+        Args:
+            order_lifecycle_id: 체결된 주문의 lifecycle ID
+            filled_qty:         이번 회 체결 수량 (delta, 누적 아님)
+            avg_fill_price:     평균 체결가
+            is_full:            True → full_fill, False → partial_fill (이번 단계 포지션 변경 없음)
+        """
+        if self._lifecycle_mgr is None:
+            logger.warning("[dispatch_fill] lifecycle_mgr 없음 — 스킵")
+            return
+
+        lc = self._lifecycle_mgr.load(order_lifecycle_id)
+        if lc is None:
+            logger.warning(
+                "[dispatch_fill] OrderLifecycle 조회 실패: "
+                "order_lifecycle_id=%s", order_lifecycle_id,
+            )
+            return
+
+        try:
+            if is_full:
+                # on_filled=self._updater → BUY/SELL FILLED 시 apply_buy/apply_sell 1회
+                self._lifecycle_mgr.full_fill(
+                    lc,
+                    delta=filled_qty,
+                    avg_price=avg_fill_price,
+                    on_filled=self._updater,
+                )
+            else:
+                # 부분체결 — 이번 단계에서는 포지션 변경 없음
+                self._lifecycle_mgr.partial_fill(lc, filled_qty, avg_fill_price)
+        except Exception as exc:
+            logger.error(
+                "[dispatch_fill] lifecycle 전이 오류: "
+                "order_lifecycle_id=%s is_full=%s error=%s",
+                order_lifecycle_id, is_full, exc,
+            )
+            raise
+
+    # ══════════════════════════════════════════════════════════
+    # Phase 4: _register_pending_order() — odno 추출 + PendingRegistry 등록
+    # ══════════════════════════════════════════════════════════
+
+    def _register_pending_order(
+        self,
+        market: str,
+        trade_id: str,
+        code: str,
+        side: str,
+        order_qty: int,
+        order_response: dict,
+        lifecycle_id: str,
+        exchange: str = None,
+        currency: str = "KRW",
+    ) -> str:
+        """KIS 주문 접수 응답에서 odno를 추출하고 PendingOrderRegistry에 등록.
+
+        KIS 국내 응답 구조: result["output"]["KNO_ORD_NO"]
+        KIS 해외 응답 구조: result["output"]["ODNO"]
+
+        Args:
+            market:         "KR" | "US"
+            trade_id:       journal trade_id (client_order_id)
+            code:           종목코드 / ticker
+            side:           "BUY" | "SELL"
+            order_qty:      주문 수량
+            order_response: KIS buy()/sell() 반환 dict
+            lifecycle_id:   OrderLifecycle.order_lifecycle_id
+            exchange:       US만 사용 (NASD/NYSE/AMEX)
+            currency:       "KRW" | "USD"
+
+        Returns:
+            odno (str) — 빈 문자열이면 추출 실패
+        """
+        if self._pending_registry is None or self._lifecycle_mgr is None:
+            return ""
+
+        try:
+            output = order_response.get("output", {}) or {}
+            if market == "KR":
+                odno = str(output.get("KNO_ORD_NO", "") or "").strip()
+            else:
+                # US: result["output"]["ODNO"]
+                odno = str(output.get("ODNO", "") or "").strip()
+
+            from datetime import datetime as _dt
+            submitted_at = _dt.now().isoformat()
+
+            # PendingOrderRegistry에 등록
+            self._pending_registry.register(
+                market             = market,
+                trade_id           = lifecycle_id,   # lifecycle_id를 trade_id로 사용
+                code               = code,
+                side               = side,
+                order_qty          = order_qty,
+                submitted_at       = submitted_at,
+                odno               = odno,
+                client_order_id    = trade_id,
+                raw_order_response = order_response,
+                exchange           = exchange,
+                currency           = currency,
+            )
+
+            # Lifecycle에도 odno 주입 (accept 시 odno 저장)
+            lc = self._lifecycle_mgr.load(lifecycle_id)
+            if lc is not None:
+                self._lifecycle_mgr.accept(lc, odno=odno)
+                logger.info(
+                    "[PendingRegistry] 등록 완료: market=%s code=%s side=%s "
+                    "odno=%r lifecycle_id=%s",
+                    market, code, side, odno, lifecycle_id,
+                )
+            else:
+                logger.warning(
+                    "[PendingRegistry] lifecycle 조회 실패 — odno만 등록: "
+                    "lifecycle_id=%s odno=%r", lifecycle_id, odno,
+                )
+
+            return odno
+
+        except Exception as exc:
+            logger.error(
+                "[PendingRegistry] 등록 오류: market=%s code=%s side=%s error=%s",
+                market, code, side, exc,
+            )
+            return ""
+
+    # ══════════════════════════════════════════════════════════
+    # Phase 4: run_fill_poll() — FillObserver → dispatch_fill() 자동 연결
+    # ══════════════════════════════════════════════════════════
+
+    def run_fill_poll(self) -> dict:
+        """FillObserver.poll_once() → dispatch_fill() 자동 연결.
+
+        ACCEPTED / PARTIALLY_FILLED 상태의 pending_orders를 KIS API로 1회 체결조회.
+        전량 체결된 주문은 dispatch_fill(is_full=True)로 lifecycle 전이 트리거.
+        부분 체결된 주문은 dispatch_fill(is_full=False)로 PARTIALLY_FILLED 전이.
+
+        app.py 메인 루프(또는 별도 스레드)에서 주기적으로 호출한다.
+
+        Returns:
+            {
+              "total": int,    # 조회한 pending 주문 수
+              "filled": int,   # 전량 체결 처리 수
+              "partial": int,  # 부분 체결 처리 수
+              "no_change": int,
+              "errors": int,
+              "dispatched": list,  # dispatch_fill 호출된 lifecycle_id 목록
+            }
+        """
+        if self._fill_observer is None or self._lifecycle_mgr is None:
+            return {
+                "total": 0, "filled": 0, "partial": 0,
+                "no_change": 0, "errors": 0, "dispatched": [],
+            }
+
+        dispatched = []
+        try:
+            poll_result = self._fill_observer.poll_once()
+        except Exception as exc:
+            logger.error("[run_fill_poll] poll_once 오류: %s", exc)
+            return {
+                "total": 0, "filled": 0, "partial": 0,
+                "no_change": 0, "errors": 1, "dispatched": [],
+            }
+
+        for detail in poll_result.get("details", []):
+            lifecycle_id = detail.get("trade_id", "")   # pending_orders.trade_id = lifecycle_id
+            fill_delta   = detail.get("fill_delta", 0)
+            cum_filled   = detail.get("cum_filled", 0)
+            status_after = detail.get("status_after", "")
+            error        = detail.get("error")
+
+            if error or fill_delta <= 0:
+                continue
+
+            if not lifecycle_id:
+                logger.warning("[run_fill_poll] lifecycle_id 없음 — 스킵: %s", detail)
+                continue
+
+            # pending_orders에서 order_qty 조회
+            pending_row = (self._pending_registry.get_by_trade_id(lifecycle_id)
+                           if self._pending_registry else None)
+            order_qty   = int((pending_row or {}).get("order_qty", 0) or 0)
+
+            # avg_fill_price는 FillObserver가 obs.average_fill_price로 제공하나
+            # detail에는 포함 안 됨 → lifecycle load 후 사용 or 0으로 처리
+            # 실제 avg_fill_price는 _poll_one 내부에서 registry.update_fill 전에
+            # obs.average_fill_price로 계산됨 — 여기서는 registry 재조회
+            avg_fill_price = 0.0
+            if pending_row:
+                # pending_orders에는 avg_fill_price 컬럼이 없으므로
+                # lc에서 avg_fill_price 가져오거나 0 사용
+                pass
+
+            # lc를 로드해서 avg_fill_price 취득 시도
+            try:
+                lc = self._lifecycle_mgr.load(lifecycle_id)
+                if lc and lc.avg_fill_price:
+                    avg_fill_price = lc.avg_fill_price
+            except Exception:
+                pass
+
+            is_full = (status_after == PendingStatus.FILLED)
+            try:
+                self.dispatch_fill(
+                    order_lifecycle_id = lifecycle_id,
+                    filled_qty         = fill_delta,
+                    avg_fill_price     = avg_fill_price,
+                    is_full            = is_full,
+                )
+                dispatched.append(lifecycle_id)
+                logger.info(
+                    "[run_fill_poll] dispatch_fill 완료: lifecycle_id=%s "
+                    "fill_delta=%s is_full=%s",
+                    lifecycle_id, fill_delta, is_full,
+                )
+            except Exception as exc:
+                logger.error(
+                    "[run_fill_poll] dispatch_fill 오류: lifecycle_id=%s error=%s",
+                    lifecycle_id, exc,
+                )
+
+        summary = {
+            "total":     poll_result.get("total",     0),
+            "filled":    poll_result.get("filled",    0),
+            "partial":   poll_result.get("partial",   0),
+            "no_change": poll_result.get("no_change", 0),
+            "errors":    poll_result.get("errors",    0),
+            "dispatched": dispatched,
+        }
+        if dispatched:
+            logger.info("[run_fill_poll] 완료: dispatched=%s", dispatched)
+        return summary
+
+    # ══════════════════════════════════════════════════════════
+    # Phase 4: _restore_pending_meta_from_lifecycle() — 재시작 복원
+    # ══════════════════════════════════════════════════════════
+
+    def _restore_pending_meta_from_lifecycle(self) -> None:
+        """프로세스 재시작 후 ACCEPTED 상태의 OrderLifecycle을 로드하여
+        _pending_buy_meta / _pending_sell_meta를 복원한다.
+
+        OrderLifecycle에는 code, side, order_qty, strategy_name이 저장되어 있으므로
+        meta의 필수 필드(code, side, qty)는 복원 가능.
+        name / price / reason 등 상세 필드는 lifecycle에 없어 기본값으로 채운다.
+        """
+        if self._lifecycle_mgr is None:
+            return
+
+        try:
+            active_lifecycles = self._lifecycle_mgr.load_all_active()
+        except Exception as exc:
+            logger.warning("[RestoreMeta] load_all_active 실패: %s", exc)
+            return
+
+        restored_buy  = 0
+        restored_sell = 0
+
+        for lc in active_lifecycles:
+            lc_id = lc.order_lifecycle_id
+            side  = (lc.side or "BUY").upper()
+
+            # 이미 in-memory에 있으면 스킵 (재시작이 아닌 경우 중복 방지)
+            if side == "BUY" and lc_id in self._pending_buy_meta:
+                continue
+            if side == "SELL" and lc_id in self._pending_sell_meta:
+                continue
+
+            # 기본 meta 재구성 — 상세 필드 없이 필수만
+            base_meta = {
+                "code":     lc.code,
+                "qty":      lc.filled_qty if lc.filled_qty > 0 else (lc.order_qty or 0),
+                "price":    lc.avg_fill_price or 0.0,
+                "trade_id": lc.trade_id or "",
+                "session":  "",
+                "reason":   "restored_on_restart",
+            }
+
+            if side == "BUY":
+                base_meta.update({
+                    "name":            lc.code,
+                    "level":           1,
+                    "using_compound":  0,
+                    "is_full_add":     False,
+                    "buy_score":       None,
+                    "sell_score":      None,
+                    "ind_score":       None,
+                    "trend_score":     None,
+                })
+                self._pending_buy_meta[lc_id] = base_meta
+                restored_buy += 1
+            else:
+                base_meta.update({
+                    "name":      lc.code,
+                    "level":     None,
+                    "is_full":   True,
+                    "is_forced": False,
+                    "buy_score": None,
+                    "sell_score": None,
+                    "sell_urgent": None,
+                    "trend_score": None,
+                    "strength":  None,
+                    "obv_state": None,
+                    "vwap_state": None,
+                    "bb_state":  None,
+                    "elapsed_min": None,
+                    "avg_price": 0.0,
+                    "max_net_pct": 0.0,
+                    "vol_change_pct": 0.0,
+                    "order_label": "",
+                    "indicators": {},
+                })
+                self._pending_sell_meta[lc_id] = base_meta
+                restored_sell += 1
+
+        if restored_buy or restored_sell:
+            logger.info(
+                "[RestoreMeta] 재시작 복원 완료: BUY=%d SELL=%d lifecycle 복원됨",
+                restored_buy, restored_sell,
+            )
 
     # ══════════════════════════════════════════════════════════
     # 메인 실행
@@ -682,30 +1265,80 @@ class StrategyManager:
                         )
                         if code not in self.pyramid.positions:
                             is_full_add = (action == "BUY_LEVEL1_FULL_ADD")
-                            self.pyramid.apply_buy(
-                                code, name, level, actual_qty, actual_price,
-                                using_compound=decision.get("using_compound", 0),
-                                is_full_add=is_full_add,
-                            )
-                            # trade_id → 포지션에 저장
-                            if _trade_id and code in self.pyramid.positions:
-                                self.pyramid.positions[code].trade_id = _trade_id
-                                self.pyramid._save()
-                            self._log_trade(
-                                "BUY", code, name, actual_price, actual_qty,
-                                decision["reason"] + " [잔고확인 자동등록]",
-                                sess["session"],
-                                extra={
-                                    "level":          level,
-                                    "buy_score":      buy_score,
-                                    "sell_score":     sell_score,
-                                    "ind_score":      ind_score,
-                                    "trend_score":    trend_score,
-                                    "compound_pool":  self.pyramid.compound_pool,
-                                    "realized_pnl":   self.pnl_guard.realized_pnl,
-                                    "pnl_state":      self.pnl_guard.state,
-                                }
-                            )
+                            # ── ★ Phase 3: apply_buy 제거 → lifecycle 등록 ──
+                            # 잔고 재확인 = 이미 체결 확인됨 → 즉시 full_fill 트리거
+                            _lc_id_bal = None
+                            if self._lifecycle_mgr is not None:
+                                try:
+                                    _lc_id_bal = make_order_lifecycle_id("KR", "BUY", code)
+                                    _lc_bal = self._lifecycle_mgr.create(
+                                        trade_id       = _trade_id or _lc_id_bal,
+                                        market         = "KR",
+                                        code           = code,
+                                        side           = "BUY",
+                                        strategy_name  = "StrategyManager",
+                                        order_qty      = actual_qty,
+                                    )
+                                    self._lifecycle_mgr.accept(_lc_bal)
+                                    # 잔고 재확인 경로 = 즉시 체결 확인
+                                    self._pending_buy_meta[_lc_bal.order_lifecycle_id] = {
+                                        "name": name, "level": level,
+                                        "using_compound": decision.get("using_compound", 0),
+                                        "is_full_add": is_full_add,
+                                        "buy_score": buy_score, "sell_score": sell_score,
+                                        "ind_score": ind_score, "trend_score": trend_score,
+                                        "session": sess["session"],
+                                        "reason": decision["reason"] + " [잔고확인 자동등록]",
+                                        "trade_id": _trade_id,
+                                        "qty": actual_qty, "price": actual_price,
+                                    }
+                                    # 즉시 full_fill → apply_buy 1회
+                                    self._lifecycle_mgr.full_fill(
+                                        _lc_bal,
+                                        delta=actual_qty,
+                                        avg_price=actual_price,
+                                        on_filled=self._updater,
+                                    )
+                                except Exception as _lce2:
+                                    logger.warning(
+                                        f"[BUY 잔고재확인 Lifecycle] 오류 — "
+                                        f"직접 apply_buy 폴백: {_lce2}"
+                                    )
+                                    # 폴백: lifecycle 실패 시 기존 방식
+                                    self.pyramid.apply_buy(
+                                        code, name, level, actual_qty, actual_price,
+                                        using_compound=decision.get("using_compound", 0),
+                                        is_full_add=is_full_add,
+                                    )
+                                    if _trade_id and code in self.pyramid.positions:
+                                        self.pyramid.positions[code].trade_id = _trade_id
+                                        self.pyramid._save()
+                            else:
+                                # lifecycle 비활성 → 기존 방식
+                                self.pyramid.apply_buy(
+                                    code, name, level, actual_qty, actual_price,
+                                    using_compound=decision.get("using_compound", 0),
+                                    is_full_add=is_full_add,
+                                )
+                                # trade_id → 포지션에 저장
+                                if _trade_id and code in self.pyramid.positions:
+                                    self.pyramid.positions[code].trade_id = _trade_id
+                                    self.pyramid._save()
+                                self._log_trade(
+                                    "BUY", code, name, actual_price, actual_qty,
+                                    decision["reason"] + " [잔고확인 자동등록]",
+                                    sess["session"],
+                                    extra={
+                                        "level":          level,
+                                        "buy_score":      buy_score,
+                                        "sell_score":     sell_score,
+                                        "ind_score":      ind_score,
+                                        "trend_score":    trend_score,
+                                        "compound_pool":  self.pyramid.compound_pool,
+                                        "realized_pnl":   self.pnl_guard.realized_pnl,
+                                        "pnl_state":      self.pnl_guard.state,
+                                    }
+                                )
                             # ── [훅 5] ORDER_ACCEPTED (잔고 재확인 = 체결 확인됨) ─
                             if _JOURNAL_ENABLED and _trade_id:
                                 try:
@@ -775,29 +1408,100 @@ class StrategyManager:
             # ── 명확한 성공(rt_cd==0) ──────────────────────
             if order_ok:
                 is_full_add = (action == "BUY_LEVEL1_FULL_ADD")
-                self.pyramid.apply_buy(
-                    code, name, level, qty, price,
-                    using_compound=decision.get("using_compound", 0),
-                    is_full_add=is_full_add,
-                )
-                # trade_id → 포지션에 저장 (재시작 후 매도 연결용)
-                if _trade_id and code in self.pyramid.positions:
-                    self.pyramid.positions[code].trade_id = _trade_id
-                    self.pyramid._save()
-                self._log_trade(
-                    "BUY", code, name, price, qty,
-                    decision["reason"], sess["session"],
-                    extra={
-                        "level":          level,
-                        "buy_score":      buy_score,
-                        "sell_score":     sell_score,
-                        "ind_score":      ind_score,
-                        "trend_score":    trend_score,
-                        "compound_pool":  self.pyramid.compound_pool,
-                        "realized_pnl":   self.pnl_guard.realized_pnl,
-                        "pnl_state":      self.pnl_guard.state,
-                    }
-                )
+                # ── ★ Phase 3: apply_buy 제거 → lifecycle 등록 ──
+                # rt_cd=0 = 주문 접수 성공이지 체결이 아님.
+                # apply_buy 는 FILLED 전이 후 _handle_buy_filled 에서 1회 호출된다.
+                _lc_id_ok = None
+                if self._lifecycle_mgr is not None:
+                    try:
+                        _lc_id_ok = make_order_lifecycle_id("KR", "BUY", code)
+                        _lc_ok = self._lifecycle_mgr.create(
+                            trade_id      = _trade_id or _lc_id_ok,
+                            market        = "KR",
+                            code          = code,
+                            side          = "BUY",
+                            strategy_name = "StrategyManager",
+                            order_qty     = qty,
+                        )
+                        self._lifecycle_mgr.accept(_lc_ok)
+                        self._pending_buy_meta[_lc_ok.order_lifecycle_id] = {
+                            "name": name, "level": level,
+                            "using_compound": decision.get("using_compound", 0),
+                            "is_full_add": is_full_add,
+                            "buy_score": buy_score, "sell_score": sell_score,
+                            "ind_score": ind_score, "trend_score": trend_score,
+                            "session": sess["session"],
+                            "reason": decision["reason"],
+                            "trade_id": _trade_id,
+                            "qty": qty, "price": price,
+                        }
+                        # ★ Phase 4: odno 추출 → PendingRegistry 자동 등록
+                        self._register_pending_order(
+                            market        = "KR",
+                            trade_id      = _trade_id or "",
+                            code          = code,
+                            side          = "BUY",
+                            order_qty     = qty,
+                            order_response= result,
+                            lifecycle_id  = _lc_ok.order_lifecycle_id,
+                        )
+                        logger.info(
+                            "[BUY ACCEPTED] lifecycle 등록 완료 — "
+                            "apply_buy 대기 중: order_lifecycle_id=%s code=%s qty=%s",
+                            _lc_ok.order_lifecycle_id, code, qty,
+                        )
+                    except Exception as _lce3:
+                        logger.warning(
+                            f"[BUY rt_cd=0 Lifecycle] 오류 — "
+                            f"직접 apply_buy 폴백: {_lce3}"
+                        )
+                        # 폴백: lifecycle 실패 시 기존 방식
+                        self.pyramid.apply_buy(
+                            code, name, level, qty, price,
+                            using_compound=decision.get("using_compound", 0),
+                            is_full_add=is_full_add,
+                        )
+                        if _trade_id and code in self.pyramid.positions:
+                            self.pyramid.positions[code].trade_id = _trade_id
+                            self.pyramid._save()
+                        self._log_trade(
+                            "BUY", code, name, price, qty,
+                            decision["reason"] + " [fallback]", sess["session"],
+                            extra={
+                                "level":          level,
+                                "buy_score":      buy_score,
+                                "sell_score":     sell_score,
+                                "ind_score":      ind_score,
+                                "trend_score":    trend_score,
+                                "compound_pool":  self.pyramid.compound_pool,
+                                "realized_pnl":   self.pnl_guard.realized_pnl,
+                                "pnl_state":      self.pnl_guard.state,
+                            }
+                        )
+                else:
+                    # lifecycle 비활성 → 기존 방식 유지
+                    self.pyramid.apply_buy(
+                        code, name, level, qty, price,
+                        using_compound=decision.get("using_compound", 0),
+                        is_full_add=is_full_add,
+                    )
+                    if _trade_id and code in self.pyramid.positions:
+                        self.pyramid.positions[code].trade_id = _trade_id
+                        self.pyramid._save()
+                    self._log_trade(
+                        "BUY", code, name, price, qty,
+                        decision["reason"], sess["session"],
+                        extra={
+                            "level":          level,
+                            "buy_score":      buy_score,
+                            "sell_score":     sell_score,
+                            "ind_score":      ind_score,
+                            "trend_score":    trend_score,
+                            "compound_pool":  self.pyramid.compound_pool,
+                            "realized_pnl":   self.pnl_guard.realized_pnl,
+                            "pnl_state":      self.pnl_guard.state,
+                        }
+                    )
                 # ── [훅 6] ORDER_ACCEPTED (rt_cd=0 접수 성공, 체결 미확인) ──
                 # ★ ORDER_FILLED 는 실체결 확인 후에만 기록. rt_cd=0 은 접수이지 체결이 아님.
                 # ★ fill_price / fill_time 은 NULL 유지. 잔고 재확인 후에 ORDER_FILLED 기록.
@@ -830,6 +1534,7 @@ class StrategyManager:
                     "compound_pool": self.pyramid.compound_pool,
                     "realized_pnl":  self.pnl_guard.realized_pnl,
                     "pnl_state":     self.pnl_guard.state,
+                    "_lifecycle_id": _lc_id_ok,   # 폴링 루프에서 dispatch_fill 연결용
                 }
             return {
                 "action":       "BUY_FAIL",
@@ -928,79 +1633,165 @@ class StrategyManager:
                     except Exception as _je:
                         _jnl._inc_error("kr_sell_accepted", _je)
 
-                profit  = self.pyramid.apply_sell(
-                    code, qty, price, level=level, is_full=is_full
-                )
-                net_pct_actual = profit.get("net_profit_pct", 0.0)
-                net_profit_amt = profit.get("net_profit", 0.0)
+                # ── ★ Phase 3: apply_sell 제거 → lifecycle 등록 ──
+                # SELL ACCEPTED = 접수 성공이지 체결이 아님.
+                # apply_sell / DailyPnLGuard.record / reentry.record_sell 은
+                # SELL FILLED 시 _handle_sell_filled 에서만 1회 실행된다.
+                _sell_lc_id = None
+                if self._lifecycle_mgr is not None:
+                    try:
+                        _sell_lc_id = make_order_lifecycle_id("KR", "SELL", code)
+                        _sell_lc = self._lifecycle_mgr.create(
+                            trade_id      = _sell_trade_id or _sell_lc_id,
+                            market        = "KR",
+                            code          = code,
+                            side          = "SELL",
+                            strategy_name = "StrategyManager",
+                            order_qty     = qty,
+                        )
+                        self._lifecycle_mgr.accept(_sell_lc)
+                        # SELL FILLED 시 사용할 컨텍스트 저장
+                        self._pending_sell_meta[_sell_lc.order_lifecycle_id] = {
+                            "name":        name,
+                            "qty":         qty,
+                            "price":       price,
+                            "level":       level,
+                            "is_full":     is_full,
+                            "reason":      reason,
+                            "is_forced":   is_forced,
+                            "buy_score":   buy_score,
+                            "sell_score":  sell_score,
+                            "sell_urgent": sell_urgent,
+                            "trend_score": trend_score,
+                            "strength":    strength,
+                            "obv_state":   obv_state,
+                            "vwap_state":  vwap_state,
+                            "bb_state":    bb_state,
+                            "elapsed_min": elapsed_min,
+                            "avg_price":   avg_price,
+                            "max_net_pct": max_net_pct,
+                            "vol_change_pct": vol_change_pct,
+                            "session":     sess["session"],
+                            "order_label": sess["order_label"],
+                            "indicators":  iv,
+                            "trade_id":    _sell_trade_id,
+                        }
+                        # ★ Phase 4: odno 추출 → PendingRegistry 자동 등록
+                        self._register_pending_order(
+                            market        = "KR",
+                            trade_id      = _sell_trade_id or "",
+                            code          = code,
+                            side          = "SELL",
+                            order_qty     = qty,
+                            order_response= sell_result,
+                            lifecycle_id  = _sell_lc.order_lifecycle_id,
+                        )
+                        logger.info(
+                            "[SELL ACCEPTED] lifecycle 등록 완료 — "
+                            "apply_sell 대기 중: order_lifecycle_id=%s code=%s qty=%s",
+                            _sell_lc.order_lifecycle_id, code, qty,
+                        )
+                    except Exception as _slce:
+                        logger.warning(
+                            f"[SELL rt_cd=0 Lifecycle] 오류 — "
+                            f"직접 apply_sell 폴백: {_slce}"
+                        )
+                        # 폴백: lifecycle 실패 시 기존 방식
+                        profit = self.pyramid.apply_sell(
+                            code, qty, price, level=level, is_full=is_full
+                        )
+                        net_pct_actual = profit.get("net_profit_pct", 0.0)
+                        net_profit_amt = profit.get("net_profit", 0.0)
+                        self.pnl_guard.record(net_profit_amt)
+                        pnl_status = self.pnl_guard.status_dict()
+                        _is_sl = is_forced and "손절" in reason
+                        self.reentry.record_sell(
+                            market="KR", code=code, name=name,
+                            reason=reason, is_stoploss=_is_sl,
+                        )
+                        self._log_trade(
+                            "SELL", code, name, price, qty,
+                            reason + " [fallback]", sess["session"],
+                            extra={
+                                "level": level, "profit": profit,
+                                "net_pct": net_pct_actual,
+                                "is_forced": is_forced,
+                                "buy_score": buy_score, "sell_score": sell_score,
+                                "sell_urgent": sell_urgent, "trend_score": trend_score,
+                                "strength": strength, "obv_state": obv_state,
+                                "vwap_state": vwap_state, "bb_state": bb_state,
+                                "elapsed_min": elapsed_min,
+                                "compound_pool": self.pyramid.compound_pool,
+                                "realized_pnl": pnl_status["realized_pnl"],
+                                "peak_pnl": pnl_status["peak_pnl"],
+                                "pnl_state": pnl_status["state"],
+                            }
+                        )
+                        return {
+                            "action": "SELL", "code": code, "name": name,
+                            "price": price, "qty": qty,
+                            "profit": profit, "net_pct": net_pct_actual,
+                            "is_full": is_full, "level": level, "reason": reason,
+                            "is_forced": is_forced,
+                            "buy_score": buy_score, "sell_score": sell_score,
+                            "session": sess["session"],
+                            "order_label": sess["order_label"],
+                            "compound_pool": self.pyramid.compound_pool,
+                            "indicators": iv, "trend_score": trend_score,
+                            "elapsed_min": elapsed_min,
+                            "realized_pnl": pnl_status["realized_pnl"],
+                            "peak_pnl": pnl_status["peak_pnl"],
+                            "pnl_state": pnl_status["state"],
+                        }
+                else:
+                    # lifecycle 비활성 → 기존 방식 유지
+                    profit = self.pyramid.apply_sell(
+                        code, qty, price, level=level, is_full=is_full
+                    )
+                    net_pct_actual = profit.get("net_profit_pct", 0.0)
+                    net_profit_amt = profit.get("net_profit", 0.0)
+                    self.pnl_guard.record(net_profit_amt)
+                    pnl_status = self.pnl_guard.status_dict()
+                    logger.info(
+                        f"[SELL] {name}({code}) | "
+                        f"매수가={avg_price:,.0f}원 → 매도가={price:,.0f}원 | "
+                        f"실질수익={net_pct_actual:+.2f}% | 최고수익={max_net_pct:+.2f}% | "
+                        f"BUY_SCORE={buy_score:.2f} | SELL_SCORE={sell_score}/27 | "
+                        f"거래량변화={vol_change_pct:+.1f}% | 체결강도={strength:.1f} | "
+                        f"OBV={obv_state} | VWAP={vwap_state} | BB={bb_state} | "
+                        f"매도사유={reason} | 보유시간={elapsed_min:.0f}분 | "
+                        f"일일손익={pnl_status['realized_pnl']:+,.0f}원 "
+                        f"(최고={pnl_status['peak_pnl']:+,.0f}원, 상태={pnl_status['state']})"
+                    )
+                    self._log_trade(
+                        "SELL", code, name, price, qty, reason, sess["session"],
+                        extra={
+                            "level": level, "profit": profit,
+                            "net_pct": net_pct_actual, "is_forced": is_forced,
+                            "buy_score": buy_score, "sell_score": sell_score,
+                            "sell_urgent": sell_urgent, "trend_score": trend_score,
+                            "strength": strength, "obv_state": obv_state,
+                            "vwap_state": vwap_state, "bb_state": bb_state,
+                            "elapsed_min": elapsed_min,
+                            "compound_pool": self.pyramid.compound_pool,
+                            "realized_pnl": pnl_status["realized_pnl"],
+                            "peak_pnl": pnl_status["peak_pnl"],
+                            "pnl_state": pnl_status["state"],
+                        }
+                    )
+                    _is_sl = is_forced and "손절" in reason
+                    self.reentry.record_sell(
+                        market="KR", code=code, name=name,
+                        reason=reason, is_stoploss=_is_sl,
+                    )
 
-                # ★ DailyPnLGuard 손익 기록 (상태 자동 평가)
-                self.pnl_guard.record(net_profit_amt)
-                pnl_status = self.pnl_guard.status_dict()
-
-                # ── 매도 로그 (매도 사유 포함 14항목) ─
-                logger.info(
-                    f"[SELL] {name}({code}) | "
-                    f"매수가={avg_price:,.0f}원 → 매도가={price:,.0f}원 | "
-                    f"실질수익={net_pct_actual:+.2f}% | 최고수익={max_net_pct:+.2f}% | "
-                    f"BUY_SCORE={buy_score:.2f} | SELL_SCORE={sell_score}/27 | "
-                    f"거래량변화={vol_change_pct:+.1f}% | 체결강도={strength:.1f} | "
-                    f"OBV={obv_state} | VWAP={vwap_state} | BB={bb_state} | "
-                    f"매도사유={reason} | 보유시간={elapsed_min:.0f}분 | "
-                    f"일일손익={pnl_status['realized_pnl']:+,.0f}원 "
-                    f"(최고={pnl_status['peak_pnl']:+,.0f}원, 상태={pnl_status['state']})"
-                )
-
-                self._log_trade(
-                    "SELL", code, name, price, qty,
-                    reason, sess["session"],
-                    extra={
-                        "level":          level,
-                        "profit":         profit,
-                        "net_pct":        net_pct_actual,
-                        "is_forced":      is_forced,
-                        "buy_score":      buy_score,
-                        "sell_score":     sell_score,
-                        "sell_urgent":    sell_urgent,
-                        "trend_score":    trend_score,
-                        "strength":       strength,
-                        "obv_state":      obv_state,
-                        "vwap_state":     vwap_state,
-                        "bb_state":       bb_state,
-                        "elapsed_min":    elapsed_min,
-                        "compound_pool":   self.pyramid.compound_pool,
-                        "realized_pnl":    pnl_status["realized_pnl"],
-                        "peak_pnl":        pnl_status["peak_pnl"],
-                        "pnl_state":       pnl_status["state"],
-                    }
-                )
-
-                # ── ★ 재진입 차단 등록 (SELL 체결 완료 직후) ──────
-                # is_forced + "손절" 포함 여부로 손절 판단
-                _is_sl = is_forced and "손절" in reason
-                self.reentry.record_sell(
-                    market     = "KR",
-                    code       = code,
-                    name       = name,
-                    reason     = reason,
-                    is_stoploss= _is_sl,
-                )
-
-                # ── [훅 12/13 삭제] SELL_ORDER_FILLED + TRADE_CLOSED — 접수만으로는 기록 금지 ──
-                # ★ rt_cd=0 은 접수 성공이지 체결 확인이 아님.
-                # ★ SELL_ORDER_FILLED / TRADE_CLOSED 는 실체결 확인 후에만 기록한다.
-                # ★ 현재 KIS 매도 체결조회 미연동 → 훅 12/13 은 의도적으로 비어 있음.
-                # ★ 엔진은 이미 apply_sell()로 포지션 삭제 + pnl_guard.record() 완료.
-                #    저널은 SELL_ORDER_ACCEPTED 까지만 기록하고 체결 확인을 대기한다.
-                # (향후 KIS 체결조회 연동 시 이 위치에 record_sell_order_filled +
-                #  record_trade_closed 호출 추가 예정)
-
+                # SELL ACCEPTED 반환 — 포지션은 아직 변경되지 않음
+                # (lifecycle 활성: FILLED 폴링 후 _handle_sell_filled 에서 반영)
+                # (lifecycle 비활성: 이미 위에서 반영 완료)
                 sell_result = {
                     "action":        "SELL",
                     "code":          code, "name": name,
                     "price":         price, "qty": qty,
-                    "profit":        profit,
-                    "net_pct":       net_pct_actual,
                     "is_full":       is_full,
                     "level":         level,
                     "reason":        reason,
@@ -1013,19 +1804,22 @@ class StrategyManager:
                     "indicators":    iv,
                     "trend_score":   trend_score,
                     "elapsed_min":   elapsed_min,
-                    "realized_pnl":  pnl_status["realized_pnl"],
-                    "peak_pnl":      pnl_status["peak_pnl"],
-                    "pnl_state":     pnl_status["state"],
+                    "realized_pnl":  self.pnl_guard.realized_pnl,
+                    "peak_pnl":      self.pnl_guard.peak_pnl,
+                    "pnl_state":     self.pnl_guard.state,
+                    "_lifecycle_id": _sell_lc_id,  # 폴링 루프에서 dispatch_fill 연결용
                 }
 
-                # ★ 손절 후 즉시 재배분
-                if is_forced and "손절" in reason and is_full:
-                    recycled = profit.get("net_proceeds", 0.0)
-                    realloc  = self._try_recycle_to_strong(
-                        recycled, sess, ind_score, ind_cutoff
-                    )
-                    sell_result["recycled_cash"]     = recycled
-                    sell_result["realloc_attempted"] = realloc
+                # ★ 손절 후 즉시 재배분 (lifecycle 활성 시 — 체결 대기 전 재배분은 위험)
+                # lifecycle 비활성 경우만 즉시 재배분 (기존 동작 유지)
+                if self._lifecycle_mgr is None:
+                    if is_forced and "손절" in reason and is_full:
+                        recycled = profit.get("net_proceeds", 0.0)
+                        realloc  = self._try_recycle_to_strong(
+                            recycled, sess, ind_score, ind_cutoff
+                        )
+                        sell_result["recycled_cash"]     = recycled
+                        sell_result["realloc_attempted"] = realloc
 
                 return sell_result
 
@@ -1208,11 +2002,61 @@ class StrategyManager:
                 use_price = cur_price if ord_dvsn == "05" else 0
                 res       = self.api.buy(code, qty, use_price, ord_dvsn=ord_dvsn)
                 if res.get("rt_cd") == "0":
-                    self.pyramid.apply_buy(
-                        code, tgt["name"],
-                        add_dec["level"], qty, cur_price,
-                        using_compound=add_dec.get("using_compound", 0)
-                    )
+                    # ── ★ Phase 3: 재배분 추가매수도 lifecycle 등록 ──
+                    if self._lifecycle_mgr is not None:
+                        try:
+                            _realloc_lc_id = make_order_lifecycle_id("KR", "BUY", code)
+                            _realloc_lc = self._lifecycle_mgr.create(
+                                trade_id      = _realloc_lc_id,
+                                market        = "KR",
+                                code          = code,
+                                side          = "BUY",
+                                strategy_name = "StrategyManager_Realloc",
+                                order_qty     = qty,
+                            )
+                            self._lifecycle_mgr.accept(_realloc_lc)
+                            self._pending_buy_meta[_realloc_lc.order_lifecycle_id] = {
+                                "name": tgt["name"],
+                                "level": add_dec["level"],
+                                "using_compound": add_dec.get("using_compound", 0),
+                                "is_full_add": False,
+                                "session": sess["session"],
+                                "reason": f"손절재배분→{tgt['reason']}",
+                                "trade_id": "",
+                                "qty": qty, "price": cur_price,
+                            }
+                            # ★ Phase 4: odno 추출 → PendingRegistry 자동 등록
+                            self._register_pending_order(
+                                market        = "KR",
+                                trade_id      = _realloc_lc_id,
+                                code          = code,
+                                side          = "BUY",
+                                order_qty     = qty,
+                                order_response= res,
+                                lifecycle_id  = _realloc_lc.order_lifecycle_id,
+                            )
+                            logger.info(
+                                "[REALLOC BUY ACCEPTED] lifecycle 등록 완료: "
+                                "order_lifecycle_id=%s code=%s qty=%s",
+                                _realloc_lc.order_lifecycle_id, code, qty,
+                            )
+                        except Exception as _rlce:
+                            logger.warning(
+                                f"[REALLOC BUY Lifecycle] 오류 — "
+                                f"직접 apply_buy 폴백: {_rlce}"
+                            )
+                            self.pyramid.apply_buy(
+                                code, tgt["name"],
+                                add_dec["level"], qty, cur_price,
+                                using_compound=add_dec.get("using_compound", 0)
+                            )
+                    else:
+                        # lifecycle 비활성 → 기존 방식
+                        self.pyramid.apply_buy(
+                            code, tgt["name"],
+                            add_dec["level"], qty, cur_price,
+                            using_compound=add_dec.get("using_compound", 0)
+                        )
                     self._log_trade(
                         "ADD_BUY", code, tgt["name"],
                         cur_price, qty,

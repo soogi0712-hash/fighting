@@ -68,6 +68,33 @@ except Exception as _uje:
         f"[US Journal] 로드 실패 — 저널 비활성화(매매 영향 없음): {_uje}"
     )
 
+# ── Phoenix OrderLifecycle (Phase 4 US Pipeline) ─────────────────────
+try:
+    from phoenix.lifecycle import OrderLifecycleManager, make_order_lifecycle_id
+    from phoenix.execution_driven import ExecutionDrivenPositionUpdater
+    _US_LIFECYCLE_ENABLED = True
+except Exception as _us_lce:
+    _US_LIFECYCLE_ENABLED = False
+    import logging as _us_lc_logging
+    _us_lc_logging.getLogger("USStrategy").warning(
+        f"[US Lifecycle] import 실패 — lifecycle 비활성화: {_us_lce}"
+    )
+
+# ── FillObserver + PendingOrderRegistry (Phase 4 US Pipeline) ────────
+try:
+    from journal.fill_observer import (
+        FillObserver as _USFillObserver,
+        PendingOrderRegistry as _USPendingOrderRegistry,
+        PendingStatus as _USPendingStatus,
+    )
+    _US_FILL_OBSERVER_ENABLED = True
+except Exception as _us_foe:
+    _US_FILL_OBSERVER_ENABLED = False
+    import logging as _us_fo_logging
+    _us_fo_logging.getLogger("USStrategy").warning(
+        f"[US FillObserver] import 실패 — fill observer 비활성화: {_us_foe}"
+    )
+
 logger = get_logger("USStrategy")
 
 US_POSITIONS_FILE = os.path.join(
@@ -654,8 +681,307 @@ class USStrategyManager:
             "prime_scan_done": set(),  # 완료된 초기 스캔 타임 (22:31, 22:33, 22:35, 22:40)
         }
 
+        # ── Phase 4: OrderLifecycle + FillObserver (US Pipeline) ──────
+        self._us_lifecycle_mgr   = None
+        self._us_updater         = None
+        self._us_pending_registry = None
+        self._us_fill_observer   = None
+        self._us_pending_buy_meta: dict  = {}
+        self._us_pending_sell_meta: dict = {}
+
+        if _US_LIFECYCLE_ENABLED:
+            try:
+                _jnl_db = os.path.join(
+                    os.path.dirname(__file__), "..", "data", "trading_journal.db"
+                )
+                self._us_lifecycle_mgr = OrderLifecycleManager(_jnl_db)
+                self._us_updater = ExecutionDrivenPositionUpdater(
+                    on_buy_filled  = self._us_handle_buy_filled,
+                    on_sell_filled = self._us_handle_sell_filled,
+                )
+                logger.info("[US Lifecycle] OrderLifecycleManager 초기화 완료")
+            except Exception as _us_le:
+                logger.warning(f"[US Lifecycle] 초기화 실패: {_us_le}")
+                self._us_lifecycle_mgr = None
+                self._us_updater       = None
+
+        if _US_FILL_OBSERVER_ENABLED:
+            try:
+                self._us_pending_registry = _USPendingOrderRegistry()
+                self._us_fill_observer    = _USFillObserver(
+                    kis_api         = kis_api,
+                    phoenix_db_path = None,
+                )
+                logger.info("[US FillObserver] PendingOrderRegistry + FillObserver 초기화 완료")
+                self._us_restore_pending_meta()
+            except Exception as _us_foe2:
+                logger.warning(f"[US FillObserver] 초기화 실패: {_us_foe2}")
+                self._us_pending_registry = None
+                self._us_fill_observer    = None
+
     def set_realtime_cache(self, cache: dict):
         self._rt_cache = cache or {}
+
+    # ══════════════════════════════════════════════════════════
+    # Phase 4: US Pipeline — lifecycle 콜백 + PendingRegistry
+    # ══════════════════════════════════════════════════════════
+
+    def _us_handle_buy_filled(self, lc) -> None:
+        """US BUY FILLED 시 포지션 반영 (apply는 이미 _do_buy에서 즉시 수행됨).
+
+        US는 KR과 달리 매수 즉시 포지션을 add하는 구조이므로,
+        FILLED 콜백에서는 포지션 재확인/갱신만 수행한다.
+        """
+        meta = self._us_pending_buy_meta.pop(lc.order_lifecycle_id, None)
+        if meta is None:
+            logger.warning(
+                "[US BUY FILLED] pending_buy_meta 없음 — 스킵: "
+                "order_lifecycle_id=%s code=%s",
+                lc.order_lifecycle_id, lc.code,
+            )
+            return
+        symbol = lc.code
+        qty    = lc.filled_qty if lc.filled_qty > 0 else meta.get("qty", 0)
+        price  = lc.avg_fill_price if lc.avg_fill_price else meta.get("price", 0.0)
+        logger.info(
+            "[US BUY FILLED] lifecycle 전이 완료: symbol=%s qty=%s @$%.2f "
+            "order_lifecycle_id=%s",
+            symbol, qty, price, lc.order_lifecycle_id,
+        )
+
+    def _us_handle_sell_filled(self, lc) -> None:
+        """US SELL FILLED 시 PnL 기록 및 재진입 차단 등록.
+
+        US는 _do_sell에서 즉시 pos_mgr.remove/update를 수행하므로,
+        FILLED 콜백에서는 PnL 기록 + 재진입 차단만 추가 수행한다.
+        """
+        meta = self._us_pending_sell_meta.pop(lc.order_lifecycle_id, None)
+        if meta is None:
+            logger.warning(
+                "[US SELL FILLED] pending_sell_meta 없음 — 스킵: "
+                "order_lifecycle_id=%s code=%s",
+                lc.order_lifecycle_id, lc.code,
+            )
+            return
+        symbol  = lc.code
+        qty     = lc.filled_qty if lc.filled_qty > 0 else meta.get("qty", 0)
+        price   = lc.avg_fill_price if lc.avg_fill_price else meta.get("price", 0.0)
+        avg_p   = meta.get("avg_price", price)
+        pnl_usd = (price - avg_p) * qty
+        logger.info(
+            "[US SELL FILLED] lifecycle 전이 완료: symbol=%s qty=%s @$%.2f "
+            "pnl_usd=$%.2f order_lifecycle_id=%s",
+            symbol, qty, price, pnl_usd, lc.order_lifecycle_id,
+        )
+
+    def _us_register_pending_order(
+        self,
+        symbol: str,
+        side: str,
+        order_qty: int,
+        order_response: dict,
+        lifecycle_id: str,
+        excd: str = "",
+        trade_id: str = "",
+    ) -> str:
+        """US KIS 주문 응답에서 ODNO 추출 + PendingRegistry 등록.
+
+        US 응답 구조: result["output"]["ODNO"]
+
+        Returns:
+            odno (str) — 빈 문자열이면 추출 실패
+        """
+        if self._us_pending_registry is None or self._us_lifecycle_mgr is None:
+            return ""
+
+        try:
+            output = order_response.get("output", {}) or {}
+            odno   = str(output.get("ODNO", "") or "").strip()
+
+            from datetime import datetime as _dt
+            submitted_at = _dt.now().isoformat()
+
+            self._us_pending_registry.register(
+                market             = "US",
+                trade_id           = lifecycle_id,
+                code               = symbol,
+                side               = side,
+                order_qty          = order_qty,
+                submitted_at       = submitted_at,
+                odno               = odno,
+                client_order_id    = trade_id,
+                raw_order_response = order_response,
+                exchange           = excd or None,
+                currency           = "USD",
+            )
+
+            lc = self._us_lifecycle_mgr.load(lifecycle_id)
+            if lc is not None:
+                self._us_lifecycle_mgr.accept(lc, odno=odno)
+                logger.info(
+                    "[US PendingRegistry] 등록 완료: symbol=%s side=%s "
+                    "odno=%r lifecycle_id=%s",
+                    symbol, side, odno, lifecycle_id,
+                )
+            else:
+                logger.warning(
+                    "[US PendingRegistry] lifecycle 조회 실패 — odno만 등록: "
+                    "lifecycle_id=%s odno=%r", lifecycle_id, odno,
+                )
+            return odno
+
+        except Exception as exc:
+            logger.error(
+                "[US PendingRegistry] 등록 오류: symbol=%s side=%s error=%s",
+                symbol, side, exc,
+            )
+            return ""
+
+    def us_dispatch_fill(
+        self,
+        order_lifecycle_id: str,
+        filled_qty: int,
+        avg_fill_price: float,
+        is_full: bool = True,
+    ) -> None:
+        """US FillObserver → lifecycle 전이 트리거.
+
+        run_us_fill_poll()에서 자동 호출된다.
+        """
+        if self._us_lifecycle_mgr is None:
+            return
+
+        lc = self._us_lifecycle_mgr.load(order_lifecycle_id)
+        if lc is None:
+            logger.warning(
+                "[US dispatch_fill] lifecycle 없음: order_lifecycle_id=%s",
+                order_lifecycle_id,
+            )
+            return
+
+        try:
+            if is_full:
+                self._us_lifecycle_mgr.full_fill(
+                    lc,
+                    delta     = filled_qty,
+                    avg_price = avg_fill_price,
+                    on_filled = self._us_updater,
+                )
+            else:
+                self._us_lifecycle_mgr.partial_fill(lc, filled_qty, avg_fill_price)
+        except Exception as exc:
+            logger.error(
+                "[US dispatch_fill] lifecycle 전이 오류: "
+                "order_lifecycle_id=%s is_full=%s error=%s",
+                order_lifecycle_id, is_full, exc,
+            )
+            raise
+
+    def run_us_fill_poll(self) -> dict:
+        """US FillObserver.poll_once() → us_dispatch_fill() 자동 연결.
+
+        app.py 의 메인 루프 또는 별도 폴링 스레드에서 주기적으로 호출한다.
+        """
+        if self._us_fill_observer is None or self._us_lifecycle_mgr is None:
+            return {
+                "total": 0, "filled": 0, "partial": 0,
+                "no_change": 0, "errors": 0, "dispatched": [],
+            }
+
+        dispatched = []
+        try:
+            poll_result = self._us_fill_observer.poll_once()
+        except Exception as exc:
+            logger.error("[US run_fill_poll] poll_once 오류: %s", exc)
+            return {
+                "total": 0, "filled": 0, "partial": 0,
+                "no_change": 0, "errors": 1, "dispatched": [],
+            }
+
+        for detail in poll_result.get("details", []):
+            lifecycle_id = detail.get("trade_id", "")
+            fill_delta   = detail.get("fill_delta", 0)
+            status_after = detail.get("status_after", "")
+            error        = detail.get("error")
+
+            if error or fill_delta <= 0 or not lifecycle_id:
+                continue
+
+            avg_fill_price = 0.0
+            try:
+                lc = self._us_lifecycle_mgr.load(lifecycle_id)
+                if lc and lc.avg_fill_price:
+                    avg_fill_price = lc.avg_fill_price
+            except Exception:
+                pass
+
+            is_full = (status_after == _USPendingStatus.FILLED)
+            try:
+                self.us_dispatch_fill(
+                    order_lifecycle_id = lifecycle_id,
+                    filled_qty         = fill_delta,
+                    avg_fill_price     = avg_fill_price,
+                    is_full            = is_full,
+                )
+                dispatched.append(lifecycle_id)
+                logger.info(
+                    "[US run_fill_poll] dispatch 완료: lifecycle_id=%s "
+                    "fill_delta=%s is_full=%s",
+                    lifecycle_id, fill_delta, is_full,
+                )
+            except Exception as exc:
+                logger.error(
+                    "[US run_fill_poll] dispatch 오류: lifecycle_id=%s error=%s",
+                    lifecycle_id, exc,
+                )
+
+        return {
+            "total":     poll_result.get("total",     0),
+            "filled":    poll_result.get("filled",    0),
+            "partial":   poll_result.get("partial",   0),
+            "no_change": poll_result.get("no_change", 0),
+            "errors":    poll_result.get("errors",    0),
+            "dispatched": dispatched,
+        }
+
+    def _us_restore_pending_meta(self) -> None:
+        """재시작 후 ACCEPTED 상태의 US OrderLifecycle → pending meta 복원."""
+        if self._us_lifecycle_mgr is None:
+            return
+        try:
+            active_lifecycles = self._us_lifecycle_mgr.load_all_active()
+        except Exception as exc:
+            logger.warning("[US RestoreMeta] load_all_active 실패: %s", exc)
+            return
+
+        restored_buy = restored_sell = 0
+        for lc in active_lifecycles:
+            if (lc.market or "").upper() != "US":
+                continue
+            lc_id = lc.order_lifecycle_id
+            side  = (lc.side or "BUY").upper()
+            base_meta = {
+                "code":    lc.code,
+                "qty":     lc.filled_qty if lc.filled_qty > 0 else (lc.order_qty or 0),
+                "price":   lc.avg_fill_price or 0.0,
+                "avg_price": lc.avg_fill_price or 0.0,
+                "trade_id": lc.trade_id or "",
+                "reason":  "us_restored_on_restart",
+            }
+            if side == "BUY" and lc_id not in self._us_pending_buy_meta:
+                self._us_pending_buy_meta[lc_id] = base_meta
+                restored_buy += 1
+            elif side == "SELL" and lc_id not in self._us_pending_sell_meta:
+                self._us_pending_sell_meta[lc_id] = base_meta
+                restored_sell += 1
+
+        if restored_buy or restored_sell:
+            logger.info(
+                "[US RestoreMeta] 재시작 복원 완료: BUY=%d SELL=%d",
+                restored_buy, restored_sell,
+            )
+
+
 
     @property
     def positions(self) -> dict:
@@ -1801,7 +2127,6 @@ class USStrategyManager:
         self.pos_mgr.add(pos)
         # ── [US 훅 D] ORDER_ACCEPTED (접수 성공, 체결 미확인) ──
         # ★ ORDER_FILLED 는 실체결 확인 훅에만 기록. rt_cd=0 은 접수이지 체결이 아님.
-        # ★ US 체결조회 미연동 → ORDER_FILLED 는 의도적으로 비워 둔.
         if _US_JOURNAL_ENABLED and _us_trade_id:
             try:
                 _us_jnl.record_order_accepted(
@@ -1815,6 +2140,40 @@ class USStrategyManager:
                     _us_pos_saved.trade_id = _us_trade_id
             except Exception as _uje:
                 _us_jnl._inc_error("us_accepted", _uje)
+        # ★ Phase 4: US BUY lifecycle 등록 + PendingRegistry 자동 연결
+        if _US_LIFECYCLE_ENABLED and self._us_lifecycle_mgr is not None:
+            try:
+                _us_lc_id = make_order_lifecycle_id("US", "BUY", symbol)
+                _us_lc = self._us_lifecycle_mgr.create(
+                    trade_id      = _us_trade_id or _us_lc_id,
+                    market        = "US",
+                    code          = symbol,
+                    side          = "BUY",
+                    strategy_name = "USStrategyManager",
+                    order_qty     = qty,
+                )
+                self._us_pending_buy_meta[_us_lc.order_lifecycle_id] = {
+                    "code": symbol, "name": name, "qty": qty,
+                    "price": cur_price, "avg_price": cur_price,
+                    "trade_id": _us_trade_id,
+                    "reason": entry_reason,
+                }
+                self._us_register_pending_order(
+                    symbol         = symbol,
+                    side           = "BUY",
+                    order_qty      = qty,
+                    order_response = result,
+                    lifecycle_id   = _us_lc.order_lifecycle_id,
+                    excd           = excd,
+                    trade_id       = _us_trade_id,
+                )
+                logger.info(
+                    "[US BUY ACCEPTED] lifecycle+PendingRegistry 등록 완료: "
+                    "order_lifecycle_id=%s symbol=%s qty=%s",
+                    _us_lc.order_lifecycle_id, symbol, qty,
+                )
+            except Exception as _us_le:
+                logger.warning("[US BUY Lifecycle] 등록 오류: %s", _us_le)
         # ── [US OPEN SCAN] 첫 매수 기록 ──────────────────────
         self._record_first_buy()
         logger.info(
@@ -1887,6 +2246,40 @@ class USStrategyManager:
                 )
             except Exception as _uje:
                 _us_jnl._inc_error("us_add_accepted", _uje)
+        # ★ Phase 4: US ADD_BUY lifecycle 등록 + PendingRegistry 자동 연결
+        if _US_LIFECYCLE_ENABLED and self._us_lifecycle_mgr is not None:
+            try:
+                _us_add_lc_id = make_order_lifecycle_id("US", "BUY", symbol)
+                _us_add_lc = self._us_lifecycle_mgr.create(
+                    trade_id      = _us_add_trade_id or _us_add_lc_id,
+                    market        = "US",
+                    code          = symbol,
+                    side          = "BUY",
+                    strategy_name = "USStrategyManager_AddBuy",
+                    order_qty     = add_qty,
+                )
+                self._us_pending_buy_meta[_us_add_lc.order_lifecycle_id] = {
+                    "code": symbol, "name": name, "qty": add_qty,
+                    "price": cur_price, "avg_price": cur_price,
+                    "trade_id": _us_add_trade_id,
+                    "reason": reason,
+                }
+                self._us_register_pending_order(
+                    symbol         = symbol,
+                    side           = "BUY",
+                    order_qty      = add_qty,
+                    order_response = result,
+                    lifecycle_id   = _us_add_lc.order_lifecycle_id,
+                    excd           = excd,
+                    trade_id       = _us_add_trade_id,
+                )
+                logger.info(
+                    "[US ADD_BUY ACCEPTED] lifecycle+PendingRegistry 등록 완료: "
+                    "order_lifecycle_id=%s symbol=%s qty=%s",
+                    _us_add_lc.order_lifecycle_id, symbol, add_qty,
+                )
+            except Exception as _us_add_le:
+                logger.warning("[US ADD_BUY Lifecycle] 등록 오류: %s", _us_add_le)
         logger.info(f"🟢 US추가매수 {symbol} {add_qty}주 ${cur_price:.2f} | {reason}")
         return self._buy_result(symbol, name, excd, cur_price, add_qty, 2, sess, iv,
                                 reason, "[모멘텀추가]")
@@ -2003,14 +2396,46 @@ class USStrategyManager:
                     is_stoploss= _is_sl,
                 )
 
-            # ── [US 훅 K 삭제] SELL_ORDER_FILLED + TRADE_CLOSED — 접수만으로는 기록 금지 ──
-            # ★ rt_cd=0 은 접수 성공이지 체결 확인이 아님.
-            # ★ SELL_ORDER_FILLED / TRADE_CLOSED 는 실체결 확인 훅에만 기록한다.
-            # ★ US 체결조회 미연동 → 훅 K는 의도적으로 비워 둔.
-            # (향후 US KIS 체결조회 연동 시 이 위치에
-            #  record_sell_order_filled + record_trade_closed 호출 추가 예정)
-            if False:  # placeholder — never executes
-                pass
+            # ── [US 훅 K] SELL lifecycle + PendingRegistry (Phase 4 US Pipeline) ──
+            # ★ rt_cd=0 은 접수 성공. SELL lifecycle을 ACCEPTED로 등록하고
+            # FillObserver 폴링 대상으로 PendingRegistry에 추가한다.
+            if _US_LIFECYCLE_ENABLED and self._us_lifecycle_mgr is not None:
+                try:
+                    _us_sell_lc_id = make_order_lifecycle_id("US", "SELL", symbol)
+                    _us_sell_lc = self._us_lifecycle_mgr.create(
+                        trade_id      = _us_sell_trade_id or _us_sell_lc_id,
+                        market        = "US",
+                        code          = symbol,
+                        side          = "SELL",
+                        strategy_name = "USStrategyManager",
+                        order_qty     = qty,
+                    )
+                    self._us_pending_sell_meta[_us_sell_lc.order_lifecycle_id] = {
+                        "code":      symbol,
+                        "name":      name,
+                        "qty":       qty,
+                        "price":     cur_price,
+                        "avg_price": avg_p,
+                        "trade_id":  _us_sell_trade_id,
+                        "reason":    reason,
+                        "is_full":   not is_partial,
+                    }
+                    self._us_register_pending_order(
+                        symbol         = symbol,
+                        side           = "SELL",
+                        order_qty      = qty,
+                        order_response = result,
+                        lifecycle_id   = _us_sell_lc.order_lifecycle_id,
+                        excd           = excd,
+                        trade_id       = _us_sell_trade_id,
+                    )
+                    logger.info(
+                        "[US SELL ACCEPTED] lifecycle+PendingRegistry 등록 완료: "
+                        "order_lifecycle_id=%s symbol=%s qty=%s",
+                        _us_sell_lc.order_lifecycle_id, symbol, qty,
+                    )
+                except Exception as _us_sell_le:
+                    logger.warning("[US SELL Lifecycle] 등록 오류: %s", _us_sell_le)
 
             return {
                 "action":      action_tag,

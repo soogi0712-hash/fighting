@@ -847,11 +847,41 @@ class OrderLifecycleManager:
         lc: OrderLifecycle,
         delta: int = 0,
         avg_price: Optional[float] = None,
+        on_filled=None,
     ) -> None:
+        """→ FILLED 전이 후 on_filled 콜백을 정확히 1회 실행.
+
+        Idempotency:
+          - lc.full_fill() 내부에서 이미 FILLED 이면 상태 전이 없이 조기 반환.
+          - 따라서 on_filled 콜백도 실행되지 않는다.
+          - 동일 order_lifecycle_id 로 두 번 호출해도 apply_buy/apply_sell 1회만.
+
+        Args:
+            lc:        OrderLifecycle 인스턴스 (전이 대상)
+            delta:     이번에 체결된 추가 수량 (0 허용)
+            avg_price: 최종 평균 체결가 (선택)
+            on_filled: Callable(lc) — FILLED 전이 성공 시에만 호출.
+                       ExecutionDrivenPositionUpdater 인스턴스를 전달하면
+                       apply_buy / apply_sell 이 정확히 1회 실행된다.
+        """
+        already_filled = lc.current_state == LifecycleState.FILLED
         lc.full_fill(delta, avg_price)
         self._persist_and_record(
             lc, f"lifecycle:filled:{lc.order_lifecycle_id}"
         )
+        # 이미 FILLED 였으면 콜백 실행 안 함 (멱등 보장)
+        if already_filled:
+            return
+        if on_filled is not None:
+            try:
+                on_filled(lc)
+            except Exception as exc:
+                logger.error(
+                    "full_fill on_filled 콜백 오류: "
+                    "order_lifecycle_id=%s error=%s",
+                    lc.order_lifecycle_id, exc,
+                )
+                raise
 
     def cancel(
         self, lc: OrderLifecycle, reason: Optional[str] = None
