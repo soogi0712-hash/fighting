@@ -6,6 +6,8 @@ __pycache__/
 .DS_Store
 data/screener.db
 data/lab.db
+data/trading_journal.db
+*.bak
 nohup.out
 *.pid
 .idea/
