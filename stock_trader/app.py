@@ -823,6 +823,23 @@ def _trading_loop():
     except Exception as _e:
         _log(f"❌ 고아 종목 손절 오류: {_e}", "error")
 
+    # ══════════════════════════════════════════════════════════
+    # ★ Phase 4: KR 체결 폴링 (FillObserver → dispatch_fill 자동 연결)
+    #   ACTIVE(ACCEPTED/PARTIALLY_FILLED) pending 주문이 없으면 즉시 반환
+    #   → KIS 체결조회 API 호출 0회 보장
+    # ══════════════════════════════════════════════════════════
+    if _strategy_mgr is not None:
+        try:
+            _kr_poll = _strategy_mgr.run_fill_poll()
+            if _kr_poll.get("dispatched"):
+                _log(
+                    f"[KR FillPoll] dispatched={_kr_poll['dispatched']} "
+                    f"filled={_kr_poll['filled']} partial={_kr_poll['partial']}",
+                    "info",
+                )
+        except Exception as _fp_e:
+            _log(f"❌ [KR FillPoll] 체결 폴링 오류: {_fp_e}", "error")
+
     # ── ★ 해외주식 매매 루프 (미국 정규장 중일 때만) ──────────
     _us_trading_loop()
 
@@ -1356,6 +1373,23 @@ def _us_trading_loop():
             # HOLD/SKIP 은 로그 미출력 (노이즈 방지)
         except Exception as e:
             _log(f"❌ [US] {name}({symbol}) 오류: {e}", "error")
+
+    # ══════════════════════════════════════════════════════════
+    # ★ Phase 4: US 체결 폴링 (FillObserver → us_dispatch_fill 자동 연결)
+    #   ACTIVE(ACCEPTED/PARTIALLY_FILLED) pending 주문이 없으면 즉시 반환
+    #   → KIS 체결조회 API 호출 0회 보장
+    # ══════════════════════════════════════════════════════════
+    if _us_strategy is not None:
+        try:
+            _us_poll = _us_strategy.run_us_fill_poll()
+            if _us_poll.get("dispatched"):
+                _log(
+                    f"[US FillPoll] dispatched={_us_poll['dispatched']} "
+                    f"filled={_us_poll['filled']} partial={_us_poll['partial']}",
+                    "info",
+                )
+        except Exception as _ufp_e:
+            _log(f"❌ [US FillPoll] 체결 폴링 오류: {_ufp_e}", "error")
 
     # 해외잔고 실시간 업데이트
     try:

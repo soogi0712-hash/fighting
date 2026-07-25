@@ -530,6 +530,15 @@ class StrategyManager:
                 "no_change": 0, "errors": 0, "dispatched": [],
             }
 
+        # ── ACTIVE(ACCEPTED/PARTIALLY_FILLED) 주문이 없으면 KIS API 호출 없이 즉시 반환
+        if self._pending_registry is not None:
+            _trackable = self._pending_registry.get_trackable()
+            if not _trackable:
+                return {
+                    "total": 0, "filled": 0, "partial": 0,
+                    "no_change": 0, "errors": 0, "dispatched": [],
+                }
+
         dispatched = []
         try:
             poll_result = self._fill_observer.poll_once()
