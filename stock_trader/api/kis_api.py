@@ -2038,3 +2038,254 @@ class KISApi:
         except Exception as e:
             logger.error(f"체결 내역 조회 실패: {e}")
             return []
+
+    # ──────────────────────────────────────────────────────────
+    # 6-A. 국내주식 당일 주문·체결 조회 (단일 ODNO 필터 지원)
+    # ──────────────────────────────────────────────────────────
+    def get_kr_ccld_by_odno(self, odno: str = "", code: str = "") -> dict:
+        """국내주식 당일 주문·체결 조회 (TTTC8001R, 실전).
+
+        특정 주문번호(odno)를 지정하면 해당 주문만 반환한다.
+        ondo 미지정 시 종목코드(code) 또는 전체 당일 체결 목록을 반환한다.
+
+        반환 dict:
+          {
+            "odno":           str,    # 주문번호 (KIS odno)
+            "code":           str,    # 종목코드
+            "side":           str,    # "BUY" | "SELL"
+            "order_qty":      int,    # 총 주문수량
+            "cum_filled_qty": int,    # 누적 체결수량 (tot_ccld_qty)
+            "unfilled_qty":   int,    # 미체결 잔여 수량 (ord_qty - cum_filled_qty)
+            "avg_fill_price": float,  # 평균 체결가 (avg_prvs)
+            "order_status":   str,    # KIS ord_stts_name 원본
+            "order_time":     str,    # HHMMSS (ord_tmd)
+            "order_date":     str,    # YYYYMMDD (ord_dt)
+            "raw":            dict,   # KIS output1 원본 첫 번째 레코드
+          }
+          응답 없거나 오류 시 {} 반환.
+
+        실전/모의 TR_ID:
+          KIS_IS_REAL=True  → TTTC8001R
+          KIS_IS_REAL=False → VTTC8001R
+        """
+        from config import Config as _Cfg
+        tr_id = "TTTC8001R" if _Cfg.KIS_IS_REAL else "VTTC8001R"
+        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
+        acc_no, acc_prod = self.account_no.split("-") \
+            if "-" in self.account_no else (self.account_no, "01")
+        today = datetime.now().strftime("%Y%m%d")
+        params = {
+            "CANO":             acc_no,
+            "ACNT_PRDT_CD":     acc_prod,
+            "INQR_STRT_DT":     today,
+            "INQR_END_DT":      today,
+            "SLL_BUY_DVSN_CD":  "00",   # 00=전체 (01=매도, 02=매수)
+            "INQR_DVSN":        "00",   # 00=역순
+            "PDNO":             code,   # 종목코드 (빈값=전체)
+            "CCLD_DVSN":        "01",   # 01=체결분만
+            "ORD_GNO_BRNO":     "",
+            "ODNO":             odno,   # 특정 주문번호 필터 (빈값=전체)
+            "INQR_DVSN_3":      "00",
+            "INQR_DVSN_1":      "",
+            "CTX_AREA_FK100":   "",
+            "CTX_AREA_NK100":   "",
+        }
+        try:
+            self._rate_limit()
+            resp = requests.get(url, headers=self._headers(tr_id),
+                                params=params, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("rt_cd") != "0":
+                logger.warning(
+                    f"[KR체결조회] rt_cd={data.get('rt_cd')} "
+                    f"msg_cd={data.get('msg_cd')} msg1={data.get('msg1')} "
+                    f"odno={odno!r} code={code!r}"
+                )
+                return {}
+            items = data.get("output1", []) or []
+            if not items:
+                return {}
+            # ODNO 필터: KIS가 파라미터를 무시할 경우 로컬 필터 보완
+            if odno:
+                items = [i for i in items if i.get("odno", "") == odno]
+            if not items:
+                return {}
+            # 누적 집계 (부분체결 여러 레코드 가능)
+            first = items[0]
+            sll_buy = first.get("sll_buy_dvsn_cd", "02")
+            side = "BUY" if sll_buy == "02" else "SELL"
+            order_qty     = int(first.get("ord_qty",      0) or 0)
+            cum_filled    = sum(int(i.get("tot_ccld_qty", 0) or 0) for i in items)
+            total_amt     = sum(int(i.get("tot_ccld_amt", 0) or 0) for i in items)
+            avg_price     = (total_amt / cum_filled) if cum_filled > 0 else 0.0
+            unfilled      = max(0, order_qty - cum_filled)
+            self._on_api_success()
+            return {
+                "odno":           first.get("odno",         ""),
+                "code":           first.get("pdno",         code),
+                "side":           side,
+                "order_qty":      order_qty,
+                "cum_filled_qty": cum_filled,
+                "unfilled_qty":   unfilled,
+                "avg_fill_price": float(avg_price),
+                "order_status":   first.get("ord_stts_name", ""),
+                "order_time":     first.get("ord_tmd",       ""),
+                "order_date":     first.get("ord_dt",        today),
+                "raw":            first,
+            }
+        except Exception as e:
+            logger.error(f"[KR체결조회] 오류 odno={odno!r}: {e}")
+            return {}
+
+    # ──────────────────────────────────────────────────────────
+    # 6-B. 미국주식 주문·체결 조회 (TTTS3035R)
+    # ──────────────────────────────────────────────────────────
+    def get_us_ccld(self, odno: str = "", symbol: str = "",
+                    excd: str = "NASD") -> dict:
+        """미국주식 주문·체결 조회 (TTTS3035R, 실전).
+
+        특정 주문번호(odno) 또는 종목(symbol)으로 필터 가능.
+        KIS TTTS3035R 응답에서 **실제 존재가 확인된 필드**만 사용한다.
+        불명확한 필드는 raw에 보존하고 해당 키는 None 처리한다.
+
+        반환 dict:
+          {
+            "odno":           str | None,
+            "code":           str | None,   # 티커 심볼
+            "exchange":       str | None,   # 거래소 코드
+            "side":           str | None,   # "BUY" | "SELL" | None (필드 불명확 시)
+            "order_qty":      int | None,
+            "cum_filled_qty": int | None,
+            "unfilled_qty":   int | None,
+            "avg_fill_price": float | None,
+            "order_status":   str | None,
+            "order_time":     str | None,
+            "currency":       str,          # "USD"
+            "raw":            dict,         # KIS output1 원본 첫 번째 레코드
+          }
+          응답 없거나 오류 시 {} 반환.
+
+        실전/모의 TR_ID:
+          KIS_IS_REAL=True  → TTTS3035R
+          KIS_IS_REAL=False → VTTS3035R
+        주의:
+          - 이 TR_ID의 응답 필드명은 KIS 공식 포털에서 검증이 필요하다.
+            따라서 필드명이 확인되지 않은 경우 None 을 반환하고 raw에 보존한다.
+          - KIS 해외주식 체결조회 응답의 sll_buy_dvsn_cd, ord_qty, rmn_qty 등
+            필드 존재 여부를 실계좌에서 반드시 확인해야 한다.
+        """
+        from config import Config as _Cfg
+        tr_id = "TTTS3035R" if _Cfg.KIS_IS_REAL else "VTTS3035R"
+        url = f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-ccnl"
+        acc_no, acc_prod = self.account_no.split("-") \
+            if "-" in self.account_no else (self.account_no, "01")
+        today = datetime.now().strftime("%Y%m%d")
+        params = {
+            "CANO":             acc_no,
+            "ACNT_PRDT_CD":     acc_prod,
+            "OVRS_EXCG_CD":     excd,
+            "PDNO":             symbol,     # 종목코드 (빈값=전체)
+            "ODNO":             odno,       # 주문번호 (빈값=전체)
+            "ORD_STRT_DT":      today,
+            "ORD_END_DT":       today,
+            "SLL_BUY_DVSN_CD":  "00",       # 00=전체
+            "CCLD_NCCS_DVSN":   "01",       # 01=체결분만
+            "CTX_AREA_FK200":   "",
+            "CTX_AREA_NK200":   "",
+        }
+        try:
+            self._rate_limit()
+            resp = requests.get(url, headers=self._headers(tr_id),
+                                params=params, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("rt_cd") != "0":
+                logger.warning(
+                    f"[US체결조회] rt_cd={data.get('rt_cd')} "
+                    f"msg_cd={data.get('msg_cd')} msg1={data.get('msg1')} "
+                    f"odno={odno!r} symbol={symbol!r}"
+                )
+                return {}
+            items = data.get("output1", []) or []
+            if not items:
+                return {}
+            # ODNO 로컬 필터 보완
+            if odno:
+                items = [i for i in items if i.get("odno", "") == odno]
+            if not items:
+                return {}
+            first = items[0]
+
+            # ★ 필드명은 KIS 실계좌 검증 필요 — 아래는 KIS 공식 문서 기준 추정값
+            # 불명확한 필드: None 반환 + raw 보존
+            _raw_side = first.get("sll_buy_dvsn_cd", None)
+            if _raw_side == "02":
+                side = "BUY"
+            elif _raw_side == "01":
+                side = "SELL"
+            else:
+                side = None   # ★ 필드 불명확 — raw에서 확인 필요
+
+            # ★ 주문수량 필드: KIS US는 "ord_qty" 또는 "ft_ord_qty" 가능
+            _ord_qty_raw = (first.get("ft_ord_qty")
+                            or first.get("ord_qty")
+                            or None)
+            order_qty = int(_ord_qty_raw) if _ord_qty_raw is not None else None
+
+            # ★ 누적체결수량: "ft_ccld_qty" 또는 "ccld_qty" 가능
+            _cum_raw = (first.get("ft_ccld_qty")
+                        or first.get("ccld_qty")
+                        or None)
+            cum_filled = int(_cum_raw) if _cum_raw is not None else None
+
+            # ★ 미체결: "rmn_qty" 가능
+            _unf_raw = first.get("rmn_qty", None)
+            unfilled = int(_unf_raw) if _unf_raw is not None else (
+                max(0, order_qty - cum_filled)
+                if (order_qty is not None and cum_filled is not None) else None
+            )
+
+            # ★ 평균체결가: "ft_ccld_unpr3" 또는 "ccld_unpr" 가능
+            _price_raw = (first.get("ft_ccld_unpr3")
+                          or first.get("ccld_unpr")
+                          or first.get("avg_prvs")
+                          or None)
+            avg_price = float(_price_raw) if _price_raw else None
+
+            # ★ 주문상태: "ord_stts_name" 또는 "ord_stat_name" 가능
+            order_status = (first.get("ord_stts_name")
+                            or first.get("ord_stat_name")
+                            or None)
+
+            # ★ 주문시각: "ord_tmd" 또는 "ord_tmmd" 가능
+            order_time = (first.get("ord_tmd")
+                          or first.get("ord_tmmd")
+                          or None)
+
+            # ★ 종목코드: "pdno" 또는 "ovrs_pdno" 가능
+            code_out = (first.get("ovrs_pdno")
+                        or first.get("pdno")
+                        or symbol or None)
+
+            # ★ 거래소: "ovrs_excg_cd" 가능
+            exchange = first.get("ovrs_excg_cd", excd or None)
+
+            self._on_api_success()
+            return {
+                "odno":           first.get("odno", odno or None),
+                "code":           code_out,
+                "exchange":       exchange,
+                "side":           side,
+                "order_qty":      order_qty,
+                "cum_filled_qty": cum_filled,
+                "unfilled_qty":   unfilled,
+                "avg_fill_price": avg_price,
+                "order_status":   order_status,
+                "order_time":     order_time,
+                "currency":       "USD",
+                "raw":            first,
+            }
+        except Exception as e:
+            logger.error(f"[US체결조회] 오류 odno={odno!r}: {e}")
+            return {}

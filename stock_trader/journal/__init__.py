@@ -27,7 +27,20 @@ from journal.trading_journal import (
     DB_PATH,
 )
 
+from journal.fill_observer import (
+    EXECUTION_OBSERVED_ONLY,
+    ExecutionObservation,
+    ExecutionNormalizer,
+    FillEventType,
+    FillObserver,
+    PendingOrderRegistry,
+    PendingStatus,
+    poll_pending_orders_once,
+    get_observer,
+)
+
 __all__ = [
+    # trading_journal
     "EventType",
     "make_trade_id",
     "record_signal",
@@ -48,4 +61,14 @@ __all__ = [
     "query_daily_summary",
     "get_error_counts",
     "DB_PATH",
+    # fill_observer
+    "EXECUTION_OBSERVED_ONLY",
+    "ExecutionObservation",
+    "ExecutionNormalizer",
+    "FillEventType",
+    "FillObserver",
+    "PendingOrderRegistry",
+    "PendingStatus",
+    "poll_pending_orders_once",
+    "get_observer",
 ]

@@ -25,6 +25,16 @@ from .gate import OrderGate, OrderIntent, GateDecision
 from .reconcile import Reconciler
 from .backup import backup_online, check_integrity, IntegrityResult
 from .errors import PhoenixError, SafeHaltError, CorruptionError, SchemaVersionError
+from .lifecycle import (
+    LifecycleState,
+    LifecycleTransitionError,
+    LifecycleNotFoundError,
+    DuplicateClientOrderIdError,
+    TransitionValidator,
+    OrderLifecycle,
+    OrderLifecycleManager,
+    make_order_lifecycle_id,
+)
 
 __all__ = [
     "Event", "EventType", "OrderSide", "OrderState", "IntentKind",
@@ -33,6 +43,10 @@ __all__ = [
     "GateDecision", "Reconciler", "backup_online", "check_integrity",
     "IntegrityResult", "PhoenixError", "SafeHaltError", "CorruptionError",
     "SchemaVersionError",
+    # lifecycle
+    "LifecycleState", "LifecycleTransitionError", "LifecycleNotFoundError",
+    "DuplicateClientOrderIdError", "TransitionValidator",
+    "OrderLifecycle", "OrderLifecycleManager", "make_order_lifecycle_id",
 ]
 
 SCHEMA_VERSION = 1
