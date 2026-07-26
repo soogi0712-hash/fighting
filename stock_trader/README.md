@@ -25,10 +25,14 @@ nano .env   # 또는 vi .env
 KIS_APP_KEY=발급받은_앱키
 KIS_APP_SECRET=발급받은_시크릿
 KIS_ACCOUNT_NO=계좌번호-01        # 예: 73180640-01
-KIS_IS_REAL=true                   # 실전투자
+KIS_MODE=paper                     # paper: 모의투자(기본), real: 실전투자
+LIVE_ORDER_ENABLED=false           # true: 실주문 허용, false: dry-run(주문 없음)
 MAX_INVESTMENT_PER_STOCK=1000000   # 종목당 최대 100만원
 MAX_TOTAL_INVESTMENT=5000000       # 전체 최대 500만원
 ```
+
+> **⚠️ 주의**: 처음 설정 시 `KIS_MODE=paper` + `LIVE_ORDER_ENABLED=false` 로 시작해  
+> 모의투자 환경에서 동작을 확인한 뒤, 실전전환 시 `KIS_MODE=real` + `LIVE_ORDER_ENABLED=true` 로 변경하세요.
 
 ### 3단계 — 원클릭 배포
 ```bash
