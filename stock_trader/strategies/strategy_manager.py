@@ -1288,6 +1288,11 @@ class StrategyManager:
                                         strategy_name  = "StrategyManager",
                                         order_qty      = actual_qty,
                                     )
+                                    # ★ 전이 순서 준수: UNKNOWN → SIGNAL_CONFIRMED →
+                                    #   ORDER_SUBMITTED → ORDER_ACCEPTED. create 직후
+                                    #   바로 accept 하면 UNKNOWN→ACCEPTED 예외가 난다.
+                                    self._lifecycle_mgr.confirm_signal(_lc_bal)
+                                    self._lifecycle_mgr.submit(_lc_bal)
                                     self._lifecycle_mgr.accept(_lc_bal)
                                     # 잔고 재확인 경로 = 즉시 체결 확인
                                     self._pending_buy_meta[_lc_bal.order_lifecycle_id] = {
@@ -1432,7 +1437,11 @@ class StrategyManager:
                             strategy_name = "StrategyManager",
                             order_qty     = qty,
                         )
-                        self._lifecycle_mgr.accept(_lc_ok)
+                        # ★ 전이 순서 준수: UNKNOWN → SIGNAL_CONFIRMED →
+                        #   ORDER_SUBMITTED. ORDER_ACCEPTED(odno 포함)는
+                        #   _register_pending_order 가 수행한다.
+                        self._lifecycle_mgr.confirm_signal(_lc_ok)
+                        self._lifecycle_mgr.submit(_lc_ok)
                         self._pending_buy_meta[_lc_ok.order_lifecycle_id] = {
                             "name": name, "level": level,
                             "using_compound": decision.get("using_compound", 0),
@@ -1658,7 +1667,11 @@ class StrategyManager:
                             strategy_name = "StrategyManager",
                             order_qty     = qty,
                         )
-                        self._lifecycle_mgr.accept(_sell_lc)
+                        # ★ 전이 순서 준수: UNKNOWN → SIGNAL_CONFIRMED →
+                        #   ORDER_SUBMITTED. ORDER_ACCEPTED(odno 포함)는
+                        #   _register_pending_order 가 수행한다.
+                        self._lifecycle_mgr.confirm_signal(_sell_lc)
+                        self._lifecycle_mgr.submit(_sell_lc)
                         # SELL FILLED 시 사용할 컨텍스트 저장
                         self._pending_sell_meta[_sell_lc.order_lifecycle_id] = {
                             "name":        name,
@@ -2023,7 +2036,11 @@ class StrategyManager:
                                 strategy_name = "StrategyManager_Realloc",
                                 order_qty     = qty,
                             )
-                            self._lifecycle_mgr.accept(_realloc_lc)
+                            # ★ 전이 순서 준수: UNKNOWN → SIGNAL_CONFIRMED →
+                            #   ORDER_SUBMITTED. ORDER_ACCEPTED(odno 포함)는
+                            #   _register_pending_order 가 수행한다.
+                            self._lifecycle_mgr.confirm_signal(_realloc_lc)
+                            self._lifecycle_mgr.submit(_realloc_lc)
                             self._pending_buy_meta[_realloc_lc.order_lifecycle_id] = {
                                 "name": tgt["name"],
                                 "level": add_dec["level"],
