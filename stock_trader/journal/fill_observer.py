@@ -361,6 +361,128 @@ class PendingOrderRegistry:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    # ── 상태별 조회 (P0-4a: EXPIRED 복구 감사용) ───────────────
+    def get_by_status(self, status: str,
+                      since_iso: Optional[str] = None) -> list[dict]:
+        """특정 status 의 주문 목록. since_iso 지정 시 updated_at >= since_iso 만."""
+        conn = _get_conn()
+        if since_iso:
+            rows = conn.execute(
+                "SELECT * FROM pending_orders WHERE status=? AND updated_at>=? "
+                "ORDER BY updated_at",
+                (status, since_iso),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM pending_orders WHERE status=? ORDER BY updated_at",
+                (status,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def restore_from_terminal(self, trade_id: str, new_cum: int,
+                              new_status: str = None) -> bool:
+        """[정정] EXPIRED/CANCELLED 로 마킹됐던 pending 을 실제 체결 증거에 근거해
+        FILLED(또는 PARTIALLY_FILLED)로 되돌린다. P0-4a 복구 전용.
+
+        ★ 현재 status 가 EXPIRED/CANCELLED 인 경우에만 동작(멱등: 이미 FILLED 면 no-op).
+        """
+        new_status = new_status or PendingStatus.FILLED
+        now = datetime.now().isoformat()
+        conn = _get_conn()
+        cur = conn.execute(
+            """UPDATE pending_orders
+               SET cumulative_filled_qty=?, status=?, last_checked_at=?, updated_at=?
+               WHERE trade_id=? AND status IN (?,?)""",
+            (new_cum, new_status, now, now, trade_id,
+             PendingStatus.EXPIRED, PendingStatus.CANCELLED),
+        )
+        conn.commit()
+        changed = cur.rowcount > 0
+        if changed:
+            logger.warning(
+                "[PendingRegistry] terminal→%s 정정(체결 증거): trade_id=%s cum=%s",
+                new_status, trade_id, new_cum,
+            )
+        return changed
+
+    # ── stale 후보 조회 (P0-4) ─────────────────────────────────
+    def get_stale_trackable(self, max_age_sec: int,
+                            now: Optional[datetime] = None) -> list[dict]:
+        """TRACKABLE(ACCEPTED/PARTIALLY_FILLED) 중 submitted_at 이 max_age_sec 이상
+        경과한 주문 목록. (KIS 검증 대상 = stale 후보)
+
+        now 미지정 시 datetime.now() 사용(테스트에서 주입 가능).
+        """
+        ref = now or datetime.now()
+        rows = self.get_trackable()
+        stale = []
+        for r in rows:
+            sub = r.get("submitted_at") or ""
+            try:
+                ts = datetime.fromisoformat(sub)
+            except (ValueError, TypeError):
+                # 파싱 불가한 submitted_at 은 안전하게 stale 후보에서 제외
+                continue
+            if (ref - ts).total_seconds() >= max_age_sec:
+                stale.append(r)
+        return stale
+
+    # ── 단말 상태 마킹 (P0-4) ──────────────────────────────────
+    def mark_terminal(self, trade_id: str, status: str,
+                      reason: Optional[str] = None) -> bool:
+        """pending order 를 단말 상태(CANCELLED/REJECTED/EXPIRED)로 마킹한다.
+
+        ★ idempotent + 안전: 현재 TRACKABLE(ACCEPTED/PARTIALLY_FILLED) 인 경우에만
+          전이한다. 이미 FILLED/terminal 이면 아무 것도 하지 않는다(반환 False).
+          체결(FILLED)을 단말로 덮어써 회계를 잃는 사고를 방지한다.
+        ★ 회계 무개입: cumulative_filled_qty 는 건드리지 않는다(관측값 보존).
+
+        Returns:
+            True  — 실제로 TRACKABLE → 단말 로 전이함
+            False — 대상 없음 또는 이미 terminal(멱등 no-op)
+        """
+        if status not in (PendingStatus.CANCELLED, PendingStatus.REJECTED,
+                          PendingStatus.EXPIRED):
+            raise ValueError(f"mark_terminal 은 단말 상태만 허용: {status!r}")
+        now = datetime.now().isoformat()
+        conn = _get_conn()
+        cur = conn.execute(
+            """UPDATE pending_orders
+               SET status=?, last_checked_at=?, updated_at=?
+               WHERE trade_id=? AND status IN (?,?)""",
+            (status, now, now, trade_id,
+             PendingStatus.ACCEPTED, PendingStatus.PARTIALLY_FILLED),
+        )
+        conn.commit()
+        changed = cur.rowcount > 0
+        if changed:
+            logger.info(
+                "[PendingRegistry] 단말 마킹: trade_id=%s → %s (reason=%s)",
+                trade_id, status, reason,
+            )
+        return changed
+
+    # ── in-flight 매도 가드 (P0-0) ─────────────────────────────
+    def has_active_order(self, market: str, code: str, side: str) -> bool:
+        """해당 (market, code, side)에 ACTIVE(ACCEPTED/PARTIALLY_FILLED) 주문이 있는가.
+
+        accept↔fill 창에서 apply_sell/apply_buy 가 아직 실행되지 않아 포지션이
+        full-qty 로 남아 있을 때, 동일 종목에 대한 중복 주문(이중매도 등)을
+        막기 위한 durable 조회.
+        """
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT 1 FROM pending_orders "
+            "WHERE market=? AND code=? AND side=? AND status IN (?,?) LIMIT 1",
+            (market, code, side,
+             PendingStatus.ACCEPTED, PendingStatus.PARTIALLY_FILLED),
+        ).fetchone()
+        return row is not None
+
+    def has_active_sell(self, market: str, code: str) -> bool:
+        """해당 종목에 미체결(ACTIVE) 매도 주문이 있으면 True."""
+        return self.has_active_order(market, code, "SELL")
+
     # ── trade_id로 단건 조회 ───────────────────────────────────
     def get_by_trade_id(self, trade_id: str) -> Optional[dict]:
         conn = _get_conn()

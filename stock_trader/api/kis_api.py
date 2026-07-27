@@ -880,21 +880,30 @@ class KISApi:
     # 3-1. 미체결 주문 조회 + 취소
     # ──────────────────────────────────────────────────────────
     def get_open_orders(self, order_type: str = "BUY") -> list:
+        """국내 미체결 주문 조회 (하위호환: 리스트만 반환, 실패 시 빈 리스트)."""
+        _ok, orders = self.get_open_orders_checked(order_type)
+        return orders
+
+    def get_open_orders_checked(self, order_type: str = "BUY") -> tuple:
         """
-        국내 미체결 주문 조회 (TTTC8036R)
-        order_type: "BUY" → 매수 미체결만, "SELL" → 매도 미체결만, "ALL" → 전체
-        반환: [{"order_no": str, "stock_code": str, "stock_name": str,
-                "ord_qty": int, "ord_unpr": int, "ord_dvsn": str,
-                "ord_dvsn_name": str, "ord_time": str}, ...]
+        국내 미체결 주문 조회 (TTTC0084R) — 성공여부를 함께 반환.
+
+        반환: (ok: bool, orders: list)
+          ok=False 는 '조회 실패/미지원(검증 불가)' 을 의미한다.
+          ★ P0-4 stale reconcile 이 KIS API 장애 시 절대로 pending 을
+            자동 해제하지 않도록(보수적 ACTIVE 유지), 성공/실패를 구분한다.
+          orders: [{"order_no","stock_code","stock_name","ord_qty",
+                    "unexec_qty","ord_unpr","ord_dvsn","ord_dvsn_name",
+                    "ord_time","sll_buy_dvsn_cd"}, ...]
         """
         url   = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl"
         from config import Config as _cfg
         if not _cfg.KIS_IS_REAL:
             logger.warning(
                 "[미체결조회] 모의투자 환경에서는 inquire-psbl-rvsecncl 미지원"
-                " — 빈 리스트 반환"
+                " — 검증 불가(ok=False)"
             )
-            return []
+            return (False, [])
         tr_id = "TTTC0084R"
         acc_no, acc_prod = self.account_no.split("-") \
             if "-" in self.account_no else (self.account_no, "01")
@@ -938,10 +947,10 @@ class KISApi:
                     "sll_buy_dvsn_cd": sll_buy,
                 })
             self._on_api_success()
-            return result
+            return (True, result)
         except Exception as e:
             logger.error(f"미체결 조회 실패: {e}")
-            return []
+            return (False, [])
 
     def cancel_order(self, order_no: str, stock_code: str,
                      unexec_qty: int, ord_unpr: int,
@@ -2063,8 +2072,13 @@ class KISApi:
     # ──────────────────────────────────────────────────────────
     # 6-A. 국내주식 당일 주문·체결 조회 (단일 ODNO 필터 지원)
     # ──────────────────────────────────────────────────────────
-    def get_kr_ccld_by_odno(self, odno: str = "", code: str = "") -> dict:
-        """국내주식 당일 주문·체결 조회 (TTTC8001R, 실전).
+    def get_kr_ccld_by_odno(self, odno: str = "", code: str = "",
+                            start_date: str = "", end_date: str = "") -> dict:
+        """국내주식 주문·체결 조회 (TTTC8001R, 실전).
+
+        start_date/end_date (YYYYMMDD) 미지정 시 당일만 조회한다. P0-4a 복구는
+        '당일+직전 영업일' 범위로 조회해 자정 경과·주말 재시작 시에도 늦은 체결을
+        확인할 수 있게 한다.
 
         특정 주문번호(odno)를 지정하면 해당 주문만 반환한다.
         ondo 미지정 시 종목코드(code) 또는 전체 당일 체결 목록을 반환한다.
@@ -2095,11 +2109,13 @@ class KISApi:
         acc_no, acc_prod = self.account_no.split("-") \
             if "-" in self.account_no else (self.account_no, "01")
         today = datetime.now().strftime("%Y%m%d")
+        _strt = start_date or today
+        _end  = end_date or today
         params = {
             "CANO":             acc_no,
             "ACNT_PRDT_CD":     acc_prod,
-            "INQR_STRT_DT":     today,
-            "INQR_END_DT":      today,
+            "INQR_STRT_DT":     _strt,
+            "INQR_END_DT":      _end,
             "SLL_BUY_DVSN_CD":  "00",   # 00=전체 (01=매도, 02=매수)
             "INQR_DVSN":        "00",   # 00=역순
             "PDNO":             code,   # 종목코드 (빈값=전체)

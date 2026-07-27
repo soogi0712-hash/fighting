@@ -252,8 +252,34 @@ def _init_api() -> bool:
 
         # ★ API 초기화 후 오늘 스크리닝 후보 관심종목에 자동 반영
         _load_screener_candidates()
-        # ★ 실제 잔고 기반 피라미딩 포지션 자동 복원
-        _sync_positions_from_balance()
+
+        # ── ★ P0-4/4a: restart 직후 reconcile (순서 고정) ─────────────────
+        # 1) lifecycle load_all_active → meta 복원  (StrategyManager.__init__ 에서 수행)
+        # 2) run_fill_poll          — 다운타임 중 완료된 체결을 먼저 booking
+        # 3) reconcile_execution_state — pending↔lifecycle 크로스-스토어 불일치 수렴
+        #                              (두 DB 갱신 사이 크래시 시 F1/F2 정정, 멱등)
+        # 4) reconcile_stale_pendings — 그 후에도 미체결로 남은 stale 만 KIS 검증 후 EXPIRED
+        #                              (EXPIRE 전 체결조회로 실체결이면 booking)
+        # 5) recover_expired_fills  — 과거 EXPIRED 중 실제 체결된 건(당일+직전영업일) 복구
+        # 6) _sync_positions_from_balance — 최종적으로 KIS 잔고 기준 존재/수량/평단 정합화
+        if _strategy_mgr is not None:
+            try:
+                _strategy_mgr.run_fill_poll()                # (2)
+            except Exception as _e2:
+                logger.warning(f"[restart reconcile] run_fill_poll 스킵: {_e2}")
+            try:
+                _strategy_mgr.reconcile_execution_state()    # (3)
+            except Exception as _e3a:
+                logger.warning(f"[restart reconcile] execution_state 스킵: {_e3a}")
+            try:
+                _strategy_mgr.reconcile_stale_pendings()     # (4)
+            except Exception as _e3:
+                logger.warning(f"[restart reconcile] stale reconcile 스킵: {_e3}")
+            try:
+                _strategy_mgr.recover_expired_fills()         # (5)
+            except Exception as _e4:
+                logger.warning(f"[restart reconcile] expired-fill 복구 스킵: {_e4}")
+        _sync_positions_from_balance()                       # (6)
         return True
     except Exception as e:
         _log(f"❌ API 초기화 실패: {e}", "error")
@@ -261,67 +287,64 @@ def _init_api() -> bool:
 
 
 def _sync_positions_from_balance():
-    """
-    실제 KIS 잔고 ↔ 봇 피라미딩 포지션 완전 동기화.
-    1) 누락 종목 → 자동 등록 (500에러 등으로 포지션 미등록된 경우 복원)
-    2) avg_price 불일치 → KIS 실제 평균단가로 교정
-       (pyramid_positions.json에 잘못된 avg_price가 기록된 경우 수정)
-    ★ 손절 기준이 avg_price 기반이므로 이 값이 정확해야 손절이 작동함
+    """실제 KIS 잔고 ↔ 내부 피라미딩 포지션의 '존재/수량/평단'만 정합화 (P0-3).
+
+    ★ 회계 무개입: apply_buy/apply_sell/positions.pop(매도부킹)/손익확정/재진입등록/
+      compound 을 직접 실행하지 않는다. 매매 회계는 FillObserver →
+      _handle_buy_filled / _handle_sell_filled 만 담당한다.
+    ★ ACTIVE(ACCEPTED/PARTIALLY_FILLED) 주문 종목은 접수→체결 창의 정상 수량차이
+      이므로 유령/누락으로 오판하지 않고 그대로 보존한다.
+    ★ 잔고 조회 실패(예외) 시 아무 것도 바꾸지 않고 기존 포지션을 보존한다.
+    ★ idempotent — 여러 번 실행해도 결과가 동일하다.
     """
     global _strategy_mgr
-    if _strategy_mgr is None:
+    if _strategy_mgr is None or _api is None:
         return
+
+    # 1) 잔고 조회 — 실패하면 기존 포지션 그대로 보존
     try:
         balance = _api.get_balance()
-        holdings = balance.get("holdings", [])
-        if not holdings:
-            return
-        pyramid = _strategy_mgr.pyramid
-        synced  = []
-        corrected = []
-
-        for h in holdings:
-            code      = h.get("code", "")
-            name      = h.get("name", code)
-            qty       = int(h.get("qty", 0))
-            avg_price = float(h.get("avg_price", 0))   # KIS 실제 평균단가
-            if not code or qty <= 0 or avg_price <= 0:
-                continue
-
-            if code not in pyramid.positions:
-                # ── 미등록 종목 → 1단계로 자동 등록 ──
-                pyramid.apply_buy(code, name, 1, qty, avg_price, using_compound=0)
-                synced.append(f"{name}({code}) {qty}주 @{avg_price:,.0f}원")
-            else:
-                # ── 등록된 종목 → avg_price 불일치 교정 ──
-                pos = pyramid.positions[code]
-                bot_avg = pos.avg_price
-                # 차이가 1% 이상이면 KIS 잔고 기준으로 교정
-                if bot_avg > 0 and abs(bot_avg - avg_price) / avg_price > 0.01:
-                    old_avg = pos.avg_price
-                    pos.avg_price    = avg_price
-                    pos.entry_price  = avg_price
-                    pos.total_qty    = qty
-                    # level_entries 도 교정
-                    for lvl_key in pos.level_entries:
-                        pos.level_entries[lvl_key]["avg_price"] = avg_price
-                        pos.level_entries[lvl_key]["price"]     = avg_price
-                        pos.level_entries[lvl_key]["qty"]       = qty
-                        pos.level_entries[lvl_key]["remaining"] = qty
-                    corrected.append(
-                        f"{name}({code}) avg: {old_avg:,.0f}→{avg_price:,.0f}원"
-                    )
-
-        pyramid._save()
-
-        if synced:
-            _log(f"🔄 포지션 자동 복원: {', '.join(synced)}", "info")
-        if corrected:
-            _log(f"🔧 포지션 avg_price 교정 (KIS 잔고 기준): {', '.join(corrected)}", "info")
-        if not synced and not corrected:
-            logger.info("[포지션동기화] 모든 보유종목 포지션 일치 — 복원 불필요")
     except Exception as e:
-        logger.warning(f"[포지션동기화] 실패 (무시): {e}")
+        logger.warning(f"[포지션동기화] 잔고 조회 실패 — 기존 포지션 보존: {e}")
+        return
+    if not isinstance(balance, dict) or balance.get("holdings") is None:
+        logger.warning("[포지션동기화] 잔고 응답 비정상 — 기존 포지션 보존")
+        return
+
+    # 2) 브로커 보유맵 구성
+    broker = {}
+    for h in balance.get("holdings", []):
+        code = h.get("code", "")
+        if not code:
+            continue
+        broker[code] = {
+            "qty":       int(h.get("qty", 0) or 0),
+            "avg_price": float(h.get("avg_price", 0) or 0),
+            "name":      h.get("name", code),
+        }
+
+    # 3) ACTIVE 주문 코드(보호 대상) 확보
+    active_codes = _strategy_mgr.active_order_codes("KR")
+
+    # 4) 구조적 정합화(회계 무개입) — 실제 반영/삭제/교정은 reconcile 이 수행
+    rep = _strategy_mgr.pyramid.reconcile_from_broker(broker, active_codes)
+
+    # 5) 로그
+    if rep.get("added"):
+        _log(f"🔄 포지션 복원(구조): {', '.join(rep['added'])}", "info")
+    if rep.get("removed"):
+        _log(f"🧹 유령 포지션 제거: {', '.join(rep['removed'])}", "info")
+    if rep.get("qty_fixed"):
+        _log(f"🔧 수량 교정(KIS 기준): {', '.join(rep['qty_fixed'])}", "info")
+    if rep.get("avg_fixed"):
+        _log(f"🔧 평단 교정(KIS 기준): {', '.join(rep['avg_fixed'])}", "info")
+    if rep.get("protected"):
+        logger.info(
+            "[포지션동기화] ACTIVE 보호(정합화 제외): %s",
+            sorted(set(rep["protected"])),
+        )
+    if rep.get("unchanged"):
+        logger.info("[포지션동기화] 정합 완료 — 변경 없음")
 
 
 # ── 봇 자동 시작 (앱 기동 시 이전 상태 복원) ─────────────────
@@ -792,6 +815,17 @@ def _trading_loop():
                         f"다음 루프에서 자동 재시도 (최대 3회)",
                         "warning"
                     )
+            elif action == "SELL_TIMEOUT_UNVERIFIED":
+                # ── P0-4: 매도 응답이 타임아웃(접수 불명)이고 KIS 검증도 불가/미발견 ──
+                #   맹목 재시도 시 이중매도 위험 → 재시도 큐에 넣지 않는다.
+                #   포지션 수량은 잔고 동기화(_sync_positions_from_balance)가,
+                #   미체결 잔존은 stale reconcile(reconcile_stale_pendings)가 정리한다.
+                _log(
+                    f"⏸️ SELL_TIMEOUT [{name}({code})] 접수 불명 "
+                    f"({result.get('_timeout_detail','?')}) → 재시도 안 함(이중매도 방지). "
+                    f"잔고동기화·stale reconcile 이 정리 예정",
+                    "warning"
+                )
             elif action == "SELL":
                 profit = result.get("profit", 0)
                 emoji  = "💰" if profit >= 0 else "🔴"
@@ -1707,17 +1741,48 @@ def _orphan_loss_cut():
                         f"🔴 [{tag}자동매도] {name}({code}) {sell_reason} — 전량 매도",
                         "sell"
                     )
-                    try:
-                        result = _api.sell(code, qty, 0)  # 시장가 전량 매도
-                        if result.get("rt_cd") == "0":
-                            if pyramid_obj:
-                                pyramid_obj.positions.pop(code, None)
-                                pyramid_obj._save()
-                            _log(f"✅ 매도 체결 완료: {name}({code}) {qty}주", "sell")
-                        else:
-                            _log(f"❌ 매도 주문 실패 {name}: {result.get('msg1','?')}", "error")
-                    except Exception as e:
-                        _log(f"❌ 매도 주문 오류 {name}: {e}", "error")
+                    # ── P0-2: 손절/트레일링 강제청산도 Lifecycle+PendingRegistry 경로로만 ──
+                    #   positions.pop() / apply_sell() 직접 호출 금지.
+                    #   체결 반영은 FillObserver → _handle_sell_filled 이 1회 수행한다.
+                    if _strategy_mgr is None:
+                        _log(
+                            f"❌ [{tag}자동매도] {name}({code}) strategy_mgr 미초기화 "
+                            f"→ 안전 청산 경로 불가(수동 확인 필요)",
+                            "error"
+                        )
+                        continue
+                    res = _strategy_mgr.submit_retry_liquidation(
+                        code, name, qty, reason=f"{tag}자동매도: {sell_reason[:60]}",
+                    )
+                    status = res.get("status")
+                    if status == "accepted":
+                        _log(
+                            f"✅ 매도 접수 완료: {name}({code}) {qty}주 "
+                            f"→ 체결 대기(FillObserver 반영)", "sell"
+                        )
+                    elif status == "skipped_inflight":
+                        _log(
+                            f"⏸️ [{tag}자동매도 in-flight] {name}({code}) 미체결 매도 "
+                            f"존재 → 스킵(중복 매도 방지)", "warning"
+                        )
+                    elif status == "accepted_untracked":
+                        _log(
+                            f"⚠️ [{tag}자동매도 접수(추적실패)] {name}({code}) {qty}주 "
+                            f"주문 접수됨 but lifecycle 등록 실패 → 수동 확인 필요", "error"
+                        )
+                    else:
+                        detail = res.get("msg1") or res.get("error") or status
+                        _log(
+                            f"❌ 매도 주문 실패:{status} {name}({code}): {detail} "
+                            f"→ SELL 재시도 큐 등록", "error"
+                        )
+                        import time as _t_ols
+                        _sell_retry_q.append({
+                            "code": code, "name": name, "qty": qty,
+                            "attempt": 1,
+                            "first_fail_ts": _t_ols.time(),
+                            "reason": f"{tag}자동매도: {sell_reason[:60]}",
+                        })
 
             elif net_pct <= -2.0 and is_orphan:
                 _log(
@@ -1785,32 +1850,67 @@ def _flush_sell_retry_q():
             )
             continue  # 큐에서 제거
 
+        # ── P0-0: in-flight 매도 가드 — ACTIVE 매도 주문이 있으면 이번 회차 스킵 ──
+        if _strategy_mgr is not None and _strategy_mgr.has_active_sell(code):
+            _log(
+                f"⏸️ [SELL_RETRY in-flight] {name}({code}) 미체결 매도 주문 존재 "
+                f"→ 이번 회차 재시도 스킵(체결은 FillObserver 반영)",
+                "warning"
+            )
+            remain.append(item)
+            continue
+
+        # ── P0-2: 재시도 매도도 Lifecycle+PendingRegistry 경로로만 제출 ──
+        #   positions.pop() / apply_sell() 직접 호출 금지.
+        #   체결 반영은 FillObserver → _handle_sell_filled 이 1회 수행한다.
+        if _strategy_mgr is None:
+            _log(
+                f"❌ [SELL_RETRY {attempt}/3] {name}({code}) strategy_mgr 미초기화 "
+                f"→ 안전 청산 경로 불가, 큐 유지(수동 확인 필요)",
+                "error"
+            )
+            remain.append(item)
+            continue
+
         _log(
             f"🔄 [SELL_RETRY {attempt}/3] {name}({code}) {qty}주 시장가 재매도 시도...",
             "warning"
         )
-        try:
-            result = _api.sell(code, qty, 0)   # 시장가
-            if result.get("rt_cd") == "0":
-                _log(f"✅ [SELL_RETRY 성공] {name}({code}) {qty}주 매도 완료", "sell")
-                # pyramid 포지션 정리
-                if _strategy_mgr and hasattr(_strategy_mgr, "pyramid"):
-                    _strategy_mgr.pyramid.positions.pop(code, None)
-                    _strategy_mgr.pyramid._save()
-                # 성공 → 큐에서 제거 (remain에 추가 안 함)
-            else:
-                msg1 = result.get("msg1", "?")
-                _log(
-                    f"❌ [SELL_RETRY {attempt}/3 실패] {name}({code}): {msg1}",
-                    "error"
-                )
-                item["attempt"] += 1
-                item["first_fail_ts"] = now_ts  # 다음 대기 기산점 갱신
-                remain.append(item)
-        except Exception as e:
-            _log(f"❌ [SELL_RETRY {attempt}/3 오류] {name}({code}): {e}", "error")
+        res = _strategy_mgr.submit_retry_liquidation(
+            code, name, qty, reason=f"SELL_RETRY {attempt}/3: {reason[:60]}",
+        )
+        status = res.get("status")
+
+        if status == "accepted":
+            # 접수 성공 = 체결 아님. 큐에서 제거하고, 체결은 FillObserver 가 반영.
+            _log(
+                f"✅ [SELL_RETRY 접수] {name}({code}) {qty}주 매도 접수 완료 "
+                f"→ 체결 대기(FillObserver 반영)", "sell"
+            )
+            # 성공 → 큐에서 제거 (remain에 추가 안 함)
+        elif status == "skipped_inflight":
+            # 이미 미체결 매도 존재 → 이번 회차만 스킵, 큐 유지(대기 기산점 유지)
+            _log(
+                f"⏸️ [SELL_RETRY in-flight] {name}({code}) 미체결 매도 존재 "
+                f"→ 이번 회차 스킵(중복 매도 방지)", "warning"
+            )
+            remain.append(item)
+        elif status == "accepted_untracked":
+            # 접수는 됐으나 lifecycle 등록 실패. 중복 방지 위해 큐에서 제거하고 경고.
+            _log(
+                f"⚠️ [SELL_RETRY 접수(추적실패)] {name}({code}) {qty}주 주문은 접수됨 "
+                f"but lifecycle 등록 실패 → 수동 체결 확인 필요", "error"
+            )
+            # 큐에서 제거 (재제출하면 중복 주문 위험)
+        else:
+            # rejected / refused_no_lifecycle / error → 재시도 카운트 증가 후 큐 유지
+            detail = res.get("msg1") or res.get("error") or status
+            _log(
+                f"❌ [SELL_RETRY {attempt}/3 실패:{status}] {name}({code}): {detail}",
+                "error"
+            )
             item["attempt"] += 1
-            item["first_fail_ts"] = now_ts
+            item["first_fail_ts"] = now_ts  # 다음 대기 기산점 갱신
             remain.append(item)
 
     _sell_retry_q = remain
@@ -1869,35 +1969,35 @@ def _watchdog():
         return
 
     # ══════════════
-    # W4: 포지션 불일치 (내부 있음 + KIS qty=0)
+    # W4: 포지션 불일치 — 존재/수량 정합화는 reconcile 에 위임
+    #     (P0-3: ACTIVE 주문 보호 + 회계 무개입 + idempotent)
+    #     내부 있음/KIS=0(유령 제거), KIS 보유/내부 없음(구조 복원),
+    #     양쪽 수량 불일치(교정) 를 한 번에 처리한다.
+    #     positions.pop() 직접 호출은 하지 않는다(중복매도·유령 오판 방지).
     # ══════════════
-    removed_by_watchdog = []
-    for code, pos in list(positions.items()):
-        kis_q = kis_qty.get(code, 0)
-        int_q = pos.total_qty
-        if kis_q == 0 and int_q > 0:
-            _log(
-                f"🚨 [Watchdog W4] 포지션 불일치 감지! "
-                f"{pos.name}({code}) 내부={int_q}주 KIS=0주 "
-                f"→ 내부 포지션 강제 제거 (수동청산 추정)",
-                "error"
-            )
-            pyramid_obj.positions.pop(code, None)
-            removed_by_watchdog.append(code)
-        elif kis_q > 0 and int_q == 0:
-            _log(
-                f"⚠️ [Watchdog W4] 미등록 KIS 보유 감지: "
-                f"{code} KIS={kis_q}주 내부=0주 → _sync_positions_from_balance() 호출",
-                "warning"
-            )
-            # 자동 복구는 _sync_positions_from_balance에 위임
-            try:
-                _sync_positions_from_balance()
-            except Exception:
-                pass
+    # ── P0-4: stale ACTIVE pending 정리(≥5분 미체결 & KIS 미발견 → EXPIRED) ──
+    #   후보가 없으면 즉시 no-op(추가 API 호출 없음). 회계 무개입.
+    #   포지션 정합화보다 먼저 수행해, EXPIRED 로 풀린 종목을 잔고 기준으로 정리.
+    if _strategy_mgr is not None:
+        # P0-4a: 크로스-스토어 불일치(F1/F2) 먼저 수렴 → 이후 stale/복구
+        try:
+            _strategy_mgr.reconcile_execution_state()
+        except Exception as _wce:
+            logger.warning(f"[Watchdog] execution_state reconcile 스킵: {_wce}")
+        try:
+            _strategy_mgr.reconcile_stale_pendings()
+        except Exception as _wse:
+            logger.warning(f"[Watchdog] stale reconcile 스킵: {_wse}")
+        # P0-4a: EXPIRED 중 늦게 체결된 건 복구. 대상 없으면 저비용.
+        try:
+            _strategy_mgr.recover_expired_fills()
+        except Exception as _wre:
+            logger.warning(f"[Watchdog] expired-fill 복구 스킵: {_wre}")
 
-    if removed_by_watchdog:
-        pyramid_obj._save()
+    try:
+        _sync_positions_from_balance()
+    except Exception as _w4e:
+        logger.warning(f"[Watchdog W4] 포지션 동기화 스킵: {_w4e}")
 
     # ══════════════════════════════════════════════════
     # W1/W2/W3: 규칙 위반 포지션 (익절/손절/시간청산 미실행)
@@ -1977,40 +2077,51 @@ def _watchdog():
                 "error"
             )
             if kr_tradeable:
-                try:
-                    result = _api.sell(code, qty, 0)   # 시장가 즉시 매도
-                    if result.get("rt_cd") == "0":
-                        pyramid_obj.positions.pop(code, None)
-                        pyramid_obj._save()
-                        _log(
-                            f"✅ [Watchdog 강제매도 완료] {pos.name}({code}) "
-                            f"{qty}주 | 실질{net_pct:+.2f}%",
-                            "sell"
-                        )
-                    else:
-                        msg1 = result.get("msg1", "?")
-                        _log(
-                            f"❌ [Watchdog 강제매도 실패] {pos.name}({code}): {msg1} "
-                            f"→ SELL 재시도 큐 등록",
-                            "error"
-                        )
-                        _sell_retry_q.append({
-                            "code": code, "name": pos.name, "qty": qty,
-                            "attempt": 1,
-                            "first_fail_ts": _t.time(),
-                            "reason": f"Watchdog {viol_type}: {violation[:60]}",
-                        })
-                except Exception as e:
+                # ── P0-2: 워치독 강제매도도 Lifecycle+PendingRegistry 경로로만 제출 ──
+                #   positions.pop() / apply_sell() 직접 호출 금지.
+                #   체결 반영은 FillObserver → _handle_sell_filled 이 1회 수행한다.
+                if _strategy_mgr is None:
                     _log(
-                        f"❌ [Watchdog 강제매도 예외] {pos.name}({code}): {e} "
-                        f"→ SELL 재시도 큐 등록",
+                        f"❌ [Watchdog {viol_type}] {pos.name}({code}) strategy_mgr "
+                        f"미초기화 → 안전 청산 경로 불가(수동 확인 필요)",
+                        "error"
+                    )
+                    continue
+                res = _strategy_mgr.submit_retry_liquidation(
+                    code, pos.name, qty,
+                    reason=f"Watchdog {viol_type}: {violation[:60]}",
+                )
+                status = res.get("status")
+                if status == "accepted":
+                    _log(
+                        f"✅ [Watchdog 강제매도 접수] {pos.name}({code}) {qty}주 "
+                        f"| 실질{net_pct:+.2f}% → 체결 대기(FillObserver 반영)",
+                        "sell"
+                    )
+                elif status == "skipped_inflight":
+                    _log(
+                        f"⏸️ [Watchdog {viol_type} in-flight] {pos.name}({code}) "
+                        f"미체결 매도 존재 → 강제매도 스킵(중복 매도 방지)",
+                        "warning"
+                    )
+                elif status == "accepted_untracked":
+                    _log(
+                        f"⚠️ [Watchdog 강제매도 접수(추적실패)] {pos.name}({code}) "
+                        f"{qty}주 주문 접수됨 but lifecycle 등록 실패 → 수동 확인 필요",
+                        "error"
+                    )
+                else:
+                    detail = res.get("msg1") or res.get("error") or status
+                    _log(
+                        f"❌ [Watchdog 강제매도 실패:{status}] {pos.name}({code}): "
+                        f"{detail} → SELL 재시도 큐 등록",
                         "error"
                     )
                     _sell_retry_q.append({
                         "code": code, "name": pos.name, "qty": qty,
                         "attempt": 1,
                         "first_fail_ts": _t.time(),
-                        "reason": f"Watchdog {viol_type} 예외: {str(e)[:60]}",
+                        "reason": f"Watchdog {viol_type}: {violation[:60]}",
                     })
             else:
                 _log(

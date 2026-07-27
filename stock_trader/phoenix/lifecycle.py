@@ -907,6 +907,52 @@ class OrderLifecycleManager:
             lc, f"lifecycle:expire:{lc.order_lifecycle_id}"
         )
 
+    def recover_fill_from_terminal(
+        self,
+        lc: OrderLifecycle,
+        delta: int,
+        avg_price: Optional[float] = None,
+        on_filled=None,
+        reason: Optional[str] = None,
+    ) -> bool:
+        """[정정 전용] EXPIRED/CANCELLED 단말을 실제 체결 증거에 근거해 FILLED 로 정정.
+
+        P0-4a: KIS 체결조회(ground truth) > 내부 terminal(추정). 실제 체결은
+        되돌릴 수 없는 사실이므로, 늦게 발견된 체결의 회계를 정확히 1회 복구한다.
+
+        ★ 상태머신을 우회하는 유일한 정정 경로(EXPIRED/CANCELLED → FILLED).
+          - 이미 FILLED 이면 no-op (멱등, 중복 booking 방지).
+          - REJECTED(미접수 확정) 는 정정 대상 아님(체결이 있을 수 없음).
+          - ORDER_ACCEPTED/PARTIALLY_FILLED 등 비단말은 정상 full_fill 경로 사용.
+        ★ on_filled 는 FILLED 로 정정된 후 정확히 1회 호출(회계 반영).
+
+        Returns:
+            True  — 정정 + on_filled 1회 수행
+            False — 정정 대상 아님(멱등 no-op)
+        """
+        if lc.current_state == LifecycleState.FILLED:
+            return False
+        if lc.current_state not in (LifecycleState.EXPIRED,
+                                    LifecycleState.CANCELLED):
+            return False
+        prev = lc.current_state
+        # 직접 정정(validator 우회) — 감사 로그로 명시.
+        lc.filled_qty = (lc.filled_qty or 0) + max(0, int(delta or 0))
+        if avg_price:
+            lc.avg_fill_price = avg_price
+        lc.current_state = LifecycleState.FILLED
+        lc.terminal_reason = f"RECOVERED_FILL(from {prev.name}): {reason or ''}"
+        self._persist_and_record(
+            lc, f"lifecycle:recover:{lc.order_lifecycle_id}"
+        )
+        logger.warning(
+            "[Lifecycle] %s→FILLED 정정(체결 증거 발견): id=%s filled_qty=%s reason=%s",
+            prev.name, lc.order_lifecycle_id, lc.filled_qty, reason,
+        )
+        if on_filled is not None:
+            on_filled(lc)
+        return True
+
     # ── 내부: 저장 + 기록 ─────────────────────────────────────────
     def _persist_and_record(
         self, lc: OrderLifecycle, idem_key: str
