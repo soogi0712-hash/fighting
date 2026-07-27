@@ -50,12 +50,18 @@ from strategies.pyramid_strategy   import PyramidStrategyManager
 from strategies.indicator_validator import IndicatorValidator
 from strategies.daily_pnl_guard     import DailyPnLGuard
 from strategies.reentry_guard       import ReentryGuard
+from strategies.order_pricing        import select_sell_price
+from strategies.order_failure         import (
+    classify_order_failure, FAIL_TIMEOUT, FAIL_REJECTED,
+)
 from screener.trade_decision        import TradeDecisionEngine
 from screener.transaction_cost      import net_profit_pct_from_cost
 
 # ── Phoenix OrderLifecycle + Execution-driven position update ──────────
 try:
-    from phoenix.lifecycle import OrderLifecycleManager, make_order_lifecycle_id
+    from phoenix.lifecycle import (
+        OrderLifecycleManager, make_order_lifecycle_id, LifecycleState,
+    )
     from phoenix.execution_driven import ExecutionDrivenPositionUpdater
     _LIFECYCLE_ENABLED = True
 except Exception as _lce:
@@ -505,6 +511,257 @@ class StrategyManager:
     # Phase 4: run_fill_poll() — FillObserver → dispatch_fill() 자동 연결
     # ══════════════════════════════════════════════════════════
 
+    def has_active_sell(self, code: str, market: str = "KR") -> bool:
+        """해당 종목에 미체결(ACCEPTED/PARTIALLY_FILLED) 매도 주문이 있으면 True.
+
+        P0-0 in-flight 매도 가드용. PendingRegistry 미구성 시 False(가드 미적용).
+        accept↔fill 창에서 apply_sell 이 아직 실행되지 않아 포지션이 남아 있어도
+        중복 매도를 내지 않도록, run()/retry/watchdog 이 매도 제출 전 확인한다.
+        """
+        if self._pending_registry is None:
+            return False
+        try:
+            return self._pending_registry.has_active_sell(market, code)
+        except Exception:
+            return False
+
+    def active_order_codes(self, market: str = "KR") -> set:
+        """해당 시장에서 ACTIVE(ACCEPTED/PARTIALLY_FILLED) 주문이 걸린 코드 집합.
+
+        P0-3 포지션 동기화가 접수→체결 창의 정상 수량차이를 유령/누락으로
+        오판하지 않도록 보호대상 코드를 제공한다. PendingRegistry 미구성 시 빈 집합.
+        """
+        if self._pending_registry is None:
+            return set()
+        try:
+            return {
+                r.get("code") for r in self._pending_registry.get_trackable()
+                if r.get("market") == market and r.get("code")
+            }
+        except Exception:
+            return set()
+
+    # ══════════════════════════════════════════════════════════
+    # P0-2: submit_retry_liquidation() — 재시도/워치독 강제청산 전용 매도 제출
+    # ══════════════════════════════════════════════════════════
+    def submit_retry_liquidation(
+        self,
+        code: str,
+        name: str,
+        qty: int,
+        *,
+        reason: str,
+        level=None,
+        market: str = "KR",
+    ) -> dict:
+        """재시도(SELL_RETRY)/워치독 강제청산 전용 시장가 매도 제출.
+
+        P0-2 원칙:
+          1. positions.pop() 을 직접 호출하지 않는다.
+          2. apply_sell() 을 직접 호출하지 않는다.
+          3. rt_cd==0 이면 Lifecycle + PendingRegistry 에만 정상 등록한다.
+          4. 실제 포지션 반영/실현손익/재진입기록은 FillObserver 가 체결을 감지해
+             _handle_sell_filled() 이 1회 수행한다 (여기서는 절대 하지 않는다).
+
+        정규 매도 경로(run())의 accept 처리와 동일하게, 접수(rt_cd=0)는 '체결'이
+        아니라 '접수'로만 취급한다.
+
+        Returns dict with "status":
+          "skipped_inflight"     — 이미 미체결 매도 존재 → 제출 안 함(중복 방지)
+          "refused_no_lifecycle" — lifecycle 미구성 → 회계 우회 금지, 제출 안 함
+          "unsupported_market"   — KR 외 시장(본 메서드는 국내 전용)
+          "accepted"             — 접수 성공, 체결 대기(lifecycle_id 포함)
+          "accepted_untracked"   — 접수됐으나 lifecycle 등록 실패(수동 확인 필요)
+          "rejected"             — rt_cd != 0 (msg1 포함)
+          "error"                — 예외/사전조건 불충족
+        """
+        if market != "KR":
+            return {"status": "unsupported_market", "market": market, "code": code}
+
+        # (1) in-flight 가드 — 이미 미체결 매도가 있으면 추가 매도 금지
+        if self.has_active_sell(code, market):
+            logger.info(
+                "[submit_retry_liquidation] 미체결 매도 존재 → 스킵(중복 매도 방지): "
+                "code=%s qty=%s reason=%s", code, qty, reason,
+            )
+            return {"status": "skipped_inflight", "code": code}
+
+        # (2) lifecycle 필수 — 없으면 회계 우회 금지, 제출 자체를 거부
+        if self._lifecycle_mgr is None:
+            logger.error(
+                "[submit_retry_liquidation] lifecycle 미구성 — 회계 정합 보장 불가로 "
+                "강제청산 제출 거부: code=%s qty=%s reason=%s", code, qty, reason,
+            )
+            return {"status": "refused_no_lifecycle", "code": code}
+
+        if self.api is None or qty <= 0:
+            return {"status": "error", "error": "api_none_or_qty<=0", "code": code}
+
+        # (3) 시장가 매도 제출
+        try:
+            result = self.api.sell(code, qty, 0)   # 시장가 (ORD_UNPR=0)
+        except Exception as exc:
+            logger.error(
+                "[submit_retry_liquidation] api.sell 예외: code=%s qty=%s err=%s",
+                code, qty, exc,
+            )
+            return {"status": "error", "error": str(exc), "code": code}
+
+        if not result or result.get("rt_cd") != "0":
+            msg1 = (result or {}).get("msg1", "?")
+            return {"status": "rejected", "msg1": msg1, "result": result, "code": code}
+
+        # (4) rt_cd==0 → Lifecycle + PendingRegistry 등록만.
+        #     apply_sell / positions.pop / pnl_guard.record / reentry.record_sell 없음.
+        #     체결 반영은 FillObserver → _handle_sell_filled 이 1회 수행한다.
+        try:
+            _lc_id = make_order_lifecycle_id(market, "SELL", code)
+            _lc = self._lifecycle_mgr.create(
+                trade_id      = _lc_id,
+                market        = market,
+                code          = code,
+                side          = "SELL",
+                strategy_name = "RetryLiquidation",
+                order_qty     = qty,
+            )
+            # ★ 전이 순서 준수: UNKNOWN → SIGNAL_CONFIRMED → ORDER_SUBMITTED →
+            #   (ORDER_ACCEPTED 는 _register_pending_order 가 odno 와 함께 수행).
+            #   create 직후 곧바로 accept 하면 UNKNOWN→ACCEPTED 로 전이 예외가 난다.
+            self._lifecycle_mgr.confirm_signal(_lc)
+            self._lifecycle_mgr.submit(_lc)
+            # 체결 시 _handle_sell_filled 이 사용할 최소 meta.
+            # price=0.0 → 체결가(avg_fill_price)로 채워지며, 없으면 booking 스킵(안전).
+            self._pending_sell_meta[_lc.order_lifecycle_id] = {
+                "name":      name,
+                "qty":       qty,
+                "price":     0.0,
+                "level":     level,
+                "is_full":   True,
+                "reason":    reason,
+                "is_forced": True,
+            }
+            self._register_pending_order(
+                market         = market,
+                trade_id       = "",
+                code           = code,
+                side           = "SELL",
+                order_qty      = qty,
+                order_response = result,
+                lifecycle_id   = _lc.order_lifecycle_id,
+            )
+            logger.info(
+                "[submit_retry_liquidation] 접수 성공 — 체결 대기(FillObserver 반영): "
+                "code=%s qty=%s lifecycle_id=%s reason=%s",
+                code, qty, _lc.order_lifecycle_id, reason,
+            )
+            return {
+                "status": "accepted",
+                "lifecycle_id": _lc.order_lifecycle_id,
+                "code": code,
+            }
+        except Exception as exc:
+            # 주문은 이미 접수됨(rt_cd==0)인데 lifecycle 등록만 실패.
+            # 회계 우회 금지 원칙상 여기서 apply_sell/positions.pop 하지 않는다.
+            # PendingRegistry 미등록이면 다음 회차 in-flight 가드가 못 잡을 수 있어 경고.
+            logger.error(
+                "[submit_retry_liquidation] 접수 후 lifecycle 등록 실패 — "
+                "수동 확인 필요(주문은 접수됨, 체결조회로 정합 확인): "
+                "code=%s qty=%s err=%s", code, qty, exc,
+            )
+            return {"status": "accepted_untracked", "code": code, "error": str(exc)}
+
+    # ══════════════════════════════════════════════════════════
+    # P0-4: SELL 타임아웃(불명) 검증 — 이중매도 방지
+    # ══════════════════════════════════════════════════════════
+    def _track_existing_sell(self, code, name, qty, price, level, is_full,
+                             reason, odno) -> str:
+        """이미 거래소에 접수된 것으로 확인된 SELL 주문(odno)을 신규 주문 없이
+        lifecycle + PendingRegistry 에만 등록해 FillObserver 가 체결을 추적하게 한다.
+
+        새 api.sell 을 호출하지 않는다(주문은 이미 존재). apply_sell/positions.pop 없음.
+        """
+        if self._lifecycle_mgr is None:
+            return ""
+        _lc_id = make_order_lifecycle_id("KR", "SELL", code)
+        _lc = self._lifecycle_mgr.create(
+            trade_id=_lc_id, market="KR", code=code, side="SELL",
+            strategy_name="SellTimeoutRecovery", order_qty=qty,
+        )
+        self._lifecycle_mgr.confirm_signal(_lc)
+        self._lifecycle_mgr.submit(_lc)
+        self._pending_sell_meta[_lc.order_lifecycle_id] = {
+            "name": name, "qty": qty, "price": 0.0, "level": level,
+            "is_full": is_full, "reason": reason, "is_forced": True,
+        }
+        # 실제 odno 를 담은 합성 응답으로 PendingRegistry 등록(→ ORDER_ACCEPTED)
+        self._register_pending_order(
+            market="KR", trade_id="", code=code, side="SELL", order_qty=qty,
+            order_response={"output": {"KNO_ORD_NO": str(odno)}},
+            lifecycle_id=_lc.order_lifecycle_id,
+        )
+        return _lc.order_lifecycle_id
+
+    def _handle_sell_timeout(self, code, name, qty, price, level, is_full,
+                             reason, sess) -> dict:
+        """SELL 응답이 TIMEOUT(접수 불명)일 때 KIS 미체결조회로 확인 후 처리.
+
+        정책(이중매도·가짜 PnL 동시 방지):
+          - 검증 API 실패(ok=False) → SELL_TIMEOUT_UNVERIFIED
+            (재시도 X, booking X — reconcile/잔고동기화에 위임)
+          - open orders 에 이 종목 SELL 이 살아있음 → 실제 접수됨 →
+            lifecycle+pending 등록(추적) → action=SELL (재시도 X, 체결은 FillObserver)
+          - open orders 에 없음(미접수 또는 이미 체결·소멸, 구분 불가) →
+            SELL_TIMEOUT_UNVERIFIED (재시도 X, booking X)
+        """
+        base = {"code": code, "name": name, "session": sess.get("session", ""),
+                "qty": qty, "reason": reason}
+
+        def _unverified(detail):
+            logger.warning(
+                "[SELL TIMEOUT] 접수 불명 — 재시도/부킹 안 함(보수적): "
+                "code=%s qty=%s detail=%s", code, qty, detail,
+            )
+            return {**base, "action": "SELL_TIMEOUT_UNVERIFIED",
+                    "_timeout_detail": detail}
+
+        if self.api is None or not hasattr(self.api, "get_open_orders_checked"):
+            return _unverified("api_unavailable")
+        try:
+            ok, orders = self.api.get_open_orders_checked("SELL")
+        except Exception as exc:
+            return _unverified(f"verify_exception:{exc}")
+        if not ok:
+            return _unverified("verify_api_failed")
+
+        match = next(
+            (o for o in orders
+             if o.get("stock_code") == code
+             and str(o.get("sll_buy_dvsn_cd", "")) == "01"),
+            None,
+        )
+        if match is None:
+            # 미접수 or 이미 체결·소멸 — 구분 불가 → 재시도/부킹 안 함(잔고동기화가 정정)
+            return _unverified("not_in_open_orders")
+
+        odno = str(match.get("order_no", "") or "").strip()
+        try:
+            _lc_id = self._track_existing_sell(
+                code, name, qty, price, level, is_full, reason, odno,
+            )
+            logger.info(
+                "[SELL TIMEOUT] 거래소 접수 확인 → 추적 등록(재시도 안 함): "
+                "code=%s odno=%s lifecycle_id=%s", code, odno, _lc_id,
+            )
+            return {**base, "action": "SELL", "price": price, "is_full": is_full,
+                    "level": level, "_lifecycle_id": _lc_id,
+                    "_timeout_recovered": True}
+        except Exception as exc:
+            logger.error(
+                "[SELL TIMEOUT] 접수 확인됐으나 추적 등록 실패: code=%s err=%s",
+                code, exc,
+            )
+            return _unverified(f"track_register_failed:{exc}")
+
     def run_fill_poll(self) -> dict:
         """FillObserver.poll_once() → dispatch_fill() 자동 연결.
 
@@ -617,6 +874,411 @@ class StrategyManager:
         if dispatched:
             logger.info("[run_fill_poll] 완료: dispatched=%s", dispatched)
         return summary
+
+    # ══════════════════════════════════════════════════════════
+    # P0-4: reconcile_stale_pendings() — stale ACTIVE 주문 보수적 정리
+    # ══════════════════════════════════════════════════════════
+    STALE_PENDING_SEC = 300   # ACCEPTED/PARTIAL 5분 경과 → stale 후보
+
+    def reconcile_stale_pendings(self, max_age_sec: int = None,
+                                 poll_first: bool = True) -> dict:
+        """stale ACTIVE pending 주문을 KIS 로 검증해 보수적으로 정리한다.
+
+        판정(전부 충족 시 stale): TRACKABLE + submitted_at 경과 ≥ max_age_sec +
+        (poll 후에도) 미체결 + KIS open orders 에서 odno 성공조회로 미발견.
+
+        처리:
+          - odno 가 open orders 에 여전히 존재 → live → ACTIVE 유지.
+          - open orders 조회 실패(ok=False) → 검증 불가 → ACTIVE 유지(retry_count++),
+            절대 자동 해제하지 않음(KIS 장애 보수적 처리).
+          - odno 미발견(성공조회) → 거래소에서 사라짐 & 체결 미확인 →
+            EXPIRED 처리: lifecycle.expire + pending.mark_terminal(EXPIRED).
+            ★ apply_sell/apply_buy/positions.pop/PnL/재진입 절대 없음(가짜 PnL 금지).
+            포지션 수량 정정은 P0-3 _sync_positions_from_balance 가 잔고 기준으로 담당.
+
+        ★ idempotent: terminal 처리된 주문은 다음 회차 후보에서 자동 제외된다.
+        ★ 실제 체결은 (poll_first=True) run_fill_poll 이 먼저 booking 하므로,
+          여기서 EXPIRED 되는 주문은 '거래소에서 사라졌지만 체결도 아님' 뿐이다.
+        """
+        if max_age_sec is None:
+            max_age_sec = self.STALE_PENDING_SEC
+        report = {"candidates": 0, "expired": [], "kept_live": [],
+                  "kept_unverified": [], "api_failed_markets": [], "booked": []}
+        if self._pending_registry is None or self._lifecycle_mgr is None:
+            return report
+
+        # 1) 실제 체결은 먼저 booking (stale 오판 방지)
+        if poll_first:
+            try:
+                self.run_fill_poll()
+            except Exception as exc:
+                logger.warning("[reconcile_stale] run_fill_poll 오류(무시): %s", exc)
+
+        # 2) stale 후보 수집
+        try:
+            candidates = self._pending_registry.get_stale_trackable(max_age_sec)
+        except Exception as exc:
+            logger.warning("[reconcile_stale] get_stale_trackable 오류: %s", exc)
+            return report
+        report["candidates"] = len(candidates)
+        if not candidates:
+            return report
+
+        # 3) 시장별 open orders 를 '검증 가능하게' 1회 조회 (KR 만 지원)
+        open_odno_by_market = {}   # market -> set(odno) or None(조회 실패)
+        for market in {c.get("market", "KR") for c in candidates}:
+            if market != "KR":
+                open_odno_by_market[market] = None   # 검증 불가 → 보수적 유지
+                continue
+            if self.api is None or not hasattr(self.api, "get_open_orders_checked"):
+                open_odno_by_market[market] = None
+                continue
+            try:
+                ok, orders = self.api.get_open_orders_checked("ALL")
+            except Exception as exc:
+                logger.warning("[reconcile_stale] open orders 조회 예외: %s", exc)
+                ok, orders = False, []
+            if not ok:
+                open_odno_by_market[market] = None   # 조회 실패 → 보수적 유지
+                report["api_failed_markets"].append(market)
+            else:
+                open_odno_by_market[market] = {
+                    str(o.get("order_no", "")).strip() for o in orders
+                    if o.get("order_no")
+                }
+
+        # 4) 후보별 판정
+        for c in candidates:
+            market = c.get("market", "KR")
+            lc_id  = c.get("trade_id", "")     # pending.trade_id = lifecycle_id
+            odno   = str(c.get("odno", "") or "").strip()
+            open_set = open_odno_by_market.get(market)
+
+            if open_set is None:
+                # 검증 불가(KIS 장애/미지원) → ACTIVE 유지, retry_count++
+                report["kept_unverified"].append(lc_id)
+                try:
+                    self._pending_registry.increment_retry(lc_id)
+                except Exception:
+                    pass
+                continue
+
+            if not odno:
+                # odno 가 없어 대조 불가 → 보수적으로 ACTIVE 유지
+                report["kept_unverified"].append(lc_id)
+                continue
+
+            if odno in open_set:
+                # 여전히 거래소에 살아있음 → 유지
+                report["kept_live"].append(lc_id)
+                continue
+
+            # odno 가 open book 에서 사라짐(성공조회로 확인) → 체결됐거나 취소됐음.
+            # ★ P0-4a: EXPIRE 하기 전에 체결조회로 실제 체결 여부를 확인한다.
+            #   - 체결 증거 있음 → dispatch_fill 로 booking(가짜 아님, 실체결) → "booked"
+            #   - 체결 없음     → EXPIRED(회계 무개입). 혹시 조회 순간지연으로 놓쳐도
+            #                     recover_expired_fills 가 이후 재확인해 복구(무손실).
+            outcome = self._resolve_gone_order(c)
+            if outcome == "booked":
+                report["booked"].append(lc_id)
+            else:
+                report["expired"].append(lc_id)
+
+        if report["expired"] or report["kept_unverified"]:
+            logger.info(
+                "[reconcile_stale] 후보=%d expired=%s kept_live=%d "
+                "kept_unverified=%d api_failed=%s",
+                report["candidates"], report["expired"],
+                len(report["kept_live"]), len(report["kept_unverified"]),
+                report["api_failed_markets"],
+            )
+        return report
+
+    def _expire_stale_pending(self, lifecycle_id: str, market: str,
+                              odno: str) -> None:
+        """stale 주문을 EXPIRED 로 전이(회계 무개입). lifecycle + pending 동시 처리."""
+        reason = f"STALE_EXPIRED: KIS open orders 미발견(odno={odno})"
+        # lifecycle: ORDER_ACCEPTED/PARTIALLY_FILLED → EXPIRED (booking 없음)
+        try:
+            lc = self._lifecycle_mgr.load(lifecycle_id)
+            if lc is not None and not lc.is_terminal:
+                self._lifecycle_mgr.expire(lc, reason)
+        except Exception as exc:
+            logger.warning(
+                "[reconcile_stale] lifecycle expire 실패(계속): id=%s err=%s",
+                lifecycle_id, exc,
+            )
+        # pending: TRACKABLE → EXPIRED (idempotent, 체결이면 no-op)
+        try:
+            self._pending_registry.mark_terminal(
+                lifecycle_id, PendingStatus.EXPIRED, reason=reason
+            )
+        except Exception as exc:
+            logger.warning(
+                "[reconcile_stale] pending mark_terminal 실패: id=%s err=%s",
+                lifecycle_id, exc,
+            )
+        # meta 정리 (booking 없음 — 가짜 PnL 금지).
+        # ★ 이후 늦게 체결이 발견되면 recover_expired_fills 가 회계를 복구한다(무손실).
+        self._pending_sell_meta.pop(lifecycle_id, None)
+        self._pending_buy_meta.pop(lifecycle_id, None)
+
+    # ── P0-4a: 체결 증거 확인 + 늦은 체결 복구 ────────────────
+    def _prev_business_day(self, ref=None):
+        """직전 영업일(주말 건너뜀; 공휴일은 무시 — 과다포함은 복구에 안전)."""
+        from datetime import datetime as _dt, timedelta as _td
+        d = (ref or _dt.now()) - _td(days=1)
+        while d.weekday() >= 5:   # 5=토, 6=일
+            d -= _td(days=1)
+        return d
+
+    def _recovery_window(self):
+        """복구 조회 범위 = 직전 영업일 00:00 ~ 현재. (당일 + 직전 영업일)
+
+        Returns (since_iso, start_yyyymmdd, end_yyyymmdd).
+        """
+        from datetime import datetime as _dt
+        now = _dt.now()
+        prev = self._prev_business_day(now)
+        since = prev.replace(hour=0, minute=0, second=0, microsecond=0)
+        return (since.isoformat(),
+                prev.strftime("%Y%m%d"),
+                now.strftime("%Y%m%d"))
+
+    def _probe_fill_evidence(self, market: str, odno: str, code: str,
+                             exchange: str = None,
+                             start_date: str = "", end_date: str = "") -> dict:
+        """단일 주문의 실제 체결 증거를 KIS 체결조회로 확인.
+
+        Returns {"cum": int, "avg": float}.
+          - 체결기록 없음/조회실패 → cum=0 (get_kr_ccld_by_odno 는 체결분만 반환하며
+            실패 시 {} 반환하므로 구분 불가). 이 모호성은 recover_expired_fills 가
+            EXPIRED 주문을 이후 재확인해 보정한다.
+          - start_date/end_date: 복구 시 '당일+직전 영업일' 범위 조회에 사용.
+        """
+        if self.api is None or not odno:
+            return {"cum": 0, "avg": 0.0}
+        try:
+            if market == "KR":
+                if not hasattr(self.api, "get_kr_ccld_by_odno"):
+                    return {"cum": 0, "avg": 0.0}
+                raw = self.api.get_kr_ccld_by_odno(
+                    odno=odno, code=code,
+                    start_date=start_date, end_date=end_date)
+            else:
+                if not hasattr(self.api, "get_us_ccld"):
+                    return {"cum": 0, "avg": 0.0}
+                raw = self.api.get_us_ccld(odno=odno, symbol=code,
+                                           excd=exchange or "NASD")
+        except TypeError:
+            # 구버전 시그니처(날짜 인자 미지원) 호환
+            raw = self.api.get_kr_ccld_by_odno(odno=odno, code=code)
+        except Exception as exc:
+            logger.warning("[probe_fill] 체결조회 예외: odno=%s err=%s", odno, exc)
+            return {"cum": 0, "avg": 0.0}
+        if not raw:
+            return {"cum": 0, "avg": 0.0}
+        return {"cum": int(raw.get("cum_filled_qty", 0) or 0),
+                "avg": float(raw.get("avg_fill_price", 0) or 0)}
+
+    def _ensure_min_meta(self, lc) -> None:
+        """복구/체결 booking 이 사용할 최소 meta 를 lc 로부터 보장(없을 때만)."""
+        lc_id = lc.order_lifecycle_id
+        side = (lc.side or "").upper()
+        if side == "SELL" and lc_id not in self._pending_sell_meta:
+            self._pending_sell_meta[lc_id] = {
+                "name": lc.code, "qty": lc.order_qty or 0, "price": 0.0,
+                "level": None, "is_full": True,
+                "reason": "recovered_fill", "is_forced": True,
+            }
+        elif side == "BUY" and lc_id not in self._pending_buy_meta:
+            self._pending_buy_meta[lc_id] = {
+                "name": lc.code, "level": 1, "using_compound": 0,
+                "is_full_add": False, "qty": lc.order_qty or 0, "price": 0.0,
+                "reason": "recovered_fill", "session": "",
+                "trade_id": lc.trade_id or "",
+            }
+
+    def _resolve_gone_order(self, c: dict) -> str:
+        """open book 에서 사라진 stale 주문을 체결조회로 최종 판정.
+
+        Returns "booked"(실체결 발견→booking) | "expired"(체결 없음→EXPIRED).
+        """
+        market   = c.get("market", "KR")
+        lc_id    = c.get("trade_id", "")
+        odno     = str(c.get("odno", "") or "").strip()
+        prev_cum = int(c.get("cumulative_filled_qty", 0) or 0)
+        ev = self._probe_fill_evidence(market, odno, c.get("code", ""),
+                                       c.get("exchange"))
+        cum = ev["cum"]
+        if cum > prev_cum:
+            # 실제 체결 발견 → 정상 booking(EXPIRE 하지 않음)
+            try:
+                lc = self._lifecycle_mgr.load(lc_id)
+                if lc is not None:
+                    self._ensure_min_meta(lc)
+                self.dispatch_fill(
+                    order_lifecycle_id=lc_id, filled_qty=cum - prev_cum,
+                    avg_fill_price=ev["avg"], is_full=True,
+                )
+                # pending 도 FILLED 로 동기화(dispatch_fill 은 lifecycle 만 전이)
+                try:
+                    self._pending_registry.update_fill(
+                        lc_id, cum, PendingStatus.FILLED)
+                except Exception:
+                    pass
+                logger.info(
+                    "[reconcile_stale] 사라진 주문에서 체결 발견 → booking: "
+                    "id=%s cum=%s avg=%s", lc_id, cum, ev["avg"],
+                )
+                return "booked"
+            except Exception as exc:
+                logger.error(
+                    "[reconcile_stale] 체결 booking 실패 → EXPIRE 보류: id=%s err=%s",
+                    lc_id, exc,
+                )
+                return "expired"   # booking 실패 시에도 recover 가 이후 복구
+        # 체결 증거 없음 → EXPIRED(회계 무개입)
+        self._expire_stale_pending(lc_id, market, odno)
+        return "expired"
+
+    def recover_expired_fills(self) -> dict:
+        """[안전망] EXPIRED 로 마킹된 주문을 KIS 체결조회로 재확인해, 실제 체결이
+        있으면 회계를 정확히 1회 복구한다(늦은 FILLED → PnL 누락 최소화).
+
+        조회 범위: 당일 + 직전 영업일(_recovery_window). 자정 경과·주말 재시작에도
+        직전 영업일 체결을 확인한다. KIS 체결(ground truth) > 내부 terminal.
+        ★ idempotent: 복구되면 pending→FILLED, lifecycle→FILLED 로 정정되어
+          다음 회차 EXPIRED 조회에서 빠진다.
+        """
+        report = {"scanned": 0, "recovered": []}
+        if self._pending_registry is None or self._lifecycle_mgr is None:
+            return report
+        try:
+            since_iso, start_ymd, end_ymd = self._recovery_window()
+            rows = self._pending_registry.get_by_status(
+                PendingStatus.EXPIRED, since_iso=since_iso)
+        except Exception as exc:
+            logger.warning("[recover_expired] 조회 오류: %s", exc)
+            return report
+
+        report["scanned"] = len(rows)
+        for r in rows:
+            market = r.get("market", "KR")
+            odno   = str(r.get("odno", "") or "").strip()
+            lc_id  = r.get("trade_id", "")
+            if not odno or not lc_id:
+                continue
+            ev = self._probe_fill_evidence(market, odno, r.get("code", ""),
+                                           r.get("exchange"),
+                                           start_date=start_ymd, end_date=end_ymd)
+            if ev["cum"] <= 0:
+                continue   # 여전히 체결 없음 → EXPIRED 유지(정상)
+            # 실제 체결 발견 → 복구
+            try:
+                lc = self._lifecycle_mgr.load(lc_id)
+                if lc is None:
+                    continue
+                self._ensure_min_meta(lc)
+                recovered = self._lifecycle_mgr.recover_fill_from_terminal(
+                    lc, delta=ev["cum"], avg_price=ev["avg"],
+                    on_filled=self._updater,
+                    reason=f"KIS 체결조회 cum={ev['cum']} (EXPIRED 이후 발견)",
+                )
+                if recovered:
+                    self._pending_registry.restore_from_terminal(
+                        lc_id, ev["cum"], PendingStatus.FILLED)
+                    report["recovered"].append(lc_id)
+                    logger.warning(
+                        "[recover_expired] 늦은 체결 복구 완료: id=%s cum=%s avg=%s",
+                        lc_id, ev["cum"], ev["avg"],
+                    )
+            except Exception as exc:
+                logger.error(
+                    "[recover_expired] 복구 실패: id=%s err=%s", lc_id, exc)
+        if report["recovered"]:
+            logger.warning("[recover_expired] 복구된 주문: %s", report["recovered"])
+        return report
+
+    def reconcile_execution_state(self) -> dict:
+        """[restart-safe] pending↔lifecycle 크로스-스토어 불일치 수렴(중복/누락 방지).
+
+        두-스토어(pending_orders DB / lifecycle_orders DB) 갱신 사이에 크래시가 나면
+        상태가 어긋날 수 있다. 재시작 시 아래 두 불일치를 멱등적으로 정정한다.
+
+          F1: lifecycle=FILLED 인데 pending 이 아직 TRACKABLE
+              → 이미 booking 은 끝났으므로 pending 을 FILLED 로만 동기화(재-booking 없음).
+          F2: pending=FILLED 인데 lifecycle 이 not FILLED
+              → booking 이 아직 안 됐으므로 미완료 booking 을 멱등 완료(차액 delta 만).
+
+        ★ full_fill 멱등성 덕에 재실행해도 중복 booking 이 없고,
+          체결가 미확보(F2) 시 가짜 가격으로 booking 하지 않는다(잔여 리스크로 로깅).
+        """
+        report = {"f1_synced": [], "f2_booked": [], "f2_unbookable": []}
+        if self._pending_registry is None or self._lifecycle_mgr is None:
+            return report
+        since_iso, start_ymd, end_ymd = self._recovery_window()
+
+        # ── F1: lifecycle FILLED & pending TRACKABLE → pending 동기화 ──
+        try:
+            trackable = self._pending_registry.get_trackable()
+        except Exception:
+            trackable = []
+        for r in trackable:
+            lc_id = r.get("trade_id", "")
+            lc = self._lifecycle_mgr.load(lc_id) if lc_id else None
+            if lc is not None and lc.current_state == LifecycleState.FILLED:
+                self._pending_registry.update_fill(
+                    lc_id, int(lc.filled_qty or r.get("order_qty", 0) or 0),
+                    PendingStatus.FILLED)
+                report["f1_synced"].append(lc_id)
+
+        # ── F2: pending FILLED & lifecycle not FILLED → 미완료 booking 완료 ──
+        try:
+            filled_pending = self._pending_registry.get_by_status(
+                PendingStatus.FILLED, since_iso=since_iso)
+        except Exception:
+            filled_pending = []
+        for r in filled_pending:
+            lc_id = r.get("trade_id", "")
+            lc = self._lifecycle_mgr.load(lc_id) if lc_id else None
+            if lc is None or lc.current_state == LifecycleState.FILLED:
+                continue   # 정상(이미 booking됨) 또는 lifecycle 부재
+            pend_cum = int(r.get("cumulative_filled_qty", 0) or 0)
+            already  = int(lc.filled_qty or 0)
+            delta = pend_cum - already
+            if delta <= 0:
+                continue
+            # 체결가 확보: lifecycle 우선, 없으면 ccld probe(당일+직전영업일)
+            avg = float(lc.avg_fill_price or 0.0)
+            if avg <= 0:
+                ev = self._probe_fill_evidence(
+                    r.get("market", "KR"),
+                    str(r.get("odno", "") or "").strip(),
+                    r.get("code", ""), r.get("exchange"),
+                    start_date=start_ymd, end_date=end_ymd)
+                avg = ev["avg"]
+            if avg <= 0:
+                # 가짜 가격 booking 금지 — 잔여 리스크로 로깅(수동/차기 복구 대상)
+                report["f2_unbookable"].append(lc_id)
+                logger.error(
+                    "[reconcile_state] F2 booking 불가(체결가 미확보): id=%s", lc_id)
+                continue
+            try:
+                lc_fresh = self._lifecycle_mgr.load(lc_id)
+                if lc_fresh is not None:
+                    self._ensure_min_meta(lc_fresh)
+                self.dispatch_fill(order_lifecycle_id=lc_id, filled_qty=delta,
+                                   avg_fill_price=avg, is_full=True)
+                report["f2_booked"].append(lc_id)
+            except Exception as exc:
+                logger.error(
+                    "[reconcile_state] F2 booking 오류: id=%s err=%s", lc_id, exc)
+        if any(report.values()):
+            logger.warning(
+                "[reconcile_state] F1_synced=%s F2_booked=%s F2_unbookable=%s",
+                report["f1_synced"], report["f2_booked"], report["f2_unbookable"])
+        return report
 
     # ══════════════════════════════════════════════════════════
     # Phase 4: _restore_pending_meta_from_lifecycle() — 재시작 복원
@@ -1581,9 +2243,25 @@ class StrategyManager:
             price    = decision["price"]
             is_full  = (action == "SELL_ALL")
             ord_dvsn = sess["order_dvsn"]
-            use_price = price if ord_dvsn == "05" else 0
+            # ★ P0-1: 정규장 지정가(00) SELL 에도 유효 지정가 전달 (BUY 와 대칭).
+            #   기존 `price if ord_dvsn=="05" else 0` 은 정규장 지정가에 0 을 넣어
+            #   kis_api 가 'ORD_UNPR=0' 로 주문을 차단하던 버그. 시장가(01)/장후(06)만 0.
+            use_price = select_sell_price(ord_dvsn, price, cur_price)
             level    = decision.get("level")
             reason   = decision["reason"]
+
+            # ── P0-0: in-flight 매도 가드 ─────────────────────
+            # 동일 종목에 ACTIVE(접수/부분체결) 매도 주문이 있으면 추가 매도 금지.
+            # apply_sell 이 FILLED 시점으로 미뤄져 포지션이 남아 있어도, 체결 완료는
+            # FillObserver→_handle_sell_filled 가 반영하므로 여기서 재매도하면 이중매도.
+            if self.has_active_sell(code):
+                logger.info(
+                    "[P0-0 in-flight] %s 미체결 매도 주문 존재 → 중복 매도 스킵", code)
+                return {
+                    "action":  "HOLD", "code": code, "name": name,
+                    "reason":  "미체결 매도 주문 존재 — 중복 매도 스킵(in-flight)",
+                    "session": sess["session"],
+                }
 
             # ★ 강제 매도 여부 판단
             is_forced = (
@@ -1851,6 +2529,16 @@ class StrategyManager:
                 f"msg_cd={result.get('msg_cd','?')} "
                 f"msg1={result.get('msg1','?')!r}"
             )
+
+            # ── ★ P0-4: 타임아웃(불명) vs 거절(확정) 구분 ──────────
+            # TIMEOUT 은 거래소에 접수/체결됐을 수 있으므로 맹목 재시도 금지.
+            # KIS 미체결조회로 접수여부를 확인해 이중매도를 방지한다.
+            if classify_order_failure(result) == FAIL_TIMEOUT:
+                return self._handle_sell_timeout(
+                    code, name, qty, price, level, is_full, reason, sess,
+                )
+            # REJECTED(확정 미접수) 는 아래 기존 SELL_FAIL 경로(재시도 안전)로 진행.
+
             # ── [훅 11] SELL_ORDER_REJECTED ──
             if _JOURNAL_ENABLED:
                 try:
