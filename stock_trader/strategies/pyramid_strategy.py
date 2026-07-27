@@ -150,6 +150,134 @@ class PyramidStrategyManager:
                    "updated": datetime.now().isoformat()},
                   open(COMPOUND_FILE, "w"), ensure_ascii=False, indent=2)
 
+    # ── P0-3: KIS 잔고 기준 구조적 정합화 (회계 무개입) ──────────
+    def _build_reconciled_position(self, code: str, name: str,
+                                   qty: int, avg: float):
+        """apply_buy 를 거치지 않고 '누락 종목'을 구조적으로만 복원한다.
+
+        ★ 회계 무개입: 손익/compound/쿨다운/재진입 미개입.
+        ★ 이력이 없으므로 1단계(level=1)로만 복원한다(과거 apply_buy 복원과 동일).
+          full_entry_done 마크는 넣지 않는다(존재하지 않던 정보를 조작하지 않음).
+        """
+        pos = PyramidPosition(code, name, avg)
+        pos.avg_price     = avg
+        pos.total_qty     = qty
+        pos.current_level = 1
+        pos.level_entries = {
+            1: {
+                "price":      avg,
+                "avg_price":  avg,
+                "qty":        qty,
+                "remaining":  qty,
+                "total_cost": round(avg * qty, 2),
+                "added_at":   datetime.now().isoformat(),
+            }
+        }
+        return pos
+
+    def _correct_summary_only(self, pos, qty: int, avg: float,
+                              *, fix_qty: bool, fix_avg: bool):
+        """기존 포지션의 요약값(total_qty / avg_price)만 KIS 기준으로 교정한다.
+
+        ★ level_entries(단계별 price/avg_price/qty/remaining) 와 full_entry_done
+          마크, current_level 은 절대 건드리지 않는다 → 추가매수·부분익절·Full Entry
+          게이팅 등 전략 상태를 그대로 보존한다(정보 손실 없음).
+        ★ 손절 기준(avg_price) 정확도만 복구하고 회계에는 개입하지 않는다.
+        """
+        if fix_qty:
+            pos.total_qty = qty
+        if fix_avg:
+            pos.avg_price = avg
+
+    def reconcile_from_broker(self, broker_holdings, active_codes=None,
+                              *, avg_tol: float = 0.01) -> dict:
+        """KIS 실제 잔고를 기준으로 내부 포지션의 '존재/수량/평단'만 정합화.
+
+        ★ 회계 무개입: apply_buy/apply_sell/매도부킹/손익확정/재진입등록/compound
+          을 절대 실행하지 않는다. 매매 회계는 FillObserver →
+          _handle_buy_filled / _handle_sell_filled 만 담당한다.
+        ★ ACTIVE(ACCEPTED/PARTIALLY_FILLED, BUY·SELL) 주문 종목은 접수→체결 창의
+          정상 수량차이이므로 유령/누락으로 오판하지 않고 그대로 보존한다.
+        ★ idempotent: 이미 정합이면 아무 것도 바꾸지 않는다(변경 0).
+
+        Args:
+            broker_holdings: {code: {"qty": int, "avg_price": float, "name": str}}
+                             (KIS 잔고 중 실제 보유. None 이면 '데이터 없음' →
+                              방어적으로 전체 보존(변경 없음).)
+            active_codes:    ACTIVE 주문이 걸린 코드 집합(보호 대상). None=없음.
+            avg_tol:         평균단가 상대오차 허용치(초과 시 교정).
+
+        Returns:
+            {"added":[], "removed":[], "qty_fixed":[], "avg_fixed":[],
+             "protected":[], "unchanged": bool}
+        """
+        report = {"added": [], "removed": [], "qty_fixed": [],
+                  "avg_fixed": [], "protected": [], "unchanged": True}
+
+        # 잔고 데이터 없음(조회 실패 등) → 방어적 전체 보존
+        if broker_holdings is None:
+            return report
+
+        active = set(active_codes or ())
+
+        # 유효 보유만 정규화 (qty>0, avg>0)
+        broker = {}
+        for code, h in (broker_holdings or {}).items():
+            if not code:
+                continue
+            try:
+                q = int((h or {}).get("qty", 0) or 0)
+                a = float((h or {}).get("avg_price", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if q > 0 and a > 0:
+                broker[code] = {"qty": q, "avg_price": a,
+                                "name": (h or {}).get("name", code)}
+
+        # (A) KIS 보유 종목 기준: 누락 생성 / 수량·평단 교정
+        for code, h in broker.items():
+            if code in active:
+                report["protected"].append(code)
+                continue
+            q, a, nm = h["qty"], h["avg_price"], h["name"]
+            pos = self.positions.get(code)
+            if pos is None:
+                self.positions[code] = self._build_reconciled_position(
+                    code, nm, q, a
+                )
+                report["added"].append(f"{nm}({code}) {q}주 @{a:,.0f}원")
+            else:
+                need_qty = pos.total_qty != q
+                need_avg = (pos.avg_price <= 0 or
+                            abs(pos.avg_price - a) / a > avg_tol)
+                if need_qty or need_avg:
+                    # level_entries / full_entry_done / current_level 보존.
+                    # 요약값(total_qty / avg_price)만 교정 → 전략 상태 무손실.
+                    self._correct_summary_only(pos, q, a,
+                                               fix_qty=need_qty, fix_avg=need_avg)
+                    if need_qty:
+                        report["qty_fixed"].append(f"{nm}({code}) →{q}주")
+                    if need_avg:
+                        report["avg_fixed"].append(f"{nm}({code}) avg→{a:,.0f}원")
+
+        # (B) 내부에만 있는 종목: KIS=0 & ACTIVE 없음 → 유령 제거
+        #     (구조적 삭제일 뿐 매도부킹/손익확정이 아님)
+        for code in list(self.positions.keys()):
+            if code in broker:
+                continue
+            if code in active:
+                report["protected"].append(code)
+                continue
+            del self.positions[code]
+            report["removed"].append(code)
+
+        changed = any(report[k] for k in
+                      ("added", "removed", "qty_fixed", "avg_fixed"))
+        report["unchanged"] = not changed
+        if changed:
+            self._save()
+        return report
+
     # ── 쿨다운 / 연속 손실 체크 ──────────────────────────────
     def _is_cooldown(self, code: str) -> bool:
         """15분 이내 매도한 종목이면 True"""
