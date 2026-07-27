@@ -880,21 +880,30 @@ class KISApi:
     # 3-1. 미체결 주문 조회 + 취소
     # ──────────────────────────────────────────────────────────
     def get_open_orders(self, order_type: str = "BUY") -> list:
+        """국내 미체결 주문 조회 (하위호환: 리스트만 반환, 실패 시 빈 리스트)."""
+        _ok, orders = self.get_open_orders_checked(order_type)
+        return orders
+
+    def get_open_orders_checked(self, order_type: str = "BUY") -> tuple:
         """
-        국내 미체결 주문 조회 (TTTC8036R)
-        order_type: "BUY" → 매수 미체결만, "SELL" → 매도 미체결만, "ALL" → 전체
-        반환: [{"order_no": str, "stock_code": str, "stock_name": str,
-                "ord_qty": int, "ord_unpr": int, "ord_dvsn": str,
-                "ord_dvsn_name": str, "ord_time": str}, ...]
+        국내 미체결 주문 조회 (TTTC0084R) — 성공여부를 함께 반환.
+
+        반환: (ok: bool, orders: list)
+          ok=False 는 '조회 실패/미지원(검증 불가)' 을 의미한다.
+          ★ P0-4 stale reconcile 이 KIS API 장애 시 절대로 pending 을
+            자동 해제하지 않도록(보수적 ACTIVE 유지), 성공/실패를 구분한다.
+          orders: [{"order_no","stock_code","stock_name","ord_qty",
+                    "unexec_qty","ord_unpr","ord_dvsn","ord_dvsn_name",
+                    "ord_time","sll_buy_dvsn_cd"}, ...]
         """
         url   = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl"
         from config import Config as _cfg
         if not _cfg.KIS_IS_REAL:
             logger.warning(
                 "[미체결조회] 모의투자 환경에서는 inquire-psbl-rvsecncl 미지원"
-                " — 빈 리스트 반환"
+                " — 검증 불가(ok=False)"
             )
-            return []
+            return (False, [])
         tr_id = "TTTC0084R"
         acc_no, acc_prod = self.account_no.split("-") \
             if "-" in self.account_no else (self.account_no, "01")
@@ -938,10 +947,10 @@ class KISApi:
                     "sll_buy_dvsn_cd": sll_buy,
                 })
             self._on_api_success()
-            return result
+            return (True, result)
         except Exception as e:
             logger.error(f"미체결 조회 실패: {e}")
-            return []
+            return (False, [])
 
     def cancel_order(self, order_no: str, stock_code: str,
                      unexec_qty: int, ord_unpr: int,
