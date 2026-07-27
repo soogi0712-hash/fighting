@@ -2072,8 +2072,13 @@ class KISApi:
     # ──────────────────────────────────────────────────────────
     # 6-A. 국내주식 당일 주문·체결 조회 (단일 ODNO 필터 지원)
     # ──────────────────────────────────────────────────────────
-    def get_kr_ccld_by_odno(self, odno: str = "", code: str = "") -> dict:
-        """국내주식 당일 주문·체결 조회 (TTTC8001R, 실전).
+    def get_kr_ccld_by_odno(self, odno: str = "", code: str = "",
+                            start_date: str = "", end_date: str = "") -> dict:
+        """국내주식 주문·체결 조회 (TTTC8001R, 실전).
+
+        start_date/end_date (YYYYMMDD) 미지정 시 당일만 조회한다. P0-4a 복구는
+        '당일+직전 영업일' 범위로 조회해 자정 경과·주말 재시작 시에도 늦은 체결을
+        확인할 수 있게 한다.
 
         특정 주문번호(odno)를 지정하면 해당 주문만 반환한다.
         ondo 미지정 시 종목코드(code) 또는 전체 당일 체결 목록을 반환한다.
@@ -2104,11 +2109,13 @@ class KISApi:
         acc_no, acc_prod = self.account_no.split("-") \
             if "-" in self.account_no else (self.account_no, "01")
         today = datetime.now().strftime("%Y%m%d")
+        _strt = start_date or today
+        _end  = end_date or today
         params = {
             "CANO":             acc_no,
             "ACNT_PRDT_CD":     acc_prod,
-            "INQR_STRT_DT":     today,
-            "INQR_END_DT":      today,
+            "INQR_STRT_DT":     _strt,
+            "INQR_END_DT":      _end,
             "SLL_BUY_DVSN_CD":  "00",   # 00=전체 (01=매도, 02=매수)
             "INQR_DVSN":        "00",   # 00=역순
             "PDNO":             code,   # 종목코드 (빈값=전체)
