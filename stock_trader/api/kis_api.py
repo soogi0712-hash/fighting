@@ -1141,6 +1141,14 @@ class KISApi:
                 evlu_pfls     = int(summary.get("evlu_pfls_smtl_amt", 0))   # 평가손익 합계
                 tot_evlu      = int(summary.get("tot_evlu_amt",       0))   # 총평가금액(MTS 총자산)
                 result = {
+                    # ★ P0-5: 응답 출처 구분자.
+                    #   "api"   = KIS 실조회 성공 (holdings 가 계좌의 진실)
+                    #   "cache" = 조회 실패 → 직전 성공값 재사용
+                    #   "psbl"  = 조회 실패 → 예수금 전용 API 로 cash 만 합성(holdings=[])
+                    #   "empty" = 완전 실패 → 기본값(holdings=[])
+                    #   Phoenix Reconciler 는 "api" 일 때만 대사해야 한다.
+                    #   그렇지 않으면 빈 holdings 를 "전 종목 청산" 으로 오인한다.
+                    "_source":           "api",
                     "holdings":          holdings,
                     "total_eval":        tot_evlu,       # MTS 총자산과 동일
                     "cash":              cash_amt,       # 예수금(주문가능현금)
@@ -1169,18 +1177,21 @@ class KISApi:
         # ★ 3회 모두 실패 → 1) 캐시 반환 2) 예수금API 3) 기본값
         if self._balance_cache and (time.time() - self._balance_cache_ts) < 300:
             logger.warning(f"⚠️ 잔고 조회 실패 → 캐시값 사용 (cash={self._balance_cache.get('cash',0):,}원)")
-            return self._balance_cache
+            # 캐시 사본에 출처를 "cache" 로 덮어써서 반환 (원본 캐시는 보존)
+            return {**self._balance_cache, "_source": "cache"}
         # ★ 캐시 없음 → 예수금 전용 API 시도
         psbl_cash = self._get_cash_from_psbl_api()
         if psbl_cash >= 0:
-            synth = {"holdings": [], "total_eval": 0, "cash": psbl_cash,
+            synth = {"_source": "psbl",
+                     "holdings": [], "total_eval": 0, "cash": psbl_cash,
                      "total_profit": 0, "total_profit_pct": 0}
             self._balance_cache    = synth
             self._balance_cache_ts = time.time()
             logger.warning(f"⚠️ 잔고조회 실패 → 예수금API 사용 cash={psbl_cash:,}원")
             return synth
         logger.error("잔고 조회 완전 실패 & 캐시 없음 → 기본값 반환")
-        return {"holdings": [], "total_eval": 0, "cash": 0,
+        return {"_source": "empty",
+                "holdings": [], "total_eval": 0, "cash": 0,
                 "total_profit": 0, "total_profit_pct": 0}
 
     # ──────────────────────────────────────────────────────────

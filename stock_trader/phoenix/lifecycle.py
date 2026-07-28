@@ -119,6 +119,18 @@ _TERMINAL_STATES: frozenset[LifecycleState] = frozenset(
     s for s, targets in _ALLOWED_TRANSITIONS.items() if not targets
 )
 
+# order_index projection 을 갱신할 도메인 이벤트를 발행하는 상태 (P0-5).
+# PARTIALLY_FILLED 는 제외 — 주문이 여전히 in-flight 이므로 order_index 를
+# SUBMITTED 로 유지해야 OrderGate 의 ORDER_IN_FLIGHT 판정이 맞다.
+_DOMAIN_EVENT_STATES: frozenset[LifecycleState] = frozenset({
+    LifecycleState.ORDER_SUBMITTED,
+    LifecycleState.ORDER_ACCEPTED,
+    LifecycleState.FILLED,
+    LifecycleState.CANCELLED,
+    LifecycleState.REJECTED,
+    LifecycleState.EXPIRED,
+})
+
 
 # ══════════════════════════════════════════════════════════════════════
 # 예외
@@ -720,6 +732,44 @@ class OrderLifecycleManager:
         self._insert(lc)
         return lc
 
+    def open_and_submit(
+        self,
+        *,
+        trade_id: str,
+        market: str,
+        code: str,
+        side: str,
+        order_qty: Optional[int] = None,
+        strategy_name: Optional[str] = None,
+        client_order_id: Optional[str] = None,
+        order_lifecycle_id: Optional[str] = None,
+    ) -> OrderLifecycle:
+        """create → confirm_signal → submit 을 한 번에 수행한다.
+
+        ★ 반드시 브로커 주문 전송(api.buy/sell) **직전**에 호출한다.
+
+        이유(P0-5): 주문 전송 직후 프로세스가 죽으면 브로커에는 주문이 접수되어
+        있는데 우리 쪽에는 아무 기록이 없는 상태가 된다. 전송 전에
+        ORDER_SUBMITTED 까지 영속화해 두면, 재시작 시 load_all_active() 가
+        해당 주문을 되살려 체결 대사를 이어갈 수 있다.
+
+        반환된 lc 는 ORDER_SUBMITTED 상태이며, 브로커 응답을 받은 뒤
+        accept(lc, odno=...) 또는 reject(lc, reason=...) 로 이어가야 한다.
+        """
+        lc = self.create(
+            trade_id           = trade_id,
+            market             = market,
+            code               = code,
+            side               = side,
+            strategy_name      = strategy_name,
+            client_order_id    = client_order_id,
+            order_qty          = order_qty,
+            order_lifecycle_id = order_lifecycle_id,
+        )
+        self.confirm_signal(lc)
+        self.submit(lc, client_order_id=client_order_id)
+        return lc
+
     def load(self, order_lifecycle_id: str) -> Optional[OrderLifecycle]:
         """order_lifecycle_id로 OrderLifecycle을 로드한다."""
         conn = self._get_conn()
@@ -888,7 +938,7 @@ class OrderLifecycleManager:
     ) -> None:
         lc.cancel(reason)
         self._persist_and_record(
-            lc, f"lifecycle:cancel:{lc.order_lifecycle_id}"
+            lc, f"lifecycle:cancel:{lc.order_lifecycle_id}", reason=reason
         )
 
     def reject(
@@ -896,7 +946,7 @@ class OrderLifecycleManager:
     ) -> None:
         lc.reject(reason)
         self._persist_and_record(
-            lc, f"lifecycle:reject:{lc.order_lifecycle_id}"
+            lc, f"lifecycle:reject:{lc.order_lifecycle_id}", reason=reason
         )
 
     def expire(
@@ -904,7 +954,7 @@ class OrderLifecycleManager:
     ) -> None:
         lc.expire(reason)
         self._persist_and_record(
-            lc, f"lifecycle:expire:{lc.order_lifecycle_id}"
+            lc, f"lifecycle:expire:{lc.order_lifecycle_id}", reason=reason
         )
 
     def recover_fill_from_terminal(
@@ -955,10 +1005,64 @@ class OrderLifecycleManager:
 
     # ── 내부: 저장 + 기록 ─────────────────────────────────────────
     def _persist_and_record(
-        self, lc: OrderLifecycle, idem_key: str
+        self, lc: OrderLifecycle, idem_key: str, *, reason: Optional[str] = None
     ) -> None:
         self._upsert(lc)
         self._record_event(lc, idem_key)
+        self._record_domain_event(lc, reason)
+
+    def _record_domain_event(
+        self, lc: OrderLifecycle, reason: Optional[str] = None
+    ) -> None:
+        """order_index projection 을 갱신하는 도메인 이벤트를 append 한다 (P0-5).
+
+        이것이 있어야 OrderGate 의 ORDER_IN_FLIGHT 판정이 실제로 동작한다.
+        (이전에는 order_index 가 비어 있어 해당 검사가 항상 통과했다.)
+
+        ★ EXECUTION_OBSERVED 는 절대 append 하지 않는다.
+          positions projection 은 PositionReconciled 로만 갱신되는 브로커 미러이며,
+          실제 포지션의 진실은 pyramid_positions.json / us_positions.json 이다.
+          여기서 체결을 투영하면 포지션 소스가 이중화되어 충돌한다.
+        """
+        if self._event_store is None:
+            return
+        state = lc.current_state
+        if state not in _DOMAIN_EVENT_STATES:
+            return
+        try:
+            from phoenix import models as _m   # 순환 import 방지
+            coid = lc.client_order_id or lc.order_lifecycle_id
+
+            if state is LifecycleState.ORDER_SUBMITTED:
+                ev = _m.intent_event(coid, lc.code, lc.side,
+                                     lc.order_qty or 0,
+                                     kind=(lc.side or "UNKNOWN"))
+            elif state is LifecycleState.ORDER_ACCEPTED:
+                if not lc.odno:
+                    # odno 없는 접수는 order_index 에 기록할 durable 키가 없다.
+                    # INTENT 상태로 남겨 두면 in-flight 로 계속 잡히므로 그대로 둔다.
+                    return
+                ev = _m.ack_event(coid, lc.odno, lc.code, lc.side,
+                                  lc.order_qty or 0)
+            elif state is LifecycleState.FILLED:
+                ev = _m.closed_event(coid, lc.code, odno=lc.odno,
+                                     reason="FILLED")
+            elif state is LifecycleState.EXPIRED:
+                ev = _m.closed_event(coid, lc.code, odno=lc.odno,
+                                     reason=reason or "EXPIRED")
+            elif state is LifecycleState.CANCELLED:
+                ev = _m.canceled_event(coid, lc.code, odno=lc.odno,
+                                       reason=reason)
+            elif state is LifecycleState.REJECTED:
+                ev = _m.rejected_event(coid, lc.code, odno=lc.odno,
+                                       reason=reason)
+            else:
+                return
+
+            self._event_store.apply(ev, allow_during_halt=True)
+        except Exception as exc:
+            # 도메인 이벤트 기록 실패가 상태 전이를 롤백하지는 않는다.
+            logger.warning("lifecycle domain event 기록 실패 (무시): %s", exc)
 
     def _record_event(self, lc: OrderLifecycle, idem_key: str) -> None:
         """Phoenix EventStore에 EXECUTION_OBSERVED_ONLY 이벤트를 기록한다.

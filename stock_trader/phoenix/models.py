@@ -5,6 +5,7 @@ Event 는 append-only 사실 기록이다. projection 은 이벤트에서 파생
 """
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -175,14 +176,52 @@ def execution_event(client_order_id: str, code: str, side: str,
     )
 
 
-def canceled_event(client_order_id: str, code: str, odno: Optional[str] = None) -> Event:
+def canceled_event(client_order_id: str, code: str, odno: Optional[str] = None,
+                   reason: Optional[str] = None) -> Event:
     ok = order_key(odno, client_order_id)
     return Event(
         type=EventType.ORDER_CANCELED, aggregate_type="order",
         aggregate_id=client_order_id, client_order_id=client_order_id,
         odno=odno, code=code,
+        payload=_reason_payload(reason),
         idempotency_key=f"cancel:{ok}",
     )
+
+
+def rejected_event(client_order_id: str, code: str, odno: Optional[str] = None,
+                   reason: Optional[str] = None) -> Event:
+    """브로커가 주문을 거부. order_index 를 REJECTED 로 종결시킨다."""
+    ok = order_key(odno, client_order_id)
+    return Event(
+        type=EventType.ORDER_REJECTED, aggregate_type="order",
+        aggregate_id=client_order_id, client_order_id=client_order_id,
+        odno=odno, code=code,
+        payload=_reason_payload(reason),
+        idempotency_key=f"reject:{ok}",
+    )
+
+
+def closed_event(client_order_id: str, code: str, odno: Optional[str] = None,
+                 reason: Optional[str] = None) -> Event:
+    """주문 종결(전량체결/만료). order_index 를 CLOSED 로 만들어
+    OrderGate 의 ORDER_IN_FLIGHT 판정에서 빠지게 한다.
+
+    주의: 체결 수량은 여기 담지 않는다. positions projection 은
+    PositionReconciled 로만 갱신되는 브로커 미러이며,
+    실제 포지션의 진실은 pyramid_positions.json / us_positions.json 이다.
+    """
+    ok = order_key(odno, client_order_id)
+    return Event(
+        type=EventType.ORDER_CLOSED, aggregate_type="order",
+        aggregate_id=client_order_id, client_order_id=client_order_id,
+        odno=odno, code=code,
+        payload=_reason_payload(reason),
+        idempotency_key=f"closed:{ok}",
+    )
+
+
+def _reason_payload(reason: Optional[str]) -> Optional[str]:
+    return json.dumps({"reason": reason}, ensure_ascii=False) if reason else None
 
 
 def reconcile_event(code: str, broker_qty: int, broker_avg: float,
