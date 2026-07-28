@@ -4,10 +4,16 @@
   - 단일 파일(phoenix.db), WAL, synchronous=FULL
   - 모든 상태 전이는 하나의 트랜잭션(BEGIN IMMEDIATE … COMMIT)
   - crash injection seam: 테스트가 트랜잭션 내 특정 지점에서 프로세스 종료를 모사
+
+스레드 모델(P0-5):
+  app.py 는 APScheduler 백그라운드 스레드와 Flask/SocketIO 스레드에서 동일 Database 를
+  공유한다. 따라서 커넥션은 check_same_thread=False 로 열고, 단일 커넥션에 대한
+  BEGIN…COMMIT 구간을 락으로 직렬화한다(중첩 BEGIN 은 SQLite 가 거부하므로 필수).
 """
 from __future__ import annotations
 
 import sqlite3
+import threading
 from contextlib import contextmanager
 from typing import Optional
 
@@ -33,11 +39,17 @@ class Database:
         self._synchronous = synchronous
         self._busy_timeout_ms = busy_timeout_ms
         self._crash_points: set[str] = set()
+        # 단일 커넥션을 여러 스레드가 공유하므로 트랜잭션 구간을 직렬화한다.
+        # RLock 인 이유: 실수로 중첩 호출해도 교착 대신 SQLite 오류로 즉시 드러나게 하기 위함.
+        self._lock = threading.RLock()
         self.conn = self._open()
 
     # ── 연결/PRAGMA ────────────────────────────────────────────────
     def _open(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, isolation_level=None)  # 수동 트랜잭션
+        # check_same_thread=False: APScheduler 워커 스레드에서도 동일 커넥션 사용
+        # (동시성은 self._lock 으로 제어)
+        conn = sqlite3.connect(self.path, isolation_level=None,  # 수동 트랜잭션
+                               check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute(f"PRAGMA synchronous={self._synchronous}")
@@ -53,8 +65,9 @@ class Database:
 
     def reopen(self) -> None:
         """재시작 모사: 연결을 닫고 다시 연다(미커밋 트랜잭션은 폐기됨)."""
-        self.close()
-        self.conn = self._open()
+        with self._lock:
+            self.close()
+            self.conn = self._open()
 
     # ── crash injection ────────────────────────────────────────────
     def set_crash_points(self, *points: str) -> None:
@@ -72,37 +85,42 @@ class Database:
     # ── 트랜잭션 헬퍼 ──────────────────────────────────────────────
     @contextmanager
     def transaction(self, mode: str = "IMMEDIATE"):
-        conn = self.conn
-        conn.execute(f"BEGIN {mode}")
+        self._lock.acquire()
         try:
-            yield conn
-        except BaseException:
-            conn.execute("ROLLBACK")
-            raise
-        else:
-            conn.execute("COMMIT")
+            conn = self.conn
+            conn.execute(f"BEGIN {mode}")
+            try:
+                yield conn
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            else:
+                conn.execute("COMMIT")
+        finally:
+            self._lock.release()
 
     # ── 마이그레이션/버전 ──────────────────────────────────────────
     def migrate(self) -> int:
         """스키마를 SCHEMA_VERSION 까지 올린다. 현재 버전 반환.
         DB 버전이 코드보다 높으면 SchemaVersionError(다운그레이드 금지)."""
-        cur_ver = self._read_version()
-        target = _schema.SCHEMA_VERSION
-        if cur_ver > target:
-            raise SchemaVersionError(
-                f"DB schema v{cur_ver} > code v{target} (downgrade 금지)")
-        # executescript 는 COMMIT 을 먼저 발행하고 isolation_level 을 무시하므로
-        # 명시적 트랜잭션 밖에서 실행한다(autocommit 모드에서 각 DDL 이 확정됨).
-        for ver in range(cur_ver, target):
-            self.conn.executescript(_schema.MIGRATIONS[ver])
-        with self.transaction():
-            for sql in _schema.initial_rows_sql():
-                self.conn.execute(sql)
-            self.conn.execute(
-                "INSERT INTO schema_meta(id, version) VALUES (1, ?) "
-                "ON CONFLICT(id) DO UPDATE SET version=excluded.version",
-                (target,))
-        return target
+        with self._lock:
+            cur_ver = self._read_version()
+            target = _schema.SCHEMA_VERSION
+            if cur_ver > target:
+                raise SchemaVersionError(
+                    f"DB schema v{cur_ver} > code v{target} (downgrade 금지)")
+            # executescript 는 COMMIT 을 먼저 발행하고 isolation_level 을 무시하므로
+            # 명시적 트랜잭션 밖에서 실행한다(autocommit 모드에서 각 DDL 이 확정됨).
+            for ver in range(cur_ver, target):
+                self.conn.executescript(_schema.MIGRATIONS[ver])
+            with self.transaction():
+                for sql in _schema.initial_rows_sql():
+                    self.conn.execute(sql)
+                self.conn.execute(
+                    "INSERT INTO schema_meta(id, version) VALUES (1, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET version=excluded.version",
+                    (target,))
+            return target
 
     def _read_version(self) -> int:
         row = self.conn.execute(

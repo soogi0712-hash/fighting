@@ -99,6 +99,18 @@ CREATE INDEX IF NOT EXISTS idx_po_odno     ON pending_orders(odno);
 CREATE INDEX IF NOT EXISTS idx_po_trade_id ON pending_orders(trade_id);
 """
 
+# ★ P0-5: trade_id 는 주문 1건을 가리키는 식별자인데 UNIQUE 제약이 없어서
+#   update_fill()/increment_retry() 의 WHERE trade_id=? 가 여러 행을 동시에
+#   갱신하고 get_by_trade_id() 가 비결정적으로 동작했다.
+#   기존 중복 행을 정리한 뒤 UNIQUE 인덱스를 만든다.
+_PENDING_DEDUPE_SQL = """
+DELETE FROM pending_orders
+ WHERE id NOT IN (SELECT MAX(id) FROM pending_orders GROUP BY trade_id);
+"""
+_PENDING_UNIQUE_SQL = """
+CREATE UNIQUE INDEX IF NOT EXISTS uq_po_trade_id ON pending_orders(trade_id);
+"""
+
 # pending_orders.status 상수
 class PendingStatus:
     ACCEPTED         = "ACCEPTED"
@@ -111,6 +123,66 @@ class PendingStatus:
 
     # 추적 대상 상태 (조회 대상)
     TRACKABLE = frozenset({ACCEPTED, PARTIALLY_FILLED})
+
+
+# ── 체결조회 재시도 상한 (P0-5) ────────────────────────────────
+# 이 횟수를 넘도록 체결조회가 실패/무응답이면 EXPIRED 로 종결해 폴링에서 제외한다.
+# 상한이 없으면 취소·거부된 주문이 영구히 KIS 체결조회 API 를 소모한다.
+MAX_POLL_RETRY = 40
+
+
+# ──────────────────────────────────────────────────────────────
+# 주문 응답 파싱 헬퍼 (P0-5)
+# ──────────────────────────────────────────────────────────────
+# KIS 주문 접수 응답의 주문번호 키. 국내/해외 모두 output.ODNO 가 정식이며,
+# 소문자 odno 는 조회계 API 가 쓰는 표기다. KNO_ORD_NO 는 이 저장소에만
+# 존재하던 잘못된 키로, 하위호환을 위해 마지막 후보로만 남긴다.
+_ODNO_KEYS = ("ODNO", "odno", "KRX_FWDG_ORD_ODNO", "ODER_NO", "KNO_ORD_NO")
+
+
+def _as_price(val) -> Optional[float]:
+    """체결가 정규화. 값이 없거나 숫자가 아니면 None, 그 외에는 float 그대로.
+
+    0.0 을 None 으로 바꾸지 않는 것이 핵심이다 — 기존 `float(x) or None` 은
+    체결가 0 을 '값 없음' 으로 뭉개 하위 로직을 스킵시켰다.
+    """
+    if val is None or val == "":
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def is_dry_run_response(order_response: dict) -> bool:
+    """LIVE_ORDER_ENABLED=false 로 인해 실제 제출되지 않은 응답인지 판정."""
+    if not isinstance(order_response, dict):
+        return False
+    return bool(order_response.get("_dry_run") or order_response.get("_live_disabled"))
+
+
+def extract_odno(order_response: dict) -> str:
+    """KIS 주문 접수 응답에서 주문번호(odno)를 추출한다.
+
+    국내·해외 공통. output 하위에서 _ODNO_KEYS 순서로 탐색하고,
+    없으면 최상위에서도 한 번 더 찾는다(일부 폴백 응답 대비).
+    추출 실패 시 빈 문자열을 반환한다 — 호출자는 반드시 이를 확인해
+    pending 등록을 건너뛰어야 한다(빈 odno 는 남의 체결을 자기 것으로
+    오인하는 원인이 된다).
+    """
+    if not isinstance(order_response, dict):
+        return ""
+    for container in (order_response.get("output") or {}, order_response):
+        if not isinstance(container, dict):
+            continue
+        for key in _ODNO_KEYS:
+            val = container.get(key)
+            if val is None:
+                continue
+            s = str(val).strip()
+            if s:
+                return s
+    return ""
 
 
 # ──────────────────────────────────────────────────────────────
@@ -196,7 +268,10 @@ class ExecutionNormalizer:
             previous_cumulative_filled_qty= prev_cum,
             fill_delta_qty=               delta,
             unfilled_qty=                 int(raw.get("unfilled_qty", 0) or 0),
-            average_fill_price=           float(raw.get("avg_fill_price", 0) or 0) or None,
+            # ★ P0-5: 기존 `float(...) or None` 은 체결가 0.0 을 None 으로 뭉개
+            #   trade_entries.fill_confirmed 갱신과 apply_buy 가격 전달을 막았다.
+            #   값이 없을 때만 None 이 되도록 명시적으로 판정한다.
+            average_fill_price=           _as_price(raw.get("avg_fill_price")),
             order_status=                 raw.get("order_status", None),
             observed_at=                  datetime.now().isoformat(),
             order_time=                   raw.get("order_time", None),
@@ -232,7 +307,7 @@ class ExecutionNormalizer:
             previous_cumulative_filled_qty= prev_cum,
             fill_delta_qty=               delta,
             unfilled_qty=                 raw.get("unfilled_qty", None),
-            average_fill_price=           raw.get("avg_fill_price", None),
+            average_fill_price=           _as_price(raw.get("avg_fill_price")),
             order_status=                 raw.get("order_status", None),
             observed_at=                  datetime.now().isoformat(),
             order_time=                   raw.get("order_time", None),
@@ -261,6 +336,19 @@ class PendingOrderRegistry:
         # 기존 trading_journal.db에 테이블이 없으면 DDL로 생성
         # (trading_journal._init_db()와 독립적으로 관리)
         conn.commit()
+        # ★ P0-5: trade_id UNIQUE 마이그레이션 (중복 정리 후 인덱스 생성)
+        try:
+            removed = conn.execute(_PENDING_DEDUPE_SQL).rowcount
+            conn.executescript(_PENDING_UNIQUE_SQL)
+            conn.commit()
+            if removed and removed > 0:
+                logger.warning(
+                    f"[PendingRegistry] trade_id 중복 행 {removed}건 정리 후 "
+                    f"UNIQUE 인덱스 생성"
+                )
+        except Exception as e:
+            # 인덱스 생성 실패해도 기존 동작은 유지 (경고만)
+            logger.warning(f"[PendingRegistry] trade_id UNIQUE 마이그레이션 실패: {e}")
 
     # ── 등록 ──────────────────────────────────────────────────
     def register(
@@ -277,9 +365,24 @@ class PendingOrderRegistry:
         exchange: Optional[str] = None,
         currency: str = "KRW",
     ) -> int:
-        """신규 pending order 등록. 반환: 삽입된 행 id."""
+        """신규 pending order 등록. 반환: 삽입된 행 id (거부 시 0).
+
+        ★ P0-5: odno 가 비어 있으면 등록하지 않는다.
+          odno 없는 행은 get_kr_ccld_by_odno(odno="") 로 조회되어
+          당일 첫 체결 레코드를 자기 것으로 오인한다.
+        """
+        odno = (odno or "").strip()
+        if not odno:
+            logger.error(
+                f"[PendingRegistry] odno 없음 — 등록 거부 (오인 매칭 방지): "
+                f"market={market} code={code} side={side} trade_id={trade_id}"
+            )
+            return 0
+
         conn = _get_conn()
         raw_json = json.dumps(raw_order_response or {}, ensure_ascii=False)
+        now = datetime.now().isoformat()
+        # trade_id 는 UNIQUE — 재시작 후 동일 주문 재등록 시 갱신으로 흡수한다.
         cur = conn.execute(
             """
             INSERT INTO pending_orders
@@ -289,13 +392,20 @@ class PendingOrderRegistry:
                raw_order_response, exchange, currency,
                created_at, updated_at)
             VALUES (?,?,?,?,?,?, ?,?,?, ?,?,?, ?,?,?, ?,?)
+            ON CONFLICT(trade_id) DO UPDATE SET
+               odno            = excluded.odno,
+               client_order_id = excluded.client_order_id,
+               order_qty       = excluded.order_qty,
+               exchange        = excluded.exchange,
+               currency        = excluded.currency,
+               updated_at      = excluded.updated_at
             """,
             (
                 market, trade_id, code, side, odno, client_order_id,
                 order_qty, 0, PendingStatus.ACCEPTED,
                 submitted_at, None, 0,
                 raw_json, exchange, currency,
-                datetime.now().isoformat(), datetime.now().isoformat(),
+                now, now,
             ),
         )
         conn.commit()
@@ -351,21 +461,76 @@ class PendingOrderRegistry:
         conn.commit()
         return True
 
-    # ── 추적 대상 조회 ─────────────────────────────────────────
-    def get_trackable(self) -> list[dict]:
-        """ACCEPTED / PARTIALLY_FILLED 상태 주문 목록 반환."""
+    # ── 상태 강제 전이 (취소/만료 반영용) ──────────────────────
+    def set_status(self, trade_id: str, new_status: str) -> bool:
+        """pending order 의 status 를 직접 전이한다 (P0-5).
+
+        용도: 재시도 상한 초과 → EXPIRED, 외부 취소 감지 → CANCELLED.
+        폴링 대상에서 빠지게 하는 것이 목적이다.
+        """
+        now = datetime.now().isoformat()
         conn = _get_conn()
-        rows = conn.execute(
-            "SELECT * FROM pending_orders WHERE status IN (?,?) ORDER BY submitted_at",
-            (PendingStatus.ACCEPTED, PendingStatus.PARTIALLY_FILLED),
-        ).fetchall()
+        conn.execute(
+            "UPDATE pending_orders SET status=?, last_checked_at=?, updated_at=? "
+            "WHERE trade_id=?",
+            (new_status, now, now, trade_id),
+        )
+        conn.commit()
+        return True
+
+    # ── 추적 대상 조회 ─────────────────────────────────────────
+    def get_trackable(self, market: Optional[str] = None,
+                      max_retry: int = MAX_POLL_RETRY) -> list[dict]:
+        """추적 대상(ACCEPTED / PARTIALLY_FILLED) 주문 목록 반환.
+
+        ★ P0-5 필터 3가지:
+          1. market — KR/US 레지스트리가 같은 테이블을 공유하므로 지정하지 않으면
+             KR 폴러가 US 주문을 조회하고 그 반대도 발생해 중복 dispatch 가 된다.
+          2. odno != '' — 빈 odno 는 남의 체결에 오인 매칭된다.
+          3. retry_count < max_retry — 상한 없는 재시도는 KIS API 를 영구 소모한다.
+        """
+        status_list = sorted(PendingStatus.TRACKABLE)
+        sql = (
+            "SELECT * FROM pending_orders "
+            f"WHERE status IN ({','.join('?' * len(status_list))}) "
+            "  AND TRIM(COALESCE(odno,'')) != '' "
+            "  AND retry_count < ? "
+        )
+        params: list = [*status_list, int(max_retry)]
+        if market:
+            sql += "  AND market = ? "
+            params.append(market)
+        sql += "ORDER BY submitted_at"
+
+        conn = _get_conn()
+        rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
+
+    # ── 재시도 상한 초과 주문 조회 ─────────────────────────────
+    def get_retry_exhausted(self, market: Optional[str] = None,
+                            max_retry: int = MAX_POLL_RETRY) -> list[dict]:
+        """추적 상태이지만 재시도 상한을 넘겨 만료 처리해야 할 주문 목록."""
+        status_list = sorted(PendingStatus.TRACKABLE)
+        sql = (
+            "SELECT * FROM pending_orders "
+            f"WHERE status IN ({','.join('?' * len(status_list))}) "
+            "  AND retry_count >= ? "
+        )
+        params: list = [*status_list, int(max_retry)]
+        if market:
+            sql += "  AND market = ? "
+            params.append(market)
+        sql += "ORDER BY submitted_at"
+
+        conn = _get_conn()
+        return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
     # ── trade_id로 단건 조회 ───────────────────────────────────
     def get_by_trade_id(self, trade_id: str) -> Optional[dict]:
         conn = _get_conn()
         row = conn.execute(
-            "SELECT * FROM pending_orders WHERE trade_id=?", (trade_id,)
+            "SELECT * FROM pending_orders WHERE trade_id=? ORDER BY id DESC",
+            (trade_id,),
         ).fetchone()
         return dict(row) if row else None
 
@@ -713,10 +878,17 @@ class FillObserver:
             "trade_id":      trade_id,
             "market":        market,
             "code":          code,
+            "side":          side,
+            "order_qty":     order_qty,
             "status_before": status_before,
             "status_after":  status_before,   # 기본: 변경 없음
             "fill_delta":    0,
             "cum_filled":    prev_cum,
+            # ★ P0-5: 체결가를 결과에 포함한다.
+            #   이전에는 details 에 없어서 호출자가 0.0 폴백을 썼고,
+            #   그 결과 _handle_buy_filled 의 price<=0 가드에 걸려
+            #   apply_buy 가 통째로 스킵됐다.
+            "avg_fill_price": None,
             "error":         None,
         }
 
@@ -761,8 +933,13 @@ class FillObserver:
             result["error"] = "Observation 정규화 실패"
             return result
 
-        result["fill_delta"] = obs.fill_delta_qty
-        result["cum_filled"] = obs.cumulative_filled_qty
+        result["fill_delta"]     = obs.fill_delta_qty
+        result["cum_filled"]     = obs.cumulative_filled_qty
+        result["avg_fill_price"] = obs.average_fill_price
+        if obs.order_qty:
+            result["order_qty"] = obs.order_qty
+        if obs.side:
+            result["side"] = obs.side
 
         if not obs.is_new_fill:
             # 새 체결 없음 → 상태 유지
@@ -795,11 +972,34 @@ class FillObserver:
         )
         return result
 
+    # ── 재시도 상한 초과 주문 만료 처리 ───────────────────────
+    def _expire_retry_exhausted(self, market: Optional[str] = None) -> int:
+        """재시도 상한을 넘긴 추적 주문을 EXPIRED 로 종결한다 (P0-5).
+
+        상한이 없으면 취소·거부된 주문이 영구히 체결조회 API 를 소모하고
+        로그를 오염시킨다. 여기서 종결시켜 폴링 대상에서 제외한다.
+        """
+        try:
+            stale = self.registry.get_retry_exhausted(market=market)
+        except Exception as e:
+            logger.warning(f"[FillObserver] 만료 대상 조회 실패: {e}")
+            return 0
+        for row in stale:
+            self.registry.set_status(row["trade_id"], PendingStatus.EXPIRED)
+            logger.warning(
+                f"[FillObserver] 체결조회 재시도 {row.get('retry_count')}회 초과 "
+                f"→ EXPIRED 종결: market={row.get('market')} "
+                f"code={row.get('code')} odno={row.get('odno')!r} "
+                f"trade_id={row.get('trade_id')}"
+            )
+        return len(stale)
+
     # ── 1회 폴링 (전체 추적 대상) ─────────────────────────────
-    def poll_once(self) -> dict:
+    def poll_once(self, market: Optional[str] = None) -> dict:
         """ACCEPTED / PARTIALLY_FILLED 주문 전체를 1회 체결조회.
 
         동작:
+          0. 재시도 상한 초과 주문 → EXPIRED 로 종결 (폴링 대상에서 제외)
           1. ACCEPTED / PARTIALLY_FILLED 주문 목록 조회
           2. 각 주문 KIS 체결조회
           3. fill_delta 계산
@@ -808,22 +1008,28 @@ class FillObserver:
           6. pending_orders 상태 업데이트
           7. 결과 요약 반환
 
+        market: "KR" | "US" | None(전체). ★ 지정하지 않으면 KR 폴러가 US 주문을
+                조회하는 교차 오염이 발생하므로 운영 경로는 반드시 지정한다.
+
         반환: {
           "total":    int,   # 조회한 주문 수
           "filled":   int,   # 전량 체결 확인 수
           "partial":  int,   # 부분 체결 확인 수
           "no_change":int,   # 변화 없음
           "errors":   int,   # 오류 발생 수
+          "expired":  int,   # 재시도 상한 초과로 종결한 수
           "details":  list,  # 각 주문 결과 dict 목록
         }
         """
-        orders = self.registry.get_trackable()
+        expired = self._expire_retry_exhausted(market)
+        orders = self.registry.get_trackable(market=market)
         summary = {
             "total":     len(orders),
             "filled":    0,
             "partial":   0,
             "no_change": 0,
             "errors":    0,
+            "expired":   expired,
             "details":   [],
         }
         for order in orders:
