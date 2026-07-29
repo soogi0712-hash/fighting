@@ -31,8 +31,11 @@ from screener.transaction_cost import (
     SELL_COMMISSION_RATE,
     TRANSACTION_TAX_RATE,
 )
+from screener.sell_decision import SellDecisionEngine, SellReason, normalize_sell_score
 
 logger = get_logger("TradeDecision")
+
+sell_engine = SellDecisionEngine()
 
 # ── 손절·익절 기준 (실질수익률 %) ────────────────────────────
 STOP_LOSS_PCT     = -10.0   # 손절: 실질수익률 -10% 이하
@@ -276,7 +279,7 @@ class TradeDecisionEngine:
         """
         code          = position["code"]
         name          = position["name"]
-        avg_price     = position["avg_price"]       # ★ 수수료 포함 취득원가
+        avg_price     = position["avg_price"]
         highest_price = position.get("highest_price", avg_price)
         qty           = position["qty"]
         cur_price     = score_result.get("cur_price",
@@ -285,76 +288,34 @@ class TradeDecisionEngine:
         if not cur_price:
             return self._hold(code, name, "현재가없음")
 
-        # ★ 실질 수익률 (수수료·세금 차감 후)
-        net_pct   = net_profit_pct_from_cost(avg_price, cur_price)
-        trail_pct = ((cur_price - highest_price) / highest_price * 100
-                     if highest_price else 0.0)
-        ma20      = score_result.get("price_ma20", 0)
-        ma20_pct  = (cur_price - ma20) / ma20 * 100 if ma20 else 0.0
-
-        # ── ① 전량 손절: 실질수익률 ≤ -10% ─────────────────
-        # 계좌 생존 최우선: 즉시·무조건 실행
-        if net_pct <= STOP_LOSS_PCT:
-            return {
-                "action":    "SELL",
-                "code":      code, "name": name,
-                "qty":       qty, "price": cur_price,
-                "reason":    f"손절(실질{net_pct:.2f}% ≤ {STOP_LOSS_PCT}%)",
-                "sell_type": "STOP_LOSS",
-                "net_pct":   round(net_pct, 2),  # ★ 실질수익률
-                "is_forced": True,               # 지표 우선순위 무시
-            }
-
-        # ── ② 트레일링 스탑 ──────────────────────────────────
-        # 활성화 조건: 실질수익률 ≥ TRAILING_ACTIVATE_NET_PCT
-        activate_price = price_for_net_pct_from_cost(
-            avg_price, TRAILING_ACTIVATE_NET_PCT
+        raw_sell_score = score_result.get("sell_score")
+        sell_score = normalize_sell_score(raw_sell_score)
+        decision = sell_engine.evaluate(
+            position,
+            score_result,
+            sell_score=sell_score,
         )
-        trailing_active = (highest_price >= activate_price)
-        if trailing_active and trail_pct <= TRAILING_STOP_PCT:
-            return {
-                "action":    "SELL",
-                "code":      code, "name": name,
-                "qty":       qty, "price": cur_price,
-                "reason":    (f"트레일링스탑(고점대비{trail_pct:.2f}% ≤ "
-                              f"{TRAILING_STOP_PCT}%, 실질{net_pct:.2f}%)"),
-                "sell_type": "TRAILING_STOP",
-                "net_pct":   round(net_pct, 2),
-                "is_forced": True,  # 추세 종료 = 강제 매도
+        if decision.action == "SELL":
+            result = {
+                "action": decision.action,
+                "code": code,
+                "name": name,
+                "qty": qty,
+                "price": cur_price,
+                "reason": decision.reason,
+                "net_pct": decision.net_pct,
+                "sell_score": decision.sell_score,
+                "elapsed_min": decision.elapsed_min,
             }
+            if decision.sell_type:
+                result["sell_type"] = decision.sell_type
+            if decision.sell_reason is not None:
+                result["sell_reason"] = decision.sell_reason.value if isinstance(decision.sell_reason, SellReason) else decision.sell_reason
+            if decision.is_forced is not None:
+                result["is_forced"] = decision.is_forced
+            return result
 
-        # ── ③ MA20 이탈 (수익권에서 추세 이탈) ──────────────
-        # 수익권 보유 + MA20 이탈 → 추세 종료
-        if ma20 and net_pct > 0 and ma20_pct <= MA20_EXIT_BUFFER:
-            return {
-                "action":    "SELL",
-                "code":      code, "name": name,
-                "qty":       qty, "price": cur_price,
-                "reason":    (f"MA20추세이탈(실질{net_pct:.2f}%, "
-                              f"MA20괴리{ma20_pct:.2f}%)"),
-                "sell_type": "MA20_EXIT",
-                "net_pct":   round(net_pct, 2),
-                "is_forced": False,  # 지표 확인 후 실행
-            }
-
-        # ── ④ AI 점수 급락 (EXCLUDE 등급) ───────────────────
-        grade = score_result.get("grade", "")
-        score = score_result.get("total_score", 100)
-        if grade == "EXCLUDE" and score < 40:
-            return {
-                "action":    "SELL",
-                "code":      code, "name": name,
-                "qty":       qty, "price": cur_price,
-                "reason":    f"AI점수급락({score:.0f}pts/{grade})",
-                "sell_type": "SCORE_DROP",
-                "net_pct":   round(net_pct, 2),
-                "is_forced": False,
-            }
-
-        # 추세 지속 → 홀드
-        return self._hold(code, name,
-            f"추세유지(실질{net_pct:+.2f}% 고점대비{trail_pct:+.2f}% "
-            f"MA20={ma20_pct:+.2f}% 트레일활성={'ON' if trailing_active else 'OFF'})")
+        return self._hold(code, name, decision.reason)
 
     # ══════════════════════════════════════════════════════════
     # 손절 회수금 재배분 우선순위
@@ -483,4 +444,12 @@ class TradeDecisionEngine:
 
     @staticmethod
     def _hold(code, name, reason):
-        return {"action": "HOLD", "code": code, "name": name, "reason": reason}
+        return {
+            "action": "HOLD",
+            "code": code,
+            "name": name,
+            "reason": reason,
+            "net_pct": None,
+            "sell_score": None,
+            "elapsed_min": None,
+        }
