@@ -14,7 +14,7 @@
   • 20분 시간청산이 run() 경로에서 실제 매도 접수까지(요구사항 6)
   • HOLD/SELL 모두 [SELL_DECISION] 로그(요구사항 7)
   • sell_result→result 버그 수정으로 NameError 없이 등록(요구사항 2)
-  • 하드 손절 티어(-3.0%/-1.2%)는 이번 커밋에서 라우팅 보류(정책 불변 증명)
+  • 매도정책: 긴급손절 -3.0% 무조건 / 일반손절 -1.2%+5분+sell_score≥7 → SELL 라우팅
 
 경량 하니스: 실제 run()/_decide_sell_for_holding/_register_pending_order/
 has_active_sell/has_active_buy 를 그대로 바인딩하고, 지표검증(validator)·현재가/
@@ -301,18 +301,40 @@ class RunWiringTest(unittest.TestCase):
         self.assertEqual(res["action"], "HOLD", res)
         self.assertEqual(len(api.sell_calls), 0)
 
-    # ── 정책분리 증명: 하드손절(-3.0%/-1.2%) 티어는 이번 커밋 라우팅 보류 ──
-    def test_hard_stop_tier_not_routed(self):
-        # net -3.5% (decide_sell=EMERGENCY_STOP), elapsed<20 & > -5% → pyramid HOLD
+    # ── 매도정책: 긴급손절 -3.0% 는 무조건 SELL 라우팅 (run() 경로) ──
+    def test_emergency_stop_routes_in_run(self):
+        # net -3.5% (≤ -3.0%), elapsed 짧아도 무조건. pyramid -5% 미도달이라 pyramid HOLD.
         sm, api = self._mk(cur_net=-3.5)
-        seed_position(sm, "005930", "삼성전자", net_pct=-3.5, elapsed_min=10)
-        with self.assertLogs("StrategyManager", level="INFO") as cm:
-            res = sm.run({"code": "005930", "name": "삼성전자"}, cached_cash=10_000_000)
-        joined = "\n".join(cm.output)
-        # decide_sell 은 SELL(STOP_LOSS) 로 판단해 로그는 남기되
-        self.assertRegex(joined, r"\[SELL_DECISION\].*sell_type=STOP_LOSS")
-        self.assertIn("라우팅 보류", joined)
-        # 실제로는 매도하지 않음(현행 -5% pyramid 정책 유지)
+        seed_position(sm, "005930", "삼성전자", net_pct=-3.5, elapsed_min=1)
+        res = sm.run({"code": "005930", "name": "삼성전자"}, cached_cash=10_000_000)
+        self.assertEqual(res["action"], "SELL", res)
+        self.assertIn("긴급손절", res["reason"])
+        self.assertEqual(len(api.sell_calls), 1)
+        self._assert_pending_lifecycle_path("005930")
+
+    # ── 매도정책: 일반손절 -1.2% + 5분 + sell_score≥7 → SELL ──
+    def test_general_stop_routes_in_run(self):
+        sm, api = self._mk(cur_net=-1.5, sell_score=7)
+        seed_position(sm, "005930", "삼성전자", net_pct=-1.5, elapsed_min=10)
+        res = sm.run({"code": "005930", "name": "삼성전자"}, cached_cash=10_000_000)
+        self.assertEqual(res["action"], "SELL", res)
+        self.assertIn("일반손절", res["reason"])
+        self.assertEqual(len(api.sell_calls), 1)
+        self._assert_pending_lifecycle_path("005930")
+
+    # ── 매도정책: 일반손절 sell_score 6 → 미달 → HOLD ──
+    def test_general_stop_score6_holds_in_run(self):
+        sm, api = self._mk(cur_net=-1.5, sell_score=6)
+        seed_position(sm, "005930", "삼성전자", net_pct=-1.5, elapsed_min=10)
+        res = sm.run({"code": "005930", "name": "삼성전자"}, cached_cash=10_000_000)
+        self.assertEqual(res["action"], "HOLD", res)
+        self.assertEqual(len(api.sell_calls), 0)
+
+    # ── 매도정책: 일반손절 보유 5분 미만 → 보류 → HOLD ──
+    def test_general_stop_under_5min_holds_in_run(self):
+        sm, api = self._mk(cur_net=-1.5, sell_score=7)
+        seed_position(sm, "005930", "삼성전자", net_pct=-1.5, elapsed_min=3)
+        res = sm.run({"code": "005930", "name": "삼성전자"}, cached_cash=10_000_000)
         self.assertEqual(res["action"], "HOLD", res)
         self.assertEqual(len(api.sell_calls), 0)
 
@@ -333,12 +355,14 @@ class SourceWiringTest(unittest.TestCase):
         self.assertNotIn("order_response=sell_result", src)
         self.assertTrue(re.search(r"order_response=\s*result", src))
 
-    def test_hard_stop_deferred_in_overlay(self):
+    def test_hard_stop_active_in_overlay(self):
         overlay = inspect.getsource(StrategyManager._decide_sell_for_holding)
-        # 안전망만 라우팅 대상, 하드손절 티어는 보류
+        # 안전망 + 하드손절(STOP_LOSS) 모두 라우팅 대상
         self.assertIn("_ROUTABLE_SELL_TYPES", overlay)
         self.assertIn("TRAILING_STOP", overlay)
         self.assertIn("MA20_EXIT", overlay)
+        self.assertIn("SCORE_DROP", overlay)
+        self.assertIn("STOP_LOSS", overlay)
 
 
 class EtfRepeatBuyTest(unittest.TestCase):

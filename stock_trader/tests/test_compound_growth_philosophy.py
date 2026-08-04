@@ -159,12 +159,43 @@ check("손절 is_forced = True",
       d_stop.get("is_forced") == True,
       f"is_forced={d_stop.get('is_forced')}")
 
-# 손절 이전(-5% net)에서는 HOLD
-above_stop = price_for_net_pct_from_cost(avg_price, -5.0)
-sr_above = {"cur_price": above_stop, "grade": "NORMAL",
+# ── 운영정책 하드손절: 긴급 -3.0% / 일반 -1.2%(5분·SELL_SCORE≥7) ──
+# 긴급손절: -3.5% → 조건 없이 SELL(EMERGENCY_STOP)
+emer = price_for_net_pct_from_cost(avg_price, -3.5)
+d_emer = engine.decide_sell(
+    {**pos_stop, "created_at": None},
+    {"cur_price": emer, "grade": "NORMAL", "sell_score": 0,
+     "price_ma20": emer * 1.02})
+check("긴급손절(-3.5%) → SELL(EMERGENCY_STOP)",
+      d_emer["action"] == "SELL" and d_emer.get("sell_type") == "STOP_LOSS",
+      f"action={d_emer['action']}, type={d_emer.get('sell_type')}")
+
+# 일반손절: -1.5%, 보유 6분, SELL_SCORE 7 → SELL
+from datetime import datetime as _dt, timedelta as _td
+gen_pos = {**pos_stop,
+           "created_at": (_dt.now() - _td(minutes=6)).isoformat()}
+gen = price_for_net_pct_from_cost(avg_price, -1.5)
+d_gen = engine.decide_sell(
+    gen_pos, {"cur_price": gen, "grade": "NORMAL", "sell_score": 7,
+              "price_ma20": gen * 1.02})
+check("일반손절(-1.5%,6분,score7) → SELL",
+      d_gen["action"] == "SELL" and d_gen.get("sell_type") == "STOP_LOSS",
+      f"action={d_gen['action']}, type={d_gen.get('sell_type')}")
+
+# 일반손절 SELL_SCORE 6 → 미달 → HOLD (total_score 혼용 금지)
+d_gen6 = engine.decide_sell(
+    gen_pos, {"cur_price": gen, "grade": "NORMAL", "sell_score": 6,
+              "total_score": 100, "price_ma20": gen * 1.02})
+check("일반손절 SELL_SCORE6 → HOLD (total_score 혼용 금지)",
+      d_gen6["action"] == "HOLD",
+      f"action={d_gen6['action']}")
+
+# 얕은 손실(-1.0%, 조건 미달) → HOLD
+above_stop = price_for_net_pct_from_cost(avg_price, -1.0)
+sr_above = {"cur_price": above_stop, "grade": "NORMAL", "sell_score": 0,
             "total_score": 75, "price_ma20": above_stop * 1.02}
-d_above = engine.decide_sell(pos_stop, sr_above)
-check("손절 이전(-5%) → HOLD",
+d_above = engine.decide_sell({**pos_stop, "created_at": None}, sr_above)
+check("얕은 손실(-1.0%) → HOLD (긴급 -3.0/일반 -1.2 미달)",
       d_above["action"] == "HOLD",
       f"action={d_above['action']}")
 
@@ -182,9 +213,11 @@ check(f"트레일링 활성화 가격 실질수익률 = +{TRAILING_ACTIVATE_NET_
       f"verify={verify_trail:.4f}%")
 
 # highest_price = 활성화 가격 이상이어야 트레일링 동작
-# cur_price = 고점 대비 -12% (TRAILING_STOP_PCT)
-high = trailing_activate * 1.02   # 활성화 이후 조금 더 오름
-cur_trail = high * (1 + TRAILING_STOP_PCT / 100)  # 고점 -12%
+# ★ 운영정책: 긴급손절(-3.0%)이 우선하므로, 고점 -12% 하락 후에도 실질수익률이
+#   -3.0% 보다 높은 고수익 종목에서 트레일링이 발동한다. 고점 +25% 로 설정.
+high = price_for_net_pct_from_cost(avg_price, 25.0)  # 고점 +25% 실질(활성화 충족)
+# 고점 대비 -13%(경계 -12% 를 FP 오차 없이 초과) → 실질 여전히 +수익권
+cur_trail = high * (1 + (TRAILING_STOP_PCT - 1.0) / 100)
 
 pos_trail = {
     "code": "A005930", "name": "삼성전자",

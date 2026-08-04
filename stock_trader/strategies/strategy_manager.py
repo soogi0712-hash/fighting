@@ -1393,31 +1393,36 @@ class StrategyManager:
 
         run() 이 보유 종목 순회 중 pyramid 가 HOLD 로 판단한 포지션에 대해 호출한다.
 
-        ★ 전략값(손절 기준)은 이 메서드에서 변경하지 않는다.
-          손절(-5%)·익절(+2%)·수익반납방지(+1%·SELL_SCORE≥6)·시간청산(20/40분)은
-          모두 pyramid.evaluate() 소관이다. 여기서는 트레일링스탑·MA20 추세이탈·
-          AI점수급락(SCORE_DROP) 안전망만 실제 SELL 로 연결한다.
+        ★ 익절(+2%)·수익반납방지(+1%·SELL_SCORE≥6)·시간청산(20/40분)·최종 -5% 손절은
+          pyramid.evaluate() 소관이다. 이 메서드는 decide_sell 안전망을 실제 SELL 로
+          연결한다: 트레일링스탑·MA20 추세이탈·AI점수급락(SCORE_DROP) 및
+          하드 손절 티어(긴급 -3.0% / 일반 -1.2%, 보유 5분↑·SELL_SCORE≥7).
 
-        ★ 하드 손절 티어(-3.0% 긴급 / -1.2% 일반, 5분·SELL_SCORE7)는 decide_sell
-          엔진에 그대로 존재하지만 이번 커밋에서는 라이브 라우팅하지 않는다(보류).
-          하드 손절은 현행 운영 정책인 pyramid.evaluate() 의 -5% 가 담당한다.
-          -3.0/-1.2/5분/sell_score7 활성화 여부는 별도의 손절정책 커밋에서 결정한다.
+        ★ 매도정책: 손실 구간 조기 청산은 decide_sell 하드손절이 먼저 담당하고
+          (긴급 -3.0% 무조건 / 일반 -1.2% + 5분 + SELL_SCORE≥7), pyramid.evaluate()
+          의 -5% 는 최종 백스톱으로 유지된다. SELL_SCORE 는 total_score 와 혼용하지
+          않는다(decide_sell 이 score_result['sell_score'] 만 사용).
 
         동작:
           - action 이 HOLD 가 아니거나 수량/평단이 없으면 그대로 반환(무변경).
-          - decide_sell 이 SELL 이고 sell_type 이 안전망(_ROUTABLE_SELL_TYPES)이면,
+          - decide_sell 이 SELL 이고 sell_type 이 인식 대상(_ROUTABLE_SELL_TYPES)이면,
             미체결 매도 주문이 없을 때만 SELL_ALL 로 라우팅.
-          - decide_sell 이 SELL 이어도 하드손절(STOP_LOSS) 이면 로그만 남기고 보류.
           - HOLD/SELL 모두 [SELL_DECISION] 로그를 남긴다(운영 추적용).
 
         Returns:
             (action, decision) 튜플 — 오버레이 결과 반영.
         """
-        # 이번 커밋에서 실제 SELL 로 연결하는 안전망 sell_type (하드손절 제외)
-        _ROUTABLE_SELL_TYPES = {"TRAILING_STOP", "MA20_EXIT", "SCORE_DROP"}
+        # decide_sell 결과를 실제 SELL 로 연결하는 sell_type
+        #   STOP_LOSS = 긴급손절(-3.0%) / 일반손절(-1.2%, 5분·SELL_SCORE≥7)
+        _ROUTABLE_SELL_TYPES = {"TRAILING_STOP", "MA20_EXIT", "SCORE_DROP", "STOP_LOSS"}
         if action != "HOLD" or total_qty <= 0 or avg_price <= 0:
             return action, decision
 
+        # 일반손절(-1.2%)의 5분 보유 게이트 판정을 위해 created_at 를 전달한다.
+        # decide_sell 엔진은 position["created_at"] 로 보유시간을 계산하므로,
+        # run() 이 산출한 elapsed_min 을 created_at 으로 역산해 주입한다.
+        from datetime import timedelta as _td
+        _created_at = (datetime.now() - _td(minutes=float(elapsed_min or 0.0))).isoformat()
         position = {
             "code":          code,
             "name":          name,
@@ -1425,6 +1430,7 @@ class StrategyManager:
             "highest_price": highest_price if highest_price and highest_price > 0 else avg_price,
             "qty":           total_qty,
             "cur_price":     cur_price,
+            "created_at":    _created_at,
         }
         # ★ SELL SCORE 만 사용(total_score 혼용 금지). decide_sell 이 sell_score 를
         #   score_result 에서 읽으므로 명시적으로 주입한다.
@@ -1450,13 +1456,11 @@ class StrategyManager:
         if _act != "SELL":
             return action, decision
 
-        # ── 하드 손절 티어(STOP_LOSS: -3.0%/-1.2%)는 이번 커밋 라우팅 보류 ──
-        # decide_sell 엔진 값은 그대로 두되, 활성화는 별도 손절정책 커밋으로 분리.
-        # 하드 손절은 현행 pyramid -5% 가 담당하므로 여기서는 SELL 로 연결하지 않는다.
+        # ── 방어적 필터: 인식하지 못한 sell_type 은 라우팅하지 않음 ──
+        # (정상 경로엔 해당 없음 — STOP_LOSS/TRAILING_STOP/MA20_EXIT/SCORE_DROP)
         if _stype not in _ROUTABLE_SELL_TYPES:
             logger.info(
-                "[SELL_DECISION] %s decide_sell=SELL(sell_type=%s)이나 하드손절 "
-                "티어 → 이번 커밋 라우팅 보류(HOLD 유지, pyramid -5%% 담당)",
+                "[SELL_DECISION] %s decide_sell=SELL(sell_type=%s) 미인식 → 라우팅 스킵",
                 code, _stype)
             return action, decision
 
@@ -1860,10 +1864,10 @@ class StrategyManager:
                 f"실질{net_pct:.2f}%"
             )
 
-        # ── ★ 보유 포지션 매도판단 오버레이 (트레일링/MA20/점수급락 안전망) ──
+        # ── ★ 보유 포지션 매도판단 오버레이 (decide_sell 안전망 + 하드손절) ──
         # pyramid 가 HOLD 로 판단한 보유 포지션에 decide_sell 을 적용해
-        # 트레일링스탑·MA20 이탈·AI점수급락 시 안전 청산(SELL_ALL)으로 라우팅한다.
-        # 전략값(−5% 손절/+2% 익절/+1%·SELL_SCORE≥6/20·40분 시간청산)은 pyramid 소관.
+        # 트레일링·MA20 이탈·점수급락·하드손절(-3.0%/-1.2%) 시 SELL_ALL 로 라우팅.
+        # 익절(+2%)·수익반납방지(+1%·SELL_SCORE≥6)·시간청산·최종 -5% 는 pyramid 소관.
         if pos is not None and action == "HOLD":
             action, decision = self._decide_sell_for_holding(
                 code, name, avg_price, highest_price, total_qty,
