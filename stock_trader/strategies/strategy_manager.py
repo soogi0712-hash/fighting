@@ -525,6 +525,20 @@ class StrategyManager:
         except Exception:
             return False
 
+    def has_active_buy(self, code: str, market: str = "KR") -> bool:
+        """해당 종목에 미체결(ACCEPTED/PARTIALLY_FILLED) 매수 주문이 있으면 True.
+
+        ETF/개별주 동일종목 반복 신규매수 차단용. PendingRegistry 미구성 시 False.
+        접수↔체결 창에서 apply_buy 가 아직 실행되지 않아 잔고에 반영되기 전이라도
+        동일 종목에 중복 신규매수를 내지 않도록 durable 하게 조회한다.
+        """
+        if self._pending_registry is None:
+            return False
+        try:
+            return self._pending_registry.has_active_order(market, code, "BUY")
+        except Exception:
+            return False
+
     def active_order_codes(self, market: str = "KR") -> set:
         """해당 시장에서 ACTIVE(ACCEPTED/PARTIALLY_FILLED) 주문이 걸린 코드 집합.
 
@@ -1368,6 +1382,109 @@ class StrategyManager:
             )
 
     # ══════════════════════════════════════════════════════════
+    # 보유 포지션 매도판단 오버레이 (트레일링/MA20/점수급락 안전망)
+    # ══════════════════════════════════════════════════════════
+    def _decide_sell_for_holding(
+        self, code, name, avg_price, highest_price, total_qty,
+        cur_price, sell_score, elapsed_min, score_result,
+        action, decision, sess,
+    ):
+        """보유 포지션에 TradeDecisionEngine.decide_sell 안전망을 오버레이한다.
+
+        run() 이 보유 종목 순회 중 pyramid 가 HOLD 로 판단한 포지션에 대해 호출한다.
+
+        ★ 전략값(손절 기준)은 이 메서드에서 변경하지 않는다.
+          손절(-5%)·익절(+2%)·수익반납방지(+1%·SELL_SCORE≥6)·시간청산(20/40분)은
+          모두 pyramid.evaluate() 소관이다. 여기서는 트레일링스탑·MA20 추세이탈·
+          AI점수급락(SCORE_DROP) 안전망만 실제 SELL 로 연결한다.
+
+        ★ 하드 손절 티어(-3.0% 긴급 / -1.2% 일반, 5분·SELL_SCORE7)는 decide_sell
+          엔진에 그대로 존재하지만 이번 커밋에서는 라이브 라우팅하지 않는다(보류).
+          하드 손절은 현행 운영 정책인 pyramid.evaluate() 의 -5% 가 담당한다.
+          -3.0/-1.2/5분/sell_score7 활성화 여부는 별도의 손절정책 커밋에서 결정한다.
+
+        동작:
+          - action 이 HOLD 가 아니거나 수량/평단이 없으면 그대로 반환(무변경).
+          - decide_sell 이 SELL 이고 sell_type 이 안전망(_ROUTABLE_SELL_TYPES)이면,
+            미체결 매도 주문이 없을 때만 SELL_ALL 로 라우팅.
+          - decide_sell 이 SELL 이어도 하드손절(STOP_LOSS) 이면 로그만 남기고 보류.
+          - HOLD/SELL 모두 [SELL_DECISION] 로그를 남긴다(운영 추적용).
+
+        Returns:
+            (action, decision) 튜플 — 오버레이 결과 반영.
+        """
+        # 이번 커밋에서 실제 SELL 로 연결하는 안전망 sell_type (하드손절 제외)
+        _ROUTABLE_SELL_TYPES = {"TRAILING_STOP", "MA20_EXIT", "SCORE_DROP"}
+        if action != "HOLD" or total_qty <= 0 or avg_price <= 0:
+            return action, decision
+
+        position = {
+            "code":          code,
+            "name":          name,
+            "avg_price":     avg_price,
+            "highest_price": highest_price if highest_price and highest_price > 0 else avg_price,
+            "qty":           total_qty,
+            "cur_price":     cur_price,
+        }
+        # ★ SELL SCORE 만 사용(total_score 혼용 금지). decide_sell 이 sell_score 를
+        #   score_result 에서 읽으므로 명시적으로 주입한다.
+        sr = dict(score_result or {})
+        sr["cur_price"]   = cur_price
+        sr["sell_score"]  = sell_score
+        sr["elapsed_min"] = elapsed_min
+
+        sell_dec = self.decision.decide_sell(position, sr, sess)
+        _act    = sell_dec.get("action", "HOLD")
+        _net    = sell_dec.get("net_pct")
+        _stype  = sell_dec.get("sell_type")
+        _reason = sell_dec.get("reason", "")
+
+        # ── [SELL_DECISION] HOLD/SELL 공통 로그 (운영 추적) ──
+        logger.info(
+            "[SELL_DECISION] code=%s name=%s action=%s net_pct=%s "
+            "sell_score=%s elapsed_min=%.1f sell_type=%s reason=%s",
+            code, name, _act, _net, sell_score,
+            float(elapsed_min or 0.0), _stype, _reason,
+        )
+
+        if _act != "SELL":
+            return action, decision
+
+        # ── 하드 손절 티어(STOP_LOSS: -3.0%/-1.2%)는 이번 커밋 라우팅 보류 ──
+        # decide_sell 엔진 값은 그대로 두되, 활성화는 별도 손절정책 커밋으로 분리.
+        # 하드 손절은 현행 pyramid -5% 가 담당하므로 여기서는 SELL 로 연결하지 않는다.
+        if _stype not in _ROUTABLE_SELL_TYPES:
+            logger.info(
+                "[SELL_DECISION] %s decide_sell=SELL(sell_type=%s)이나 하드손절 "
+                "티어 → 이번 커밋 라우팅 보류(HOLD 유지, pyramid -5%% 담당)",
+                code, _stype)
+            return action, decision
+
+        # 미체결 매도 주문 존재 → 이중매도 방지(HOLD 유지)
+        if self.has_active_sell(code):
+            logger.info(
+                "[SELL_DECISION] %s decide_sell=SELL 이나 미체결 매도 주문 존재 "
+                "→ 중복 매도 스킵(in-flight)", code)
+            return action, decision
+
+        routed = {
+            "action":       "SELL_ALL",
+            "qty":          total_qty,
+            "price":        cur_price,
+            "code":         code,
+            "name":         name,
+            "level":        decision.get("level") if isinstance(decision, dict) else None,
+            "net_pct":      _net,
+            "reason":       f"안전청산-{_reason}",
+            # 안전망 청산은 강제 청산으로 취급(sell_score 게이트 우회).
+            "_overlay_forced": True,
+            "sell_type":    _stype,
+            "sell_reason":  sell_dec.get("sell_reason"),
+            "sell_score":   sell_score,
+        }
+        return "SELL_ALL", routed
+
+    # ══════════════════════════════════════════════════════════
     # 메인 실행
     # ══════════════════════════════════════════════════════════
     def run(self, stock: dict, cached_cash: float = None) -> dict:
@@ -1741,6 +1858,17 @@ class StrategyManager:
             logger.warning(
                 f"🚨 {name} SELL SCORE 즉시 매도! score={sell_score}, "
                 f"실질{net_pct:.2f}%"
+            )
+
+        # ── ★ 보유 포지션 매도판단 오버레이 (트레일링/MA20/점수급락 안전망) ──
+        # pyramid 가 HOLD 로 판단한 보유 포지션에 decide_sell 을 적용해
+        # 트레일링스탑·MA20 이탈·AI점수급락 시 안전 청산(SELL_ALL)으로 라우팅한다.
+        # 전략값(−5% 손절/+2% 익절/+1%·SELL_SCORE≥6/20·40분 시간청산)은 pyramid 소관.
+        if pos is not None and action == "HOLD":
+            action, decision = self._decide_sell_for_holding(
+                code, name, avg_price, highest_price, total_qty,
+                cur_price, sell_score, elapsed_min, score_result,
+                action, decision, sess,
             )
 
         # ── BUY 계열 ──────────────────────────────────────
@@ -2264,8 +2392,11 @@ class StrategyManager:
                 }
 
             # ★ 강제 매도 여부 판단
+            #   _overlay_forced: decide_sell 안전망(트레일링/MA20/점수급락) 청산은
+            #   SELL_SCORE 게이트를 우회하는 강제 청산으로 취급한다.
             is_forced = (
-                "손절"          in reason
+                (isinstance(decision, dict) and decision.get("_overlay_forced", False))
+                or "손절"          in reason
                 or "트레일링"   in reason
                 or "마감"       in reason
                 or "KRW전량익절" in reason
@@ -2383,7 +2514,7 @@ class StrategyManager:
                             code          = code,
                             side          = "SELL",
                             order_qty     = qty,
-                            order_response= sell_result,
+                            order_response= result,
                             lifecycle_id  = _sell_lc.order_lifecycle_id,
                         )
                         logger.info(

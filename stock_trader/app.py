@@ -153,6 +153,8 @@ def _build_watch_list() -> list:
 _watch_list   = _build_watch_list()
 _last_signals = {}
 _status_log   = []
+# ETF 동일 종목 반복 신규매수 차단용 최근 매수 시각 캐시 (code → epoch sec)
+_etf_buy_guard: dict = {}
 
 # ── 전략 실험실 ───────────────────────────────────────────
 _lab_engine   = None    # StrategyLabEngine 인스턴스 (지연 초기화)
@@ -1566,6 +1568,31 @@ def _handle_etf_trade(stock: dict, asset_type: str, regime: str, sess: dict,
             }
             return
 
+        # ── ★ 동일 ETF 반복 신규매수 차단 ─────────────────────
+        # is_held 는 위에서 이미 처리(보유 시 매도 판단 후 return)됐지만,
+        # 접수↔체결/잔고반영 지연 창(잔고 60초 캐시)에서 방금 매수한 ETF 를
+        # 다시 매수하는 사고를 막기 위해 쿨다운 가드를 적용한다.
+        from strategies.buy_guard import should_skip_new_buy, DEFAULT_BUY_COOLDOWN_SEC
+        _etf_has_active_buy = False
+        if _strategy_mgr is not None:
+            try:
+                _etf_has_active_buy = _strategy_mgr.has_active_buy(code, market="KR")
+            except Exception:
+                _etf_has_active_buy = False
+        _skip_buy, _skip_reason = should_skip_new_buy(
+            code, is_held=is_held, has_active_buy=_etf_has_active_buy,
+            recent_buy_ts=_etf_buy_guard.get(code), now_ts=time.time(),
+            cooldown_sec=DEFAULT_BUY_COOLDOWN_SEC,
+        )
+        if _skip_buy:
+            _log(f"⏸ ETF 반복매수 차단 {name}({code}) — {_skip_reason}", "info")
+            _last_signals[code] = {
+                "action": "HOLD", "price": cur,
+                "asset_type": asset_type, "regime": regime,
+                "buy_score": 0, "sell_score": 0, "reason": _skip_reason,
+            }
+            return
+
         # 포지션 크기 계산
         ratio       = _get_etf_position_ratio(asset_type, regime)
         invest_amt  = int(total_eval * ratio)
@@ -1585,6 +1612,8 @@ def _handle_etf_trade(stock: dict, asset_type: str, regime: str, sess: dict,
         )
         try:
             _api.buy(code, qty, cur)
+            # ★ 반복매수 차단용 최근 매수 시각 기록 (쿨다운 기준)
+            _etf_buy_guard[code] = time.time()
             notifier.notify_buy(name, code, cur, qty,
                                 f"ETF매수({asset_type}/{regime})")
         except Exception as e:
