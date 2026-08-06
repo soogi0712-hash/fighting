@@ -744,6 +744,65 @@ class _USFillOutbox:
         return [dict(r) for r in rows]
 
 
+class _USAppEffectLedger:
+    """app 측 부수효과의 (event_key, effect_type) 단위 완료 상태를 영속화.
+
+    ★ 고유키 = (event_key, effect_type) UNIQUE.
+    ★ effect 별로 완료를 개별 기록한다(app_done 하나로 묶지 않음). 한 effect
+      성공 후 다음 effect 에서 실패해도 성공한 effect 는 재실행되지 않는다.
+    ★ 재전달돼도 done() 인 effect 는 실행하지 않는다.
+    ★ 외부 함수 실행과 flag 저장을 단일 트랜잭션으로 묶을 수 없으므로, 각 effect
+      함수는 event_key 를 받아 스스로 멱등하게 처리하는 것을 계약으로 한다
+      (실행 후 flag 저장 전 crash 시에도 재실행이 무해).
+    """
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._init_db()
+
+    def _conn(self):
+        import sqlite3
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+
+    def _init_db(self):
+        try:
+            with self._conn() as c:
+                c.execute("""
+                    CREATE TABLE IF NOT EXISTS us_app_effects (
+                        event_key   TEXT NOT NULL,
+                        effect_type TEXT NOT NULL,
+                        done_at     TEXT,
+                        PRIMARY KEY (event_key, effect_type)
+                    )
+                """)
+        except Exception as exc:
+            logger.warning("[US AppEffect] 초기화 실패: %s", exc)
+
+    def done(self, event_key: str, effect_type: str) -> bool:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT 1 FROM us_app_effects WHERE event_key=? AND effect_type=?",
+                (event_key, effect_type)).fetchone()
+        return row is not None
+
+    def mark(self, event_key: str, effect_type: str) -> None:
+        from datetime import datetime as _dt
+        with self._conn() as c:
+            c.execute(
+                "INSERT OR IGNORE INTO us_app_effects "
+                "(event_key, effect_type, done_at) VALUES (?,?,?)",
+                (event_key, effect_type, _dt.now().isoformat()))
+
+    def done_types(self, event_key: str) -> set:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT effect_type FROM us_app_effects WHERE event_key=?",
+                (event_key,)).fetchall()
+        return {r[0] for r in rows}
+
+
 # ════════════════════════════════════════════════════════════
 # ── 전략 매니저
 # ════════════════════════════════════════════════════════════
@@ -805,6 +864,7 @@ class USStrategyManager:
         self._us_lifecycle_mgr   = None
         self._us_updater         = None
         self._us_outbox          = None
+        self._us_app_ledger      = None
         self._us_pending_registry = None
         self._us_fill_observer   = None
         self._us_pending_buy_meta: dict  = {}
@@ -819,13 +879,15 @@ class USStrategyManager:
                     os.path.dirname(__file__), "..", "data", "trading_journal.db"
                 )
                 self._us_lifecycle_mgr = OrderLifecycleManager(_jnl_db)
-                # ★ crash-safe 체결 outbox(execution ledger)
+                # ★ crash-safe 체결 outbox(execution ledger) + app 부수효과 원장
                 self._us_outbox = _USFillOutbox(_jnl_db)
+                self._us_app_ledger = _USAppEffectLedger(_jnl_db)
                 logger.info("[US Lifecycle] OrderLifecycleManager 초기화 완료")
             except Exception as _us_le:
                 logger.warning(f"[US Lifecycle] 초기화 실패: {_us_le}")
                 self._us_lifecycle_mgr = None
                 self._us_outbox = None
+                self._us_app_ledger = None
 
         if _US_FILL_OBSERVER_ENABLED:
             try:
@@ -1266,8 +1328,49 @@ class USStrategyManager:
             })
         return out
 
+    def us_apply_app_effects(self, event: dict, fns: dict) -> bool:
+        """체결이벤트의 app 부수효과를 (event_key, effect_type) 단위로 정확히 1회
+        적용한다.
+
+        fns: {effect_type: callable(event_key, event)} — 예: trade_count /
+             pnl_stats / watch_entry / on_sell_complete / reentry_penalty.
+        - 각 effect 는 app effect 원장에 done 이면 건너뛴다(재전달·재시작 안전).
+        - effect 실행 후 원장에 mark. 실행 후 mark 전 crash 로 재실행돼도, 각 fn 은
+          event_key 로 멱등 처리하는 것을 계약으로 한다(중복 페널티/집계 방지).
+        - 한 effect 실패 시 그 effect 만 미완료로 남기고 이후 effect 도 보류
+          → 다음 폴에서 미완료 effect 만 이어서 처리.
+        - 모든 effect 완료된 뒤에만 outbox 의 app_done 을 확정한다.
+        반환: 모든 effect 완료(app_done 확정)면 True.
+        """
+        ledger = getattr(self, "_us_app_ledger", None)
+        ek = (event or {}).get("event_key", "")
+        if ledger is None or not ek or not fns:
+            return False
+        for et, fn in fns.items():
+            if ledger.done(ek, et):
+                continue
+            try:
+                if fn is not None:
+                    fn(ek, event)
+            except Exception as exc:
+                logger.error("[US app effect] %s/%s 실패 — 다음 폴 재시도: %s",
+                             ek, et, exc)
+                return False   # 실패 effect 이후는 보류(app_done 미확정)
+            ledger.mark(ek, et)
+        # 모든 effect 완료 시에만 app_done 확정
+        if all(ledger.done(ek, et) for et in fns):
+            ob = getattr(self, "_us_outbox", None)
+            if ob is not None:
+                try:
+                    ob.set_flag(ek, "app_done")
+                except Exception as exc:
+                    logger.warning("[US Outbox] app_done 마킹 실패: %s error=%s",
+                                   ek, exc)
+            return True
+        return False
+
     def us_mark_app_done(self, event_key: str) -> None:
-        """app.py 가 체결이벤트 부수효과 처리를 마친 뒤 호출 → 재전달 방지."""
+        """(호환용) 모든 부수효과 완료를 전제로 outbox app_done 확정."""
         ob = getattr(self, "_us_outbox", None)
         if ob is not None and event_key:
             try:

@@ -1313,6 +1313,56 @@ def _us_realbalance_force_sell_check():
                 }
 
 
+def _build_us_effect_fns(ev: dict) -> dict:
+    """US 체결이벤트의 app 부수효과를 effect_type 별 idempotent 함수로 구성.
+
+    각 함수는 (event_key, event) 를 받는다. event_key 로 멱등 처리하는 것을 계약
+    으로 한다(us_apply_app_effects 가 (event_key, effect_type) 원장으로 gate). 매수는
+    거래집계·watch-entry, 매도는 거래집계·PnL집계, 전량청산이면 on_sell_complete·
+    reentry_penalty 를 각각 구분해 관리한다.
+    """
+    _sym   = ev.get("symbol", "")
+    _name  = ev.get("name", _sym)
+    _price = float(ev.get("price", 0) or 0)
+    _pnl_krw = float(ev.get("pnl_krw", 0) or 0)
+    _qty   = ev.get("qty", 0)
+
+    def _trade_count(ek, e):
+        # 당일 거래집계는 재시작 시 초기화되는 인메모리 카운터 →
+        # (event_key, trade_count) 원장 gate 로 재전달 중복 방지.
+        _record_trade_pnl(is_trade=True)
+
+    def _pnl_stats(ek, e):
+        _record_trade_pnl(pnl_krw=_pnl_krw, is_trade=False)
+
+    def _watch_entry(ek, e):
+        try:
+            from screener.us_watchlist_manager import record_watch_entry
+            record_watch_entry(_sym, _price, source="trade")
+        except Exception:
+            pass
+
+    def _on_sell_complete(ek, e):
+        # on_sell_complete 는 종목·당일 기준 쿨다운/페널티(사실상 멱등). event_key
+        # 원장 gate 로 재전달·재시작 중복 방지.
+        from screener.us_watchlist_manager import on_sell_complete
+        on_sell_complete(_sym, _pnl_krw)
+
+    if ev.get("side") == "BUY":
+        _log(f"💠 [US체결] 매수 {_name}({_sym}) {_qty}주 @${_price:.2f}", "buy")
+        return {"trade_count": _trade_count, "watch_entry": _watch_entry}
+
+    _emoji = "💰" if _pnl_krw >= 0 else "🔴"
+    _log(f"{_emoji} [US체결] 매도 {_name}({_sym}) {_qty}주 @${_price:.2f} "
+         f"실현 ₩{_pnl_krw:+,.0f}", "sell")
+    fns = {"trade_count": _trade_count, "pnl_stats": _pnl_stats}
+    if ev.get("is_full"):
+        # 전량 청산: 워치리스트 성과훅(on_sell_complete) — 쿨다운/재진입 페널티 포함.
+        # (거래 재진입 24h/72h 차단은 매니저 outbox reentry_done 이 별도로 1회 보장)
+        fns["on_sell_complete"] = _on_sell_complete
+    return fns
+
+
 def _us_trading_loop():
     """
     미국 정규장(ET 09:30~16:00) 중 호출.
@@ -1414,46 +1464,16 @@ def _us_trading_loop():
                     f"filled={_us_poll['filled']} partial={_us_poll['partial']}",
                     "info",
                 )
-            # ★ 실체결 이벤트 처리 — 접수가 아니라 FILLED 시점에 거래집계/워치엔트리/
-            #   on_sell_complete 를 정확히 1회 구동한다. 처리 후 us_mark_app_done 으로
-            #   확정 → 재시작해도 미처리(app_done=0) 이벤트만 재전달되어 중복 없음.
+            # ★ 실체결 이벤트 처리 — 접수가 아니라 FILLED 시점에 거래집계/PnL집계/
+            #   watch-entry/on_sell_complete 를 effect 별 (event_key, effect_type)
+            #   영속 원장으로 정확히 1회 구동한다. 각 effect 함수는 event_key 를
+            #   받아 멱등하게 처리(중복 페널티/집계 방지). 모든 effect 완료 시에만
+            #   outbox app_done 확정 → 재시작해도 미완료 effect 만 이어서 처리.
             for _ev in _us_poll.get("fill_events", []):
-                _ek = _ev.get("event_key", "")
                 try:
-                    _sym = _ev.get("symbol", "")
-                    if _ev.get("side") == "BUY":
-                        _record_trade_pnl(pnl_usd=0.0, is_trade=True)
-                        try:
-                            from screener.us_watchlist_manager import record_watch_entry
-                            record_watch_entry(_sym, float(_ev.get("price", 0)), source="trade")
-                        except Exception:
-                            pass
-                        _log(
-                            f"💠 [US체결] 매수 {_ev.get('name', _sym)}({_sym}) "
-                            f"{_ev.get('qty',0)}주 @${float(_ev.get('price',0)):.2f}",
-                            "buy",
-                        )
-                    elif _ev.get("side") == "SELL":
-                        _pnl_krw = float(_ev.get("pnl_krw", 0))
-                        _record_trade_pnl(pnl_krw=_pnl_krw, is_trade=True)
-                        _emoji = "💰" if _pnl_krw >= 0 else "🔴"
-                        _log(
-                            f"{_emoji} [US체결] 매도 {_ev.get('name', _sym)}({_sym}) "
-                            f"{_ev.get('qty',0)}주 @${float(_ev.get('price',0)):.2f} "
-                            f"실현 ₩{_pnl_krw:+,.0f}",
-                            "sell",
-                        )
-                        # 전량 청산 체결 시에만 on_sell_complete (재진입/쿨다운 훅)
-                        if _ev.get("is_full"):
-                            try:
-                                from screener.us_watchlist_manager import on_sell_complete
-                                on_sell_complete(_sym, _pnl_krw)
-                            except Exception as _hook_err:
-                                _log(f"⚠️ [매도훅 오류] {_sym}: {_hook_err}", "error")
-                    # ★ 처리 완료 확정(영속) — 중복 실행 방지
-                    _us_strategy.us_mark_app_done(_ek)
+                    _fns = _build_us_effect_fns(_ev)
+                    _us_strategy.us_apply_app_effects(_ev, _fns)
                 except Exception as _ev_e:
-                    # 처리 실패 시 app_done 을 세우지 않음 → 다음 폴에서 재시도
                     _log(f"⚠️ [US체결이벤트 처리 오류] {_ev_e}", "error")
         except Exception as _ufp_e:
             _log(f"❌ [US FillPoll] 체결 폴링 오류: {_ufp_e}", "error")
