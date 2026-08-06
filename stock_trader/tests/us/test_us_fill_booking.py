@@ -17,7 +17,7 @@ import sys
 import shutil
 import tempfile
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -131,10 +131,10 @@ def crash_ledger_on(us, target_effect):
     강제종료 모사."""
     orig = us._us_app_ledger.mark
 
-    def failing(ek, et):
+    def failing(ek, et, day="", amount=0.0):
         if et == target_effect:
             raise RuntimeError(f"crash before mark {et}")
-        return orig(ek, et)
+        return orig(ek, et, day, amount)
     us._us_app_ledger.mark = failing
 
 
@@ -358,8 +358,9 @@ class TestUSOutbox(unittest.TestCase):
         self.assertFalse(us._us_has_active_order("TSLA", "BUY"))
 
 
-class TestUSAppEffects(unittest.TestCase):
-    """app 부수효과의 (event_key, effect_type) 영속 멱등 원장 — crash 안전성."""
+class TestUSAppEffectsLedger(unittest.TestCase):
+    """집계 effect(trade_count/pnl_stats) — effect 원장에서 결정론적 재구성.
+    인메모리 아님 → 재시작해도 동일값(위험통제 유지). 실제 SQLite 상태 검증."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -368,156 +369,229 @@ class TestUSAppEffects(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _restart(self, us_old):
-        """객체 폐기 → 동일 DB 로 새 매니저(재시작 재현). durable pos_mgr 유지."""
-        return make_us(self.db, pos_mgr=us_old.pos_mgr)
+    def _day(self, us, ev):
+        return ev.get("day", "") or ""
 
-    def test_A1_crash_after_trade_count_before_flag(self):
-        """거래집계 실행 후 flag 저장 전 종료 → 재시작 시 거래집계 1회."""
-        eff = DurableEffects()
+    def test_B1_trade_count_survives_restart(self):
         us1 = make_us(self.db)
         ev = seed_fill(us1, "BUY")
-        ek = ev["event_key"]
-        crash_ledger_on(us1, "trade_count")
-        fns = {"trade_count": eff.fn("trade_count"),
-               "watch_entry": eff.fn("watch_entry")}
-        with self.assertRaises(RuntimeError):
-            us1.us_apply_app_effects(ev, fns)
-        self.assertEqual(eff.applied_count(ek, "trade_count"), 1)
-        self.assertFalse(us1._us_app_ledger.done(ek, "trade_count"))
-        # 재시작
-        us2 = self._restart(us1)
-        ev2 = us2._us_pending_app_events()[0]
-        us2.us_apply_app_effects(ev2, {"trade_count": eff.fn("trade_count"),
-                                       "watch_entry": eff.fn("watch_entry")})
-        self.assertEqual(eff.applied_count(ek, "trade_count"), 1)   # 정확히 1회
-        self.assertEqual(eff.applied_count(ek, "watch_entry"), 1)
-        self.assertTrue(us2._us_app_ledger.done(ek, "trade_count"))
-        self.assertEqual(us2._us_outbox.get(ek)["app_done"], 1)
+        us1.us_apply_app_effects(ev, _build_fns(us1, ev))
+        day = self._day(us1, ev)
+        self.assertEqual(us1.us_today_trade_count(day), 1)
+        # 재시작: 객체 폐기, 동일 DB 새 매니저
+        us2 = make_us(self.db, pos_mgr=us1.pos_mgr)
+        self.assertEqual(us2.us_today_trade_count(day), 1)   # 0 아님, 재구성됨
 
-    def test_A2_crash_after_watch_entry_before_flag(self):
-        """watch-entry 실행 후 flag 저장 전 종료 → 재시작 시 watch-entry 1회."""
-        eff = DurableEffects()
+    def test_B2_pnl_survives_restart(self):
+        us1 = make_us(self.db)
+        # 매도 손실 −5000 (avg 100 → 95, 10주, fx 1000 → (95-100)*10*1000)
+        oid = "US_SELL_AAPL_1"
+        us1.pos_mgr.add(USPosition("AAPL", "Apple", "NASD", 10, 100.0))
+        us1._us_pending_sell_meta[oid] = {
+            "code": "AAPL", "name": "Apple", "excd": "NASD",
+            "reason": "손절", "qty": 10}
+        us1._us_apply_fill_delta(FakeLC(oid, "AAPL", 10, 95.0, "SELL", 10))
+        ev = us1._us_pending_app_events()[0]
+        us1.us_apply_app_effects(ev, _build_fns(us1, ev))
+        day = ev["day"]
+        self.assertEqual(us1.us_today_realized_krw(day), -50000.0)
+        us2 = make_us(self.db, pos_mgr=us1.pos_mgr)
+        self.assertEqual(us2.us_today_realized_krw(day), -50000.0)   # 동일 −X
+
+    def test_B3_redelivery_no_change(self):
+        us = make_us(self.db)
+        ev = seed_fill(us, "SELL")   # 익절 (110), pnl=+100000
+        day = ev["day"]
+        us.us_apply_app_effects(ev, _build_fns(us, ev))
+        us.us_apply_app_effects(ev, _build_fns(us, ev))   # 재전달
+        us.us_apply_app_effects(ev, _build_fns(us, ev))
+        self.assertEqual(us.us_today_trade_count(day), 1)         # 불변
+        self.assertEqual(us.us_today_realized_krw(day), 100000.0)  # 불변
+        # 실제 SQLite 행 UNIQUE 확인
+        import sqlite3
+        c = sqlite3.connect(self.db)
+        n = c.execute("SELECT COUNT(*) FROM us_app_effects "
+                      "WHERE event_key=? AND effect_type='trade_count'",
+                      (ev["event_key"],)).fetchone()[0]
+        c.close()
+        self.assertEqual(n, 1)
+
+    def test_B4_repeated_restarts_stable(self):
+        us = make_us(self.db)
+        ev = seed_fill(us, "SELL")
+        day = ev["day"]
+        us.us_apply_app_effects(ev, _build_fns(us, ev))
+        pos = us.pos_mgr
+        for _ in range(3):   # 재시작 반복 + 재전달
+            us = make_us(self.db, pos_mgr=pos)
+            for e in us._us_pending_app_events():
+                us.us_apply_app_effects(e, _build_fns(us, e))
+            self.assertEqual(us.us_today_trade_count(day), 1)
+            self.assertEqual(us.us_today_realized_krw(day), 100000.0)
+
+
+class TestUSExternalEffectIdempotency(unittest.TestCase):
+    """외부 effect(on_sell_complete/watch_entry) — 실제 JSON 영속 상태로 멱등 검증.
+    now() 아닌 결정론적 event_time + event_key 로 재실행에도 만료시각·집계 불변."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "us.db")
+        self.jdir = os.path.join(self.tmp, "json")
+        os.makedirs(self.jdir, exist_ok=True)
+        import screener.us_watchlist_manager as wm
+        self.wm = wm
+        self._patches = []
+        for name in ("WATCH_PERF_FILE", "DAILY_PROFIT_FILE", "PENALTY_FILE",
+                     "COOLDOWN_FILE", "RECENT_LOSS_FILE"):
+            p = patch.object(wm, name,
+                             os.path.join(self.jdir, name.lower() + ".json"))
+            p.start()
+            self._patches.append(p)
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _real_fns(self, ev):
+        """실제 us_watchlist_manager 함수를 external_fns 로 구성(app.py 와 동일)."""
+        wm = self.wm
+        _sym = ev["symbol"]; _price = ev["price"]
+        _pnl = ev["pnl_krw"]; _et = ev.get("event_time")
+
+        def _watch(ek, e):
+            wm.record_watch_entry(_sym, _price, source="trade",
+                                  entered_at=_et, event_key=ek)
+
+        def _osc(ek, e):
+            wm.on_sell_complete(_sym, _pnl, event_key=ek, event_time=_et)
+
+        if ev["side"] == "BUY":
+            return {"watch_entry": _watch}
+        return {"on_sell_complete": _osc} if ev.get("is_full") else {}
+
+    def test_C1_on_sell_complete_crash_before_mark_no_extension(self):
+        """on_sell_complete 실행 후 mark 전 종료 → 재시작 후 쿨다운 만료시각 불변,
+        중복 집계 없음(실제 JSON 검증)."""
+        us1 = make_us(self.db)
+        ev = seed_fill(us1, "SELL")   # 익절 → 쿨다운 등록
+        ek = ev["event_key"]
+        crash_ledger_on(us1, "on_sell_complete")
+        with self.assertRaises(RuntimeError):
+            us1.us_apply_app_effects(ev, self._real_fns(ev))
+        # on_sell_complete 는 실행됨(JSON 기록), ledger 미mark
+        cooldown1 = self.wm._load_json(self.wm.COOLDOWN_FILE)
+        perf1     = self.wm._load_json(self.wm.WATCH_PERF_FILE)
+        self.assertEqual(cooldown1.get("AAPL"), ev["event_time"])   # 결정론적 시각
+        self.assertEqual(perf1["AAPL"]["trade_count"], 1)
+        self.assertFalse(us1._us_app_ledger.done(ek, "on_sell_complete"))
+        # 재시작: 재전달 → on_sell_complete 재실행(같은 event_time/event_key)
+        us2 = make_us(self.db, pos_mgr=us1.pos_mgr)
+        e2 = us2._us_pending_app_events()[0]
+        us2.us_apply_app_effects(e2, self._real_fns(e2))
+        cooldown2 = self.wm._load_json(self.wm.COOLDOWN_FILE)
+        perf2     = self.wm._load_json(self.wm.WATCH_PERF_FILE)
+        self.assertEqual(cooldown2.get("AAPL"), ev["event_time"])   # 만료시각 불변(연장X)
+        self.assertEqual(perf2["AAPL"]["trade_count"], 1)           # 중복 집계 없음
+        self.assertTrue(us2._us_app_ledger.done(ek, "on_sell_complete"))
+
+    def test_C2_watch_entry_crash_before_mark_no_duplicate(self):
+        """watch_entry 실행 후 mark 전 종료 → 재시작 후 중복 항목 없음, 시각 불변."""
         us1 = make_us(self.db)
         ev = seed_fill(us1, "BUY")
         ek = ev["event_key"]
         crash_ledger_on(us1, "watch_entry")
-        fns = {"trade_count": eff.fn("trade_count"),
-               "watch_entry": eff.fn("watch_entry")}
         with self.assertRaises(RuntimeError):
-            us1.us_apply_app_effects(ev, fns)
-        # trade_count 는 완료(mark 됨), watch_entry 는 실행됐으나 flag 미저장
-        self.assertTrue(us1._us_app_ledger.done(ek, "trade_count"))
-        self.assertEqual(eff.applied_count(ek, "watch_entry"), 1)
-        self.assertFalse(us1._us_app_ledger.done(ek, "watch_entry"))
-        us2 = self._restart(us1)
-        us2.us_apply_app_effects(us2._us_pending_app_events()[0],
-                                 {"trade_count": eff.fn("trade_count"),
-                                  "watch_entry": eff.fn("watch_entry")})
-        self.assertEqual(eff.applied_count(ek, "trade_count"), 1)   # 재실행 안 됨
-        self.assertEqual(eff.applied_count(ek, "watch_entry"), 1)   # 정확히 1회
-        self.assertEqual(us2._us_outbox.get(ek)["app_done"], 1)
+            us1.us_apply_app_effects(ev, self._real_fns(ev))
+        perf1 = self.wm._load_json(self.wm.WATCH_PERF_FILE)
+        self.assertIn("AAPL", perf1)
+        self.assertEqual(perf1["AAPL"]["entered_at"], ev["event_time"])
+        # 재시작 재전달
+        us2 = make_us(self.db, pos_mgr=us1.pos_mgr)
+        e2 = us2._us_pending_app_events()[0]
+        us2.us_apply_app_effects(e2, self._real_fns(e2))
+        perf2 = self.wm._load_json(self.wm.WATCH_PERF_FILE)
+        self.assertEqual(list(perf2.keys()), ["AAPL"])              # 중복 항목 없음
+        self.assertEqual(perf2["AAPL"]["entered_at"], ev["event_time"])  # 시각 불변
+        self.assertTrue(us2._us_app_ledger.done(ek, "watch_entry"))
 
-    def test_A3_crash_after_on_sell_complete_before_flag(self):
-        """on_sell_complete 실행 후 flag 저장 전 종료 → 중복 페널티 없음(1회)."""
+    def test_C3_repeated_restart_external_stable(self):
+        """재시작을 반복해도 쿨다운/성과 JSON 최종 상태 동일."""
+        us = make_us(self.db)
+        ev = seed_fill(us, "SELL")
+        us.us_apply_app_effects(ev, self._real_fns(ev))
+        pos = us.pos_mgr
+        for _ in range(3):
+            us = make_us(self.db, pos_mgr=pos)
+            for e in us._us_pending_app_events():
+                us.us_apply_app_effects(e, self._real_fns(e))
+        cooldown = self.wm._load_json(self.wm.COOLDOWN_FILE)
+        perf     = self.wm._load_json(self.wm.WATCH_PERF_FILE)
+        self.assertEqual(cooldown.get("AAPL"), ev["event_time"])
+        self.assertEqual(perf["AAPL"]["trade_count"], 1)
+
+
+class TestUSAppDoneGating(unittest.TestCase):
+    """모든 effect 완료 후에만 app_done 확정 + effect 간 crash 재개."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "us.db")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_D1_crash_between_effects_resume(self):
+        """외부 effect 처리 중 종료 → 재시작 시 집계는 재실행 없이 외부만 이어서."""
         eff = DurableEffects()
         us1 = make_us(self.db)
-        ev = seed_fill(us1, "SELL")
+        ev = seed_fill(us1, "BUY")   # effects: trade_count(집계) + watch_entry(외부)
         ek = ev["event_key"]
-        self.assertTrue(ev["is_full"])
-        crash_ledger_on(us1, "on_sell_complete")
-        fns = {"trade_count": eff.fn("trade_count"),
-               "pnl_stats": eff.fn("pnl_stats"),
-               "on_sell_complete": eff.fn("on_sell_complete")}
-        with self.assertRaises(RuntimeError):
-            us1.us_apply_app_effects(ev, fns)
-        self.assertEqual(eff.applied_count(ek, "on_sell_complete"), 1)
-        self.assertFalse(us1._us_app_ledger.done(ek, "on_sell_complete"))
-        us2 = self._restart(us1)
-        us2.us_apply_app_effects(
-            us2._us_pending_app_events()[0],
-            {"trade_count": eff.fn("trade_count"),
-             "pnl_stats": eff.fn("pnl_stats"),
-             "on_sell_complete": eff.fn("on_sell_complete")})
-        self.assertEqual(eff.applied_count(ek, "on_sell_complete"), 1)  # 페널티 1회
-        self.assertEqual(eff.applied_count(ek, "trade_count"), 1)
-        self.assertEqual(eff.applied_count(ek, "pnl_stats"), 1)
-        self.assertEqual(us2._us_outbox.get(ek)["app_done"], 1)
+        day = ev["day"]
 
-    def test_A4_crash_between_effects(self):
-        """첫 effect 완료 후 두 번째 effect 처리 중 종료 → 첫 effect 재실행 안 함."""
-        eff = DurableEffects()
-        us1 = make_us(self.db)
-        ev = seed_fill(us1, "BUY")
-        ek = ev["event_key"]
-
-        # 두 번째 effect(watch_entry) 가 첫 시도에서 실패(=처리 중 종료)
         def failing_watch(ekey, evt):
             raise RuntimeError("crash during watch_entry")
-        us1.us_apply_app_effects(ev, {"trade_count": eff.fn("trade_count"),
-                                      "watch_entry": failing_watch})
-        # trade_count 완료, watch_entry 미완료, app_done 미확정
-        self.assertTrue(us1._us_app_ledger.done(ek, "trade_count"))
+        us1.us_apply_app_effects(ev, {"watch_entry": failing_watch})
+        self.assertEqual(us1.us_today_trade_count(day), 1)       # 집계는 완료
         self.assertFalse(us1._us_app_ledger.done(ek, "watch_entry"))
-        self.assertEqual(us1._us_outbox.get(ek)["app_done"], 0)
-        # 재시작: 미완료(watch_entry)만 이어서 처리, trade_count 재실행 안 함
-        us2 = self._restart(us1)
-        us2.us_apply_app_effects(us2._us_pending_app_events()[0],
-                                 {"trade_count": eff.fn("trade_count"),
-                                  "watch_entry": eff.fn("watch_entry")})
-        self.assertEqual(eff.applied_count(ek, "trade_count"), 1)   # 재실행 없음
+        self.assertEqual(us1._us_outbox.get(ek)["app_done"], 0)  # 미확정
+        # 재시작: watch_entry 만 이어서, 집계 재실행 없음(원장 UNIQUE)
+        us2 = make_us(self.db, pos_mgr=us1.pos_mgr)
+        e2 = us2._us_pending_app_events()[0]
+        us2.us_apply_app_effects(e2, {"watch_entry": eff.fn("watch_entry")})
+        self.assertEqual(us2.us_today_trade_count(day), 1)       # 불변
         self.assertEqual(eff.applied_count(ek, "watch_entry"), 1)
-        self.assertEqual(us2._us_outbox.get(ek)["app_done"], 1)
+        self.assertEqual(us2._us_outbox.get(ek)["app_done"], 1)  # 이제 확정
+        self.assertEqual(len(us2._us_pending_app_events()), 0)
 
-    def test_A5_crash_after_all_effects_before_app_done(self):
-        """모든 effect 완료 후 outbox app_done 저장 전 종료 → 재시작 시 재실행 없음."""
-        eff = DurableEffects()
+    def test_D2_all_effects_then_app_done_before_flag(self):
+        """모든 effect 완료 후 app_done 저장 전 종료 → 재시작 시 재실행 없이 확정."""
         us1 = make_us(self.db)
         ev = seed_fill(us1, "BUY")
         ek = ev["event_key"]
-        # app_done 저장 직전 강제종료 모사: set_flag(app_done) 를 no-op 으로
+        day = ev["day"]
         orig = us1._us_outbox.set_flag
 
         def skip_app_done(ekey, flag):
             if flag == "app_done":
-                return   # 저장 전 종료
+                return
             return orig(ekey, flag)
         us1._us_outbox.set_flag = skip_app_done
-        us1.us_apply_app_effects(ev, {"trade_count": eff.fn("trade_count"),
-                                      "watch_entry": eff.fn("watch_entry")})
-        self.assertTrue(us1._us_app_ledger.done(ek, "trade_count"))
-        self.assertTrue(us1._us_app_ledger.done(ek, "watch_entry"))
+        us1.us_apply_app_effects(ev, {"watch_entry": lambda a, b: None})
         self.assertEqual(us1._us_outbox.get(ek)["app_done"], 0)
-        # 재시작: 여전히 app_done=0 → 재전달되나 모든 effect done → fn 재실행 없이
-        #         app_done 확정
-        us2 = self._restart(us1)
-        pend = us2._us_pending_app_events()
-        self.assertEqual(len(pend), 1)
-        us2.us_apply_app_effects(pend[0], {"trade_count": eff.fn("trade_count"),
-                                           "watch_entry": eff.fn("watch_entry")})
-        self.assertEqual(eff.applied_count(ek, "trade_count"), 1)   # 재실행 없음
-        self.assertEqual(eff.applied_count(ek, "watch_entry"), 1)
+        us2 = make_us(self.db, pos_mgr=us1.pos_mgr)
+        us2.us_apply_app_effects(us2._us_pending_app_events()[0],
+                                 {"watch_entry": lambda a, b: None})
+        self.assertEqual(us2.us_today_trade_count(day), 1)       # 재집계 없음
         self.assertEqual(us2._us_outbox.get(ek)["app_done"], 1)
-        self.assertEqual(len(us2._us_pending_app_events()), 0)
 
-    def test_A6_same_event_redelivered_normal(self):
-        """정상 상태에서 동일 event 여러 번 재전달 → 각 effect 정확히 1회."""
-        eff = DurableEffects()
-        us = make_us(self.db)
-        ev = seed_fill(us, "SELL")
-        ek = ev["event_key"]
-        fns = lambda: {"trade_count": eff.fn("trade_count"),
-                       "pnl_stats": eff.fn("pnl_stats"),
-                       "on_sell_complete": eff.fn("on_sell_complete")}
-        us.us_apply_app_effects(ev, fns())
-        us.us_apply_app_effects(ev, fns())   # 재전달
-        us.us_apply_app_effects(ev, fns())
-        self.assertEqual(eff.applied_count(ek, "trade_count"), 1)
-        self.assertEqual(eff.applied_count(ek, "pnl_stats"), 1)
-        self.assertEqual(eff.applied_count(ek, "on_sell_complete"), 1)
-        self.assertEqual(us._us_outbox.get(ek)["app_done"], 1)
-        # 완료 후에는 pending 에서 빠짐
-        self.assertEqual(len(us._us_pending_app_events()), 0)
+
+def _build_fns(us, ev):
+    """집계 전용 event 는 external_fns 없이(watch/on_sell 은 no-op) 전달."""
+    if ev["side"] == "BUY":
+        return {"watch_entry": lambda a, b: None}
+    return {"on_sell_complete": (lambda a, b: None)} if ev.get("is_full") else {}
 
 
 if __name__ == "__main__":

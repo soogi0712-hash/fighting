@@ -1314,48 +1314,41 @@ def _us_realbalance_force_sell_check():
 
 
 def _build_us_effect_fns(ev: dict) -> dict:
-    """US 체결이벤트의 app 부수효과를 effect_type 별 idempotent 함수로 구성.
+    """US 체결이벤트의 '외부' 부수효과(watch_entry/on_sell_complete)를 event_key 로
+    멱등한 함수로 구성한다.
 
-    각 함수는 (event_key, event) 를 받는다. event_key 로 멱등 처리하는 것을 계약
-    으로 한다(us_apply_app_effects 가 (event_key, effect_type) 원장으로 gate). 매수는
-    거래집계·watch-entry, 매도는 거래집계·PnL집계, 전량청산이면 on_sell_complete·
-    reentry_penalty 를 각각 구분해 관리한다.
+    ★ 거래집계(trade_count)·PnL집계(pnl_stats)는 인메모리 카운터가 아니라
+      us_apply_app_effects 가 effect 원장에 (day, amount) 로 기록하고 COUNT/SUM 으로
+      매번 결정론적으로 재구성한다(재시작해도 동일값) → 여기서 다루지 않는다.
+    ★ 외부 effect 는 now() 가 아니라 event 의 결정론적 event_time 을 사용해,
+      실행 후 mark 전 crash 로 재실행돼도 쿨다운 만료시각·집계가 불변이도록 한다.
     """
     _sym   = ev.get("symbol", "")
     _name  = ev.get("name", _sym)
     _price = float(ev.get("price", 0) or 0)
     _pnl_krw = float(ev.get("pnl_krw", 0) or 0)
     _qty   = ev.get("qty", 0)
-
-    def _trade_count(ek, e):
-        # 당일 거래집계는 재시작 시 초기화되는 인메모리 카운터 →
-        # (event_key, trade_count) 원장 gate 로 재전달 중복 방지.
-        _record_trade_pnl(is_trade=True)
-
-    def _pnl_stats(ek, e):
-        _record_trade_pnl(pnl_krw=_pnl_krw, is_trade=False)
+    _etime = ev.get("event_time", "") or None
 
     def _watch_entry(ek, e):
-        try:
-            from screener.us_watchlist_manager import record_watch_entry
-            record_watch_entry(_sym, _price, source="trade")
-        except Exception:
-            pass
+        from screener.us_watchlist_manager import record_watch_entry
+        # entered_at=event_time(결정론적) + event_key 로 멱등
+        record_watch_entry(_sym, _price, source="trade",
+                           entered_at=_etime, event_key=ek)
 
     def _on_sell_complete(ek, e):
-        # on_sell_complete 는 종목·당일 기준 쿨다운/페널티(사실상 멱등). event_key
-        # 원장 gate 로 재전달·재시작 중복 방지.
         from screener.us_watchlist_manager import on_sell_complete
-        on_sell_complete(_sym, _pnl_krw)
+        # event_key(멱등) + event_time(쿨다운/페널티 만료 결정론적)
+        on_sell_complete(_sym, _pnl_krw, event_key=ek, event_time=_etime)
 
     if ev.get("side") == "BUY":
         _log(f"💠 [US체결] 매수 {_name}({_sym}) {_qty}주 @${_price:.2f}", "buy")
-        return {"trade_count": _trade_count, "watch_entry": _watch_entry}
+        return {"watch_entry": _watch_entry}
 
     _emoji = "💰" if _pnl_krw >= 0 else "🔴"
     _log(f"{_emoji} [US체결] 매도 {_name}({_sym}) {_qty}주 @${_price:.2f} "
          f"실현 ₩{_pnl_krw:+,.0f}", "sell")
-    fns = {"trade_count": _trade_count, "pnl_stats": _pnl_stats}
+    fns = {}
     if ev.get("is_full"):
         # 전량 청산: 워치리스트 성과훅(on_sell_complete) — 쿨다운/재진입 페널티 포함.
         # (거래 재진입 24h/72h 차단은 매니저 outbox reentry_done 이 별도로 1회 보장)
@@ -1469,12 +1462,25 @@ def _us_trading_loop():
             #   영속 원장으로 정확히 1회 구동한다. 각 effect 함수는 event_key 를
             #   받아 멱등하게 처리(중복 페널티/집계 방지). 모든 effect 완료 시에만
             #   outbox app_done 확정 → 재시작해도 미완료 effect 만 이어서 처리.
-            for _ev in _us_poll.get("fill_events", []):
+            _pend = _us_poll.get("fill_events", [])
+            for _ev in _pend:
                 try:
                     _fns = _build_us_effect_fns(_ev)
                     _us_strategy.us_apply_app_effects(_ev, _fns)
                 except Exception as _ev_e:
                     _log(f"⚠️ [US체결이벤트 처리 오류] {_ev_e}", "error")
+            # ★ 당일 US 거래건수·실현손익은 effect 원장에서 결정론적으로 재구성
+            #   (인메모리 아님 → 재시작해도 동일값, 위험통제 유지)
+            if _pend:
+                try:
+                    from datetime import date as _date
+                    _uday = _date.today().isoformat()
+                    _utc  = _us_strategy.us_today_trade_count(_uday)
+                    _upnl = _us_strategy.us_today_realized_krw(_uday)
+                    _log(f"📊 [US당일] 거래 {_utc}회 · 실현 ₩{_upnl:+,.0f} "
+                         f"(effect 원장 재구성)", "info")
+                except Exception:
+                    pass
         except Exception as _ufp_e:
             _log(f"❌ [US FillPoll] 체결 폴링 오류: {_ufp_e}", "error")
 
