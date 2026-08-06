@@ -80,7 +80,7 @@ class SellDecisionEngine:
     MIN_HOLD_MINUTES = 5
     GENERAL_STOP_LOSS_SCORE_THRESHOLD = SELL_SCORE_THRESHOLD
     TRAILING_STOP_PCT = -12.0
-    TRAILING_ACTIVATE_NET_PCT = 5.0
+    TRAILING_ACTIVATE_NET_PCT = 1.5
     MA20_EXIT_BUFFER = -1.0
 
     def evaluate(self, position: dict, score_result: dict, *, sell_score: int = 0) -> SellDecision:
