@@ -106,6 +106,7 @@ def _make_us_strategy_stub(tmp_dir: str):
         us._us_lifecycle_mgr     = None
         us._us_pending_buy_meta  = {}
         us._us_pending_sell_meta = {}
+        us._us_fill_events       = []
 
         db_path = os.path.join(tmp_dir, "us_journal.db")
         us._us_lifecycle_mgr = OrderLifecycleManager(db_path)

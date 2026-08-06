@@ -688,6 +688,9 @@ class USStrategyManager:
         self._us_fill_observer   = None
         self._us_pending_buy_meta: dict  = {}
         self._us_pending_sell_meta: dict = {}
+        # ★ 체결(FILLED) 시 app.py 측 부수효과(거래집계/워치엔트리/on_sell_complete)를
+        #   구동하기 위한 이벤트 큐. run_us_fill_poll() 반환에 실려 드레인된다.
+        self._us_fill_events: list = []
 
         if _US_LIFECYCLE_ENABLED:
             try:
@@ -727,52 +730,148 @@ class USStrategyManager:
     # ══════════════════════════════════════════════════════════
 
     def _us_handle_buy_filled(self, lc) -> None:
-        """US BUY FILLED 시 포지션 반영 (apply는 이미 _do_buy에서 즉시 수행됨).
+        """US BUY FILLED 시 포지션을 실제 체결가 기준으로 정확히 1회 반영한다.
 
-        US는 KR과 달리 매수 즉시 포지션을 add하는 구조이므로,
-        FILLED 콜백에서는 포지션 재확인/갱신만 수행한다.
+        ★ rt_cd=0(접수)에는 포지션을 만들지 않는다. 실제 FILLED 후 이 콜백에서만
+          pos_mgr.add/update 를 수행한다. full_fill(on_filled=updater) 경유로만
+          호출되며 lifecycle 멱등성 덕에 재실행/중복 체결에도 1회만 반영된다.
         """
         meta = self._us_pending_buy_meta.pop(lc.order_lifecycle_id, None)
         if meta is None:
             logger.warning(
-                "[US BUY FILLED] pending_buy_meta 없음 — 스킵: "
+                "[US BUY FILLED] pending_buy_meta 없음 — 포지션 반영 스킵: "
                 "order_lifecycle_id=%s code=%s",
                 lc.order_lifecycle_id, lc.code,
             )
             return
         symbol = lc.code
+        name   = meta.get("name", symbol)
+        excd   = meta.get("excd", "NASD")
+        level  = meta.get("level", 1)
         qty    = lc.filled_qty if lc.filled_qty > 0 else meta.get("qty", 0)
         price  = lc.avg_fill_price if lc.avg_fill_price else meta.get("price", 0.0)
+        if qty <= 0 or price <= 0:
+            logger.error(
+                "[US BUY FILLED] 수량/가격 이상 — 포지션 반영 스킵: "
+                "order_lifecycle_id=%s qty=%s price=%s",
+                lc.order_lifecycle_id, qty, price,
+            )
+            return
+
+        # ── 포지션 반영: 기존 있으면 가중평균 병합(추가매수), 없으면 신규 ──
+        existing = self.pos_mgr.positions.get(symbol)
+        if existing is not None:
+            new_qty = existing.qty + qty
+            new_avg = ((existing.avg_price * existing.qty + price * qty) / new_qty
+                       if new_qty > 0 else price)
+            self.pos_mgr.update(symbol, new_qty, new_avg,
+                                max(existing.current_level, level))
+            applied_qty, applied_avg = new_qty, new_avg
+        else:
+            pos = USPosition(symbol, name, excd, qty, price)
+            pos.current_level = level
+            pos.trade_id = meta.get("trade_id", "") or (getattr(lc, "trade_id", "") or "")
+            self.pos_mgr.add(pos)
+            applied_qty, applied_avg = qty, price
+
         logger.info(
-            "[US BUY FILLED] lifecycle 전이 완료: symbol=%s qty=%s @$%.2f "
-            "order_lifecycle_id=%s",
-            symbol, qty, price, lc.order_lifecycle_id,
+            "[US BUY FILLED] 포지션 반영 완료: symbol=%s +%s주 @$%.2f "
+            "(보유 %s주 평단 $%.2f) order_lifecycle_id=%s",
+            symbol, qty, price, applied_qty, applied_avg, lc.order_lifecycle_id,
         )
+        # app.py 측 부수효과(거래집계/워치엔트리)는 체결 이벤트로 전달
+        self._us_fill_events.append({
+            "side": "BUY", "symbol": symbol, "name": name,
+            "qty": qty, "price": price,
+        })
 
     def _us_handle_sell_filled(self, lc) -> None:
-        """US SELL FILLED 시 PnL 기록 및 재진입 차단 등록.
+        """US SELL FILLED 시 포지션 감소·삭제 + 실현손익 + 재진입차단을 1회 반영.
 
-        US는 _do_sell에서 즉시 pos_mgr.remove/update를 수행하므로,
-        FILLED 콜백에서는 PnL 기록 + 재진입 차단만 추가 수행한다.
+        ★ rt_cd=0(접수)에는 아무 것도 부킹하지 않는다. 실제 FILLED 후 이 콜백에서만
+          pos_mgr.remove/update, pnl_guard.record, reentry.record_sell 를 수행한다.
+          full_fill(on_filled=updater) 경유 멱등 → 중복 체결에도 1회만 반영.
         """
         meta = self._us_pending_sell_meta.pop(lc.order_lifecycle_id, None)
         if meta is None:
             logger.warning(
-                "[US SELL FILLED] pending_sell_meta 없음 — 스킵: "
+                "[US SELL FILLED] pending_sell_meta 없음 — 반영 스킵: "
                 "order_lifecycle_id=%s code=%s",
                 lc.order_lifecycle_id, lc.code,
             )
             return
         symbol  = lc.code
+        name    = meta.get("name", symbol)
+        reason  = meta.get("reason", "")
+        want_full = meta.get("is_full", True)
         qty     = lc.filled_qty if lc.filled_qty > 0 else meta.get("qty", 0)
         price   = lc.avg_fill_price if lc.avg_fill_price else meta.get("price", 0.0)
-        avg_p   = meta.get("avg_price", price)
+        pos     = self.pos_mgr.positions.get(symbol)
+        avg_p   = pos.avg_price if pos is not None else meta.get("avg_price", price)
+        if qty <= 0 or price <= 0:
+            logger.error(
+                "[US SELL FILLED] 수량/가격 이상 — 반영 스킵: "
+                "order_lifecycle_id=%s qty=%s price=%s",
+                lc.order_lifecycle_id, qty, price,
+            )
+            return
+
+        # ── 포지션 감소/삭제 (부분매도는 수량만 감소) ──
+        if pos is not None and not want_full and pos.qty > qty:
+            self.pos_mgr.update(symbol, pos.qty - qty, avg_p, pos.current_level)
+            sold_full = False
+        else:
+            if pos is not None:
+                self.pos_mgr.remove(symbol)
+            sold_full = True
+
+        # ── 실현손익 기록 (USD → KRW) ──
         pnl_usd = (price - avg_p) * qty
+        try:
+            fx = self.api.get_usd_exchange_rate() or 1350.0
+        except Exception:
+            fx = 1350.0
+        pnl_krw = pnl_usd * fx
+        self.pnl_guard.record(pnl_krw)
+
+        # ── 재진입 차단 등록 (전량 청산 시에만) ──
+        if sold_full:
+            _is_sl = _is_stoploss_reason(reason)
+            self.reentry.record_sell(
+                market="US", code=symbol, name=name,
+                reason=reason, is_stoploss=_is_sl,
+            )
+
+        pnl_st = self.pnl_guard.status_dict()
         logger.info(
-            "[US SELL FILLED] lifecycle 전이 완료: symbol=%s qty=%s @$%.2f "
-            "pnl_usd=$%.2f order_lifecycle_id=%s",
-            symbol, qty, price, pnl_usd, lc.order_lifecycle_id,
+            "[US SELL FILLED] 반영 완료: symbol=%s %s%s주 @$%.2f "
+            "실현 $%.2f (₩%.0f) 일일실현 ₩%.0f order_lifecycle_id=%s",
+            symbol, ("전량" if sold_full else "부분"), qty, price,
+            pnl_usd, pnl_krw, pnl_st["realized_pnl"], lc.order_lifecycle_id,
         )
+        self._us_fill_events.append({
+            "side": "SELL", "symbol": symbol, "name": name,
+            "qty": qty, "price": price,
+            "pnl_usd": pnl_usd, "is_full": sold_full,
+        })
+
+    def _us_has_active_order(self, symbol: str, side: str = None) -> bool:
+        """동일 종목(선택적으로 동일 방향)에 ACTIVE(접수/부분체결) US 주문이
+        있으면 True. 접수 시 pending meta 에 등록되고 FILLED 시 pop 되므로,
+        meta 존재 = 미체결 주문 존재. 중복 제출(이중 매수/매도) 차단용.
+        재시작 후에도 _us_restore_pending_meta 가 meta 를 복원한다.
+        """
+        _side = (side or "").upper()
+        metas = []
+        if _side in ("", "BUY"):
+            metas.append(self._us_pending_buy_meta)
+        if _side in ("", "SELL"):
+            metas.append(self._us_pending_sell_meta)
+        for m in metas:
+            for meta in m.values():
+                if meta.get("code") == symbol:
+                    return True
+        return False
 
     def _us_register_pending_order(
         self,
@@ -944,6 +1043,10 @@ class USStrategyManager:
                     lifecycle_id, exc,
                 )
 
+        # 체결 콜백이 쌓은 이벤트를 드레인해 app.py 측 부수효과 구동에 전달
+        fill_events = getattr(self, "_us_fill_events", [])
+        self._us_fill_events = []
+
         return {
             "total":     poll_result.get("total",     0),
             "filled":    poll_result.get("filled",    0),
@@ -951,6 +1054,7 @@ class USStrategyManager:
             "no_change": poll_result.get("no_change", 0),
             "errors":    poll_result.get("errors",    0),
             "dispatched": dispatched,
+            "fill_events": fill_events,
         }
 
     def _us_restore_pending_meta(self) -> None:
@@ -1998,6 +2102,15 @@ class USStrategyManager:
                 "session": sess.get("session", ""),
             }
 
+        # ── ★ in-flight 중복 매수 가드: 동일 종목 미체결 주문 존재 시 스킵 ──
+        if self._us_has_active_order(symbol, "BUY"):
+            logger.info("[US in-flight] %s 미체결 매수 주문 존재 → 중복 매수 스킵", symbol)
+            return {
+                "action":  "SKIP", "symbol": symbol, "name": name, "excd": excd,
+                "reason":  "미체결 매수 주문 존재 — 중복 매수 스킵(in-flight)",
+                "session": sess.get("session", ""),
+            }
+
         # ── 실제 USD 주문가능금액 기준 동적 수량 계산 ──────────
         # 매수 종목 기준 TTTS3007R 조회 → 정확한 ovrs_ord_psbl_amt 확보
         try:
@@ -2132,10 +2245,9 @@ class USStrategyManager:
                 return {"action": "BUY_FAIL", "symbol": symbol, "name": name,
                         "reason": str(e2), "session": sess["session"]}
 
-        pos = USPosition(symbol, name, excd, qty, cur_price)
-        self.pos_mgr.add(pos)
         # ── [US 훅 D] ORDER_ACCEPTED (접수 성공, 체결 미확인) ──
-        # ★ ORDER_FILLED 는 실체결 확인 훅에만 기록. rt_cd=0 은 접수이지 체결이 아님.
+        # ★ rt_cd=0 은 접수이지 체결이 아님 → 포지션을 만들지 않는다.
+        #   포지션 생성은 실체결 후 _us_handle_buy_filled 에서만 수행한다.
         if _US_JOURNAL_ENABLED and _us_trade_id:
             try:
                 _us_jnl.record_order_accepted(
@@ -2143,10 +2255,6 @@ class USStrategyManager:
                     rt_cd = result.get("rt_cd", "0"),
                     msg1  = result.get("msg1", "US매수접수성공_체결미확인"),
                 )
-                # trade_id를 포지션에 저장 (매도 연결용)
-                _us_pos_saved = self.pos_mgr.positions.get(symbol)
-                if _us_pos_saved and hasattr(_us_pos_saved, "trade_id"):
-                    _us_pos_saved.trade_id = _us_trade_id
             except Exception as _uje:
                 _us_jnl._inc_error("us_accepted", _uje)
         # ★ Phase 4: US BUY lifecycle 등록 + PendingRegistry 자동 연결
@@ -2164,6 +2272,7 @@ class USStrategyManager:
                 self._us_pending_buy_meta[_us_lc.order_lifecycle_id] = {
                     "code": symbol, "name": name, "qty": qty,
                     "price": cur_price, "avg_price": cur_price,
+                    "excd": excd, "level": 1,
                     "trade_id": _us_trade_id,
                     "reason": entry_reason,
                 }
@@ -2239,9 +2348,8 @@ class USStrategyManager:
                     _us_jnl._inc_error("us_add_rejected", _uje)
             return {"action": "BUY_FAIL", "symbol": symbol, "name": name,
                     "reason": result.get("msg1", "추가매수실패"), "session": sess["session"]}
-        new_qty = pos.qty + add_qty
-        new_avg = (pos.avg_price * pos.qty + cur_price * add_qty) / new_qty
-        self.pos_mgr.update(symbol, new_qty, new_avg, 2)
+        # ★ rt_cd=0 은 접수 — 포지션 수량/평단 갱신은 하지 않는다.
+        #   실체결 후 _us_handle_buy_filled 가 기존 포지션에 가중평균 병합한다.
         reason = (f"모멘텀추가매수: 수익{pos.net_pct(cur_price):+.1f}% "
                   f"vol{iv['vol_ratio']:.1f}x VWAP위 등락{iv['intraday_pct']:+.1f}%")
         # ── [US 훅 G] 추가매수 ORDER_ACCEPTED (접수, 체결 미확인) ──
@@ -2270,6 +2378,7 @@ class USStrategyManager:
                 self._us_pending_buy_meta[_us_add_lc.order_lifecycle_id] = {
                     "code": symbol, "name": name, "qty": add_qty,
                     "price": cur_price, "avg_price": cur_price,
+                    "excd": excd, "level": 2,
                     "trade_id": _us_add_trade_id,
                     "reason": reason,
                 }
@@ -2295,6 +2404,16 @@ class USStrategyManager:
 
     def _do_sell(self, symbol, name, excd, qty, cur_price, reason, sess,
                  is_partial: bool = False) -> dict:
+        # ── ★ in-flight 중복 매도 가드: 동일 종목 미체결 매도 존재 시 스킵 ──
+        #   apply(감소/삭제)는 FILLED 시점으로 미뤄지므로 포지션이 남아 있어도
+        #   여기서 재매도하면 이중 매도가 된다.
+        if self._us_has_active_order(symbol, "SELL"):
+            logger.info("[US in-flight] %s 미체결 매도 주문 존재 → 중복 매도 스킵", symbol)
+            return {
+                "action":  "HOLD", "symbol": symbol, "name": name, "excd": excd,
+                "reason":  "미체결 매도 주문 존재 — 중복 매도 스킵(in-flight)",
+                "session": sess.get("session", ""),
+            }
         # ── [US 훅 H] SELL_SIGNAL_CONFIRMED — 포지션에서 trade_id 조회 ──
         _us_sell_trade_id = ""
         if _US_JOURNAL_ENABLED:
@@ -2338,72 +2457,19 @@ class USStrategyManager:
                 except Exception as _uje:
                     _us_jnl._inc_error("us_sell_accepted", _uje)
 
-            pos     = self.pos_mgr.positions.get(symbol)
-            avg_p   = pos.avg_price if pos else cur_price
-            pnl_usd = (cur_price - avg_p) * qty
-            pnl_pct = (cur_price - avg_p) / avg_p * 100 if avg_p > 0 else 0.0
-
-            if is_partial and pos and pos.qty > qty:
-                # 부분 익절: 수량만 줄이고 포지션 유지
-                new_qty = pos.qty - qty
-                self.pos_mgr.update(symbol, new_qty, avg_p, pos.current_level)
-                action_tag = "SELL_PARTIAL"
-                logger.info(
-                    f"💰 US부분익절 {name}({symbol}) ${cur_price:.2f}×{qty}주"
-                    f"→ 잔여{new_qty}주 PnL ${pnl_usd:+.2f} ({pnl_pct:+.1f}%)\n"
-                    f"   매도사유: {reason}"
-                )
-                logger.info(
-                    f"[US SELL] 종목={name}({symbol}) | "
-                    f"매수가=${avg_p:.2f} | 매도가=${cur_price:.2f} | "
-                    f"수량={qty}주(부분) | "
-                    f"실현손익=${pnl_usd:+.2f}({pnl_pct:+.1f}%) | "
-                    f"매도사유={reason}"
-                )
-            else:
-                # 전량 매도
-                self.pos_mgr.remove(symbol)
-                action_tag = "SELL"
-                emoji = "💰" if pnl_usd >= 0 else "🔴"
-                logger.info(
-                    f"{emoji} US매도 {name}({symbol}) ${cur_price:.2f}×{qty}주 "
-                    f"PnL ${pnl_usd:+.2f} ({pnl_pct:+.1f}%)\n"
-                    f"   매도사유: {reason}"
-                )
-                logger.info(
-                    f"[US SELL] 종목={name}({symbol}) | "
-                    f"매수가=${avg_p:.2f} | 매도가=${cur_price:.2f} | "
-                    f"수량={qty}주(전량) | "
-                    f"실현손익=${pnl_usd:+.2f}({pnl_pct:+.1f}%) | "
-                    f"매도사유={reason}"
-                )
-
-            # ★ DailyPnLGuard에 실현 손익 기록 (USD → KRW 환산)
-            try:
-                fx = self.api.get_usd_exchange_rate() or 1350.0
-            except Exception:
-                fx = 1350.0
-            pnl_krw = pnl_usd * fx
-            self.pnl_guard.record(pnl_krw)
-            pnl_st = self.pnl_guard.status_dict()
+            # ★ rt_cd=0 은 접수 — 포지션 감소/삭제·실현손익·재진입은 하지 않는다.
+            #   실체결 후 _us_handle_sell_filled 에서만 정확히 1회 반영한다.
+            pos         = self.pos_mgr.positions.get(symbol)
+            avg_p       = pos.avg_price if pos else cur_price
+            est_pnl_usd = (cur_price - avg_p) * qty
+            est_pnl_pct = (cur_price - avg_p) / avg_p * 100 if avg_p > 0 else 0.0
+            action_tag  = "SELL_ACCEPTED"
             logger.info(
-                f"[미국장 PnL] 💱 ${pnl_usd:+.2f} × {fx:.0f} = {pnl_krw:+,.0f}원 | "
-                f"일일실현={pnl_st['realized_pnl']:+,.0f}원 | "
-                f"최고={pnl_st['peak_pnl']:+,.0f}원 | "
-                f"상태={pnl_st['state']}"
+                "[US SELL ACCEPTED] %s(%s) $%.2f×%s주 접수 — 체결 대기 "
+                "(%s, 예상손익 $%+.2f) 사유=%s",
+                name, symbol, cur_price, qty,
+                ("전량" if not is_partial else "부분"), est_pnl_usd, reason,
             )
-
-            # ── ★ 재진입 차단 등록 (SELL 체결 완료 직후) ──────
-            # 부분 익절은 포지션 유지이므로 전량 매도일 때만 등록
-            if action_tag == "SELL":
-                _is_sl = _is_stoploss_reason(reason)
-                self.reentry.record_sell(
-                    market     = "US",
-                    code       = symbol,
-                    name       = name,
-                    reason     = reason,
-                    is_stoploss= _is_sl,
-                )
 
             # ── [US 훅 K] SELL lifecycle + PendingRegistry (Phase 4 US Pipeline) ──
             # ★ rt_cd=0 은 접수 성공. SELL lifecycle을 ACCEPTED로 등록하고
@@ -2450,12 +2516,9 @@ class USStrategyManager:
                 "action":      action_tag,
                 "symbol":      symbol, "name": name, "excd": excd,
                 "price":       cur_price, "qty": qty,
-                "pnl_usd":     round(pnl_usd, 2), "pnl_pct": round(pnl_pct, 2),
-                "pnl_krw":     round(pnl_krw, 0),
+                "est_pnl_usd": round(est_pnl_usd, 2),
+                "est_pnl_pct": round(est_pnl_pct, 2),
                 "reason":      reason, "session": sess["session"], "currency": "USD",
-                "realized_pnl": pnl_st["realized_pnl"],
-                "peak_pnl":    pnl_st["peak_pnl"],
-                "pnl_state":   pnl_st["state"],
             }
         # ★ 매도 실패 시 — '가능수량보다 큽니다' 오류 = KIS에 실제 잔고 없음
         # → 유령 포지션으로 판단하고 봇 포지션에서도 제거
@@ -2483,7 +2546,7 @@ class USStrategyManager:
     def _buy_result(self, symbol, name, excd, price, qty, level,
                     sess, iv, entry_reason, tag) -> dict:
         return {
-            "action":       "BUY",
+            "action":       "BUY_ACCEPTED",
             "symbol":       symbol, "name": name, "excd": excd,
             "price":        price,  "qty": qty,
             "amount_usd":   round(price * qty, 2),
