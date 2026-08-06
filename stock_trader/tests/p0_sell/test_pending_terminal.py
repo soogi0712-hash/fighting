@@ -46,24 +46,24 @@ class PendingTerminalTest(unittest.TestCase):
 
     # ── CANCELLED / REJECTED / EXPIRED ───────────────────────────────────
     def test_mark_cancelled(self):
-        self.reg.register("KR", "t1", "005930", "SELL", 7, self._now())
+        self.reg.register("KR", "t1", "005930", "SELL", 7, self._now(), odno="OD0000001")
         self.assertTrue(self.reg.mark_terminal("t1", PendingStatus.CANCELLED))
         self.assertFalse(self.reg.has_active_sell("KR", "005930"))
 
     def test_mark_rejected(self):
-        self.reg.register("KR", "t2", "005930", "BUY", 7, self._now())
+        self.reg.register("KR", "t2", "005930", "BUY", 7, self._now(), odno="OD0000002")
         self.assertTrue(self.reg.mark_terminal("t2", PendingStatus.REJECTED))
         self.assertFalse(self.reg.has_active_order("KR", "005930", "BUY"))
 
     def test_mark_expired(self):
-        self.reg.register("KR", "t3", "005930", "SELL", 7, self._now())
+        self.reg.register("KR", "t3", "005930", "SELL", 7, self._now(), odno="OD0000003")
         self.assertTrue(self.reg.mark_terminal("t3", PendingStatus.EXPIRED,
                                                reason="stale"))
         self.assertFalse(self.reg.has_active_sell("KR", "005930"))
 
     # ── FILLED 는 절대 단말로 덮어쓰지 않음(회계 보호) ────────────────────
     def test_filled_not_overwritten(self):
-        self.reg.register("KR", "t4", "005930", "SELL", 7, self._now())
+        self.reg.register("KR", "t4", "005930", "SELL", 7, self._now(), odno="OD0000004")
         self.reg.update_fill("t4", 7, PendingStatus.FILLED)
         # 이미 FILLED → mark_terminal no-op(False)
         self.assertFalse(self.reg.mark_terminal("t4", PendingStatus.EXPIRED))
@@ -72,12 +72,12 @@ class PendingTerminalTest(unittest.TestCase):
 
     # ── idempotent: 두 번째 mark_terminal 은 no-op ───────────────────────
     def test_mark_terminal_idempotent(self):
-        self.reg.register("KR", "t5", "005930", "SELL", 7, self._now())
+        self.reg.register("KR", "t5", "005930", "SELL", 7, self._now(), odno="OD0000005")
         self.assertTrue(self.reg.mark_terminal("t5", PendingStatus.EXPIRED))
         self.assertFalse(self.reg.mark_terminal("t5", PendingStatus.EXPIRED))
 
     def test_invalid_terminal_status_raises(self):
-        self.reg.register("KR", "t6", "005930", "SELL", 7, self._now())
+        self.reg.register("KR", "t6", "005930", "SELL", 7, self._now(), odno="OD0000006")
         with self.assertRaises(ValueError):
             self.reg.mark_terminal("t6", PendingStatus.FILLED)
 
@@ -85,8 +85,8 @@ class PendingTerminalTest(unittest.TestCase):
     def test_stale_detection(self):
         old = (datetime.now() - timedelta(minutes=10)).isoformat()
         fresh = datetime.now().isoformat()
-        self.reg.register("KR", "old1", "005930", "SELL", 7, old)
-        self.reg.register("KR", "new1", "000660", "SELL", 3, fresh)
+        self.reg.register("KR", "old1", "005930", "SELL", 7, old, odno="OD0000007")
+        self.reg.register("KR", "new1", "000660", "SELL", 3, fresh, odno="OD0000008")
         stale = self.reg.get_stale_trackable(max_age_sec=300)
         ids = {r["trade_id"] for r in stale}
         self.assertIn("old1", ids)
@@ -94,7 +94,7 @@ class PendingTerminalTest(unittest.TestCase):
 
     def test_stale_excludes_terminal(self):
         old = (datetime.now() - timedelta(minutes=10)).isoformat()
-        self.reg.register("KR", "old2", "005930", "SELL", 7, old)
+        self.reg.register("KR", "old2", "005930", "SELL", 7, old, odno="OD0000009")
         self.reg.mark_terminal("old2", PendingStatus.EXPIRED)
         self.assertEqual(self.reg.get_stale_trackable(300), [])
 

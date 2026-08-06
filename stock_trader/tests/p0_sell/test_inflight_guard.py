@@ -45,34 +45,34 @@ class InflightGuardTest(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_accepted_sell_is_active(self):
-        self.reg.register("KR", "t1", "005930", "SELL", 7, TS)
+        self.reg.register("KR", "t1", "005930", "SELL", 7, TS, odno="OD0000001")
         self.assertTrue(self.reg.has_active_sell("KR", "005930"))
 
     def test_partially_filled_sell_is_active(self):
-        self.reg.register("KR", "t1", "005930", "SELL", 7, TS)
+        self.reg.register("KR", "t1", "005930", "SELL", 7, TS, odno="OD0000002")
         self.reg.update_fill("t1", 3, PendingStatus.PARTIALLY_FILLED)
         self.assertTrue(self.reg.has_active_sell("KR", "005930"))
 
     def test_filled_sell_not_active(self):
-        self.reg.register("KR", "t1", "005930", "SELL", 7, TS)
+        self.reg.register("KR", "t1", "005930", "SELL", 7, TS, odno="OD0000003")
         self.reg.update_fill("t1", 7, PendingStatus.FILLED)
         self.assertFalse(self.reg.has_active_sell("KR", "005930"))
 
     def test_cancelled_sell_not_active(self):
-        self.reg.register("KR", "t1", "005930", "SELL", 7, TS)
+        self.reg.register("KR", "t1", "005930", "SELL", 7, TS, odno="OD0000004")
         self.reg.update_fill("t1", 0, PendingStatus.CANCELLED)
         self.assertFalse(self.reg.has_active_sell("KR", "005930"))
 
     def test_buy_not_counted_as_active_sell(self):
-        self.reg.register("KR", "t1", "005930", "BUY", 7, TS)
+        self.reg.register("KR", "t1", "005930", "BUY", 7, TS, odno="OD0000005")
         self.assertFalse(self.reg.has_active_sell("KR", "005930"))
 
     def test_other_code_isolated(self):
-        self.reg.register("KR", "t1", "005930", "SELL", 7, TS)
+        self.reg.register("KR", "t1", "005930", "SELL", 7, TS, odno="OD0000006")
         self.assertFalse(self.reg.has_active_sell("KR", "000660"))
 
     def test_other_market_isolated(self):
-        self.reg.register("US", "t1", "TSLA", "SELL", 7, TS)
+        self.reg.register("US", "t1", "TSLA", "SELL", 7, TS, odno="OD0000007")
         self.assertFalse(self.reg.has_active_sell("KR", "TSLA"))
         self.assertTrue(self.reg.has_active_sell("US", "TSLA"))
 
