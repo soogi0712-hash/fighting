@@ -1371,41 +1371,29 @@ def _us_trading_loop():
             _us_last_signals[symbol] = result
             action = result.get("action", "HOLD")
 
-            if action == "BUY":
+            # ★ rt_cd=0 은 접수(ACCEPTED)이지 체결이 아니다. 거래집계·워치엔트리·
+            #   실현손익·on_sell_complete 는 실체결(run_us_fill_poll fill_events)에서만
+            #   1회 처리한다. 접수 시점에는 로그만 남긴다.
+            if action == "BUY_ACCEPTED":
                 buy_price = float(result.get("price", 0))
                 _log(
-                    f"🟢 [US매수] {name}({symbol}) "
-                    f"${buy_price:.2f} × {result['qty']}주 "
-                    f"≈ ${result.get('amount_usd',0):.0f}",
+                    f"🟢 [US매수접수] {name}({symbol}) "
+                    f"${buy_price:.2f} × {result.get('qty',0)}주 "
+                    f"≈ ${result.get('amount_usd',0):.0f} — 체결 대기",
                     "buy"
                 )
-                # ★ 거래 횟수 카운트 (매수)
-                _record_trade_pnl(pnl_usd=0.0, is_trade=True)
-                # ★ v3: 매수 진입 시각 기록 (48h 성과 추적용)
-                try:
-                    from screener.us_watchlist_manager import record_watch_entry
-                    record_watch_entry(symbol, buy_price, source="trade")
-                except Exception:
-                    pass
             elif action == "BUY_FAIL":
                 _log(f"❌ [US BUY_FAIL] {name}({symbol}) — {result.get('reason','')}", "error")
-            elif action == "SELL":
-                pnl_usd_val = float(result.get("pnl_usd", 0))
-                pnl_pct_val = float(result.get("pnl_pct", 0))
-                emoji = "💰" if pnl_usd_val >= 0 else "🔴"
+            elif action == "SELL_ACCEPTED":
+                est = float(result.get("est_pnl_usd", 0))
                 _log(
-                    f"{emoji} [US매도] {name}({symbol}) "
-                    f"손익 ${pnl_usd_val:+.2f} ({pnl_pct_val:+.1f}%)",
+                    f"📤 [US매도접수] {name}({symbol}) "
+                    f"${float(result.get('price',0)):.2f} × {result.get('qty',0)}주 "
+                    f"— 체결 대기 (예상 ${est:+.2f})",
                     "sell"
                 )
-                # ★ 당일 미국 수익 누적
-                _record_trade_pnl(pnl_usd=pnl_usd_val, is_trade=True)
-                # ★ v3 통합 훅: on_sell_complete (익절→당일재진입금지+24h쿨다운 / 손절→7일페널티+3일손실기록)
-                try:
-                    from screener.us_watchlist_manager import on_sell_complete
-                    on_sell_complete(symbol, pnl_usd_val)
-                except Exception as _hook_err:
-                    _log(f"⚠️ [매도훅 오류] {symbol}: {_hook_err}", "error")
+            elif action == "SELL_FAIL":
+                _log(f"❌ [US SELL_FAIL] {name}({symbol}) — {result.get('reason','')}", "error")
             # HOLD/SKIP 은 로그 미출력 (노이즈 방지)
         except Exception as e:
             _log(f"❌ [US] {name}({symbol}) 오류: {e}", "error")
@@ -1424,6 +1412,42 @@ def _us_trading_loop():
                     f"filled={_us_poll['filled']} partial={_us_poll['partial']}",
                     "info",
                 )
+            # ★ 실체결 이벤트 처리 — 접수가 아니라 FILLED 시점에 거래집계/워치엔트리/
+            #   on_sell_complete 를 정확히 1회 구동한다.
+            for _ev in _us_poll.get("fill_events", []):
+                try:
+                    _sym = _ev.get("symbol", "")
+                    if _ev.get("side") == "BUY":
+                        _record_trade_pnl(pnl_usd=0.0, is_trade=True)
+                        try:
+                            from screener.us_watchlist_manager import record_watch_entry
+                            record_watch_entry(_sym, float(_ev.get("price", 0)), source="trade")
+                        except Exception:
+                            pass
+                        _log(
+                            f"💠 [US체결] 매수 {_ev.get('name', _sym)}({_sym}) "
+                            f"{_ev.get('qty',0)}주 @${float(_ev.get('price',0)):.2f}",
+                            "buy",
+                        )
+                    elif _ev.get("side") == "SELL":
+                        _pnl = float(_ev.get("pnl_usd", 0))
+                        _record_trade_pnl(pnl_usd=_pnl, is_trade=True)
+                        _emoji = "💰" if _pnl >= 0 else "🔴"
+                        _log(
+                            f"{_emoji} [US체결] 매도 {_ev.get('name', _sym)}({_sym}) "
+                            f"{_ev.get('qty',0)}주 @${float(_ev.get('price',0)):.2f} "
+                            f"실현 ${_pnl:+.2f}",
+                            "sell",
+                        )
+                        # 전량 청산 체결 시에만 on_sell_complete (재진입/쿨다운 훅)
+                        if _ev.get("is_full"):
+                            try:
+                                from screener.us_watchlist_manager import on_sell_complete
+                                on_sell_complete(_sym, _pnl)
+                            except Exception as _hook_err:
+                                _log(f"⚠️ [매도훅 오류] {_sym}: {_hook_err}", "error")
+                except Exception as _ev_e:
+                    _log(f"⚠️ [US체결이벤트 처리 오류] {_ev_e}", "error")
         except Exception as _ufp_e:
             _log(f"❌ [US FillPoll] 체결 폴링 오류: {_ufp_e}", "error")
 
