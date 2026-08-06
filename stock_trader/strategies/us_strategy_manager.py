@@ -625,6 +625,83 @@ class USPositionManager:
 
 
 # ════════════════════════════════════════════════════════════
+# ── 주문별 반영(부킹) 완료 누적 체결 워터마크 영속화
+# ════════════════════════════════════════════════════════════
+
+class _USAppliedFillStore:
+    """주문(order_lifecycle_id)별로 '이미 포지션/손익에 반영(부킹)한' 누적 체결
+    수량과 누적 원가를 영속화한다.
+
+    delta = cumulative_filled_qty - applied_qty 만 반영하므로, 부분체결 누적·
+    중복 폴링·프로세스 재시작 후 재조회에서도 이중부킹이 발생하지 않는다.
+    반영 성공 후에만 applied 를 원자적으로 UPSERT 한다.
+    """
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._init_db()
+
+    def _conn(self):
+        import sqlite3
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+
+    def _init_db(self):
+        try:
+            with self._conn() as c:
+                c.execute("""
+                    CREATE TABLE IF NOT EXISTS us_applied_fills (
+                        order_lifecycle_id TEXT PRIMARY KEY,
+                        applied_qty        INTEGER NOT NULL DEFAULT 0,
+                        applied_cost       REAL    NOT NULL DEFAULT 0,
+                        updated_at         TEXT
+                    )
+                """)
+        except Exception as exc:
+            logger.warning("[US AppliedStore] 초기화 실패: %s", exc)
+
+    def get(self, oid: str):
+        """→ (applied_qty:int, applied_cost:float). 없으면 (0, 0.0)."""
+        try:
+            with self._conn() as c:
+                row = c.execute(
+                    "SELECT applied_qty, applied_cost FROM us_applied_fills "
+                    "WHERE order_lifecycle_id=?", (oid,),
+                ).fetchone()
+            if row:
+                return int(row[0] or 0), float(row[1] or 0.0)
+        except Exception as exc:
+            logger.warning("[US AppliedStore] get 실패: oid=%s error=%s", oid, exc)
+        return 0, 0.0
+
+    def set(self, oid: str, applied_qty: int, applied_cost: float):
+        """반영 성공 후 원자적 UPSERT (실패 시 예외 전파 → 호출자가 보상)."""
+        from datetime import datetime as _dt
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT INTO us_applied_fills
+                    (order_lifecycle_id, applied_qty, applied_cost, updated_at)
+                VALUES (?,?,?,?)
+                ON CONFLICT(order_lifecycle_id) DO UPDATE SET
+                    applied_qty  = excluded.applied_qty,
+                    applied_cost = excluded.applied_cost,
+                    updated_at   = excluded.updated_at
+                """,
+                (oid, int(applied_qty), float(applied_cost), _dt.now().isoformat()),
+            )
+
+    def clear(self, oid: str):
+        try:
+            with self._conn() as c:
+                c.execute("DELETE FROM us_applied_fills WHERE order_lifecycle_id=?",
+                          (oid,))
+        except Exception:
+            pass
+
+
+# ════════════════════════════════════════════════════════════
 # ── 전략 매니저
 # ════════════════════════════════════════════════════════════
 
@@ -684,6 +761,7 @@ class USStrategyManager:
         # ── Phase 4: OrderLifecycle + FillObserver (US Pipeline) ──────
         self._us_lifecycle_mgr   = None
         self._us_updater         = None
+        self._us_applied_store   = None
         self._us_pending_registry = None
         self._us_fill_observer   = None
         self._us_pending_buy_meta: dict  = {}
@@ -698,15 +776,13 @@ class USStrategyManager:
                     os.path.dirname(__file__), "..", "data", "trading_journal.db"
                 )
                 self._us_lifecycle_mgr = OrderLifecycleManager(_jnl_db)
-                self._us_updater = ExecutionDrivenPositionUpdater(
-                    on_buy_filled  = self._us_handle_buy_filled,
-                    on_sell_filled = self._us_handle_sell_filled,
-                )
+                # ★ 부분체결 delta 부킹용 applied 워터마크 영속화
+                self._us_applied_store = _USAppliedFillStore(_jnl_db)
                 logger.info("[US Lifecycle] OrderLifecycleManager 초기화 완료")
             except Exception as _us_le:
                 logger.warning(f"[US Lifecycle] 초기화 실패: {_us_le}")
                 self._us_lifecycle_mgr = None
-                self._us_updater       = None
+                self._us_applied_store = None
 
         if _US_FILL_OBSERVER_ENABLED:
             try:
@@ -729,104 +805,134 @@ class USStrategyManager:
     # Phase 4: US Pipeline — lifecycle 콜백 + PendingRegistry
     # ══════════════════════════════════════════════════════════
 
-    def _us_handle_buy_filled(self, lc) -> None:
-        """US BUY FILLED 시 포지션을 실제 체결가 기준으로 정확히 1회 반영한다.
+    def _us_apply_fill_delta(self, lc) -> None:
+        """부분/전량 체결 공통 — 신규 체결분(delta)만 포지션·손익에 반영한다.
 
-        ★ rt_cd=0(접수)에는 포지션을 만들지 않는다. 실제 FILLED 후 이 콜백에서만
-          pos_mgr.add/update 를 수행한다. full_fill(on_filled=updater) 경유로만
-          호출되며 lifecycle 멱등성 덕에 재실행/중복 체결에도 1회만 반영된다.
+        delta      = cumulative_filled_qty(lc.filled_qty) − applied_qty(영속)
+        delta_avg  = (누적원가 − applied원가) / delta   ← 단계별 평균체결가
+        - delta ≤ 0 이면 아무 것도 반영하지 않는다(중복 폴링·재시작 재조회 안전).
+        - 반영(부킹) 성공 후에만 applied 를 원자적으로 저장한다.
+        - applied 저장 실패 시 방금 반영분을 되돌려(보상) 이중부킹을 방지한다.
+        - 재진입 등록·체결이벤트 등 부수효과는 저장 커밋 확정 후에만 수행한다.
         """
-        meta = self._us_pending_buy_meta.pop(lc.order_lifecycle_id, None)
-        if meta is None:
-            logger.warning(
-                "[US BUY FILLED] pending_buy_meta 없음 — 포지션 반영 스킵: "
-                "order_lifecycle_id=%s code=%s",
-                lc.order_lifecycle_id, lc.code,
-            )
+        if getattr(self, "_us_applied_store", None) is None:
             return
+        oid  = lc.order_lifecycle_id
+        side = (getattr(lc, "side", "") or "").upper()
+        cum_qty = int(lc.filled_qty or 0)
+        cum_avg = float(lc.avg_fill_price or 0.0)
+        if cum_qty <= 0 or cum_avg <= 0:
+            return
+
+        applied_qty, applied_cost = self._us_applied_store.get(oid)
+        delta = cum_qty - applied_qty
+        if delta <= 0:
+            return   # 신규 체결분 없음 → 이중부킹 방지
+
+        cum_cost   = cum_qty * cum_avg
+        delta_cost = cum_cost - applied_cost
+        delta_avg  = (delta_cost / delta) if delta > 0 else cum_avg
+        if delta_avg <= 0:
+            delta_avg = cum_avg
+
+        booked = (self._us_book_buy_delta if side == "BUY"
+                  else self._us_book_sell_delta)(lc, delta, delta_avg)
+        if booked is None:
+            return   # 반영 대상 없음(포지션 부재 등)
+        undo, on_commit = booked
+
+        # ── 반영 성공 후에만 applied 원자적 저장. 실패 시 보상(되돌림) ──
+        try:
+            self._us_applied_store.set(oid, cum_qty, cum_cost)
+        except Exception as exc:
+            logger.error(
+                "[US applied 저장 실패] 반영분 되돌림(보상): oid=%s error=%s", oid, exc)
+            try:
+                undo()
+            except Exception as uexc:
+                logger.critical(
+                    "[US applied 보상 실패] 수동 정합 필요: oid=%s error=%s", oid, uexc)
+            return
+
+        # ── 커밋 확정 후 부수효과(체결이벤트/재진입) ──
+        if on_commit is not None:
+            try:
+                on_commit()
+            except Exception as cexc:
+                logger.error("[US fill on_commit 오류] oid=%s error=%s", oid, cexc)
+
+        # ── 주문 완전 종료(누적 == 주문수량) 시 meta 정리 ──
+        if cum_qty >= int(getattr(lc, "order_qty", 0) or 0):
+            (self._us_pending_buy_meta if side == "BUY"
+             else self._us_pending_sell_meta).pop(oid, None)
+
+    def _us_book_buy_delta(self, lc, delta, delta_avg):
+        """BUY delta 를 포지션에 가중평균 병합. (undo, on_commit) 반환."""
+        oid    = lc.order_lifecycle_id
         symbol = lc.code
+        meta   = self._us_pending_buy_meta.get(oid, {})
         name   = meta.get("name", symbol)
         excd   = meta.get("excd", "NASD")
         level  = meta.get("level", 1)
-        qty    = lc.filled_qty if lc.filled_qty > 0 else meta.get("qty", 0)
-        price  = lc.avg_fill_price if lc.avg_fill_price else meta.get("price", 0.0)
-        if qty <= 0 or price <= 0:
-            logger.error(
-                "[US BUY FILLED] 수량/가격 이상 — 포지션 반영 스킵: "
-                "order_lifecycle_id=%s qty=%s price=%s",
-                lc.order_lifecycle_id, qty, price,
-            )
-            return
 
-        # ── 포지션 반영: 기존 있으면 가중평균 병합(추가매수), 없으면 신규 ──
         existing = self.pos_mgr.positions.get(symbol)
         if existing is not None:
-            new_qty = existing.qty + qty
-            new_avg = ((existing.avg_price * existing.qty + price * qty) / new_qty
-                       if new_qty > 0 else price)
-            self.pos_mgr.update(symbol, new_qty, new_avg,
-                                max(existing.current_level, level))
-            applied_qty, applied_avg = new_qty, new_avg
+            prev_qty, prev_avg, prev_lvl = (
+                existing.qty, existing.avg_price, existing.current_level)
+            new_qty = prev_qty + delta
+            new_avg = ((prev_qty * prev_avg + delta * delta_avg) / new_qty
+                       if new_qty > 0 else delta_avg)
+            self.pos_mgr.update(symbol, new_qty, new_avg, max(prev_lvl, level))
+
+            def _undo():
+                self.pos_mgr.update(symbol, prev_qty, prev_avg, prev_lvl)
         else:
-            pos = USPosition(symbol, name, excd, qty, price)
+            pos = USPosition(symbol, name, excd, delta, delta_avg)
             pos.current_level = level
             pos.trade_id = meta.get("trade_id", "") or (getattr(lc, "trade_id", "") or "")
             self.pos_mgr.add(pos)
-            applied_qty, applied_avg = qty, price
+
+            def _undo():
+                self.pos_mgr.remove(symbol)
 
         logger.info(
-            "[US BUY FILLED] 포지션 반영 완료: symbol=%s +%s주 @$%.2f "
-            "(보유 %s주 평단 $%.2f) order_lifecycle_id=%s",
-            symbol, qty, price, applied_qty, applied_avg, lc.order_lifecycle_id,
-        )
-        # app.py 측 부수효과(거래집계/워치엔트리)는 체결 이벤트로 전달
-        self._us_fill_events.append({
-            "side": "BUY", "symbol": symbol, "name": name,
-            "qty": qty, "price": price,
-        })
+            "[US BUY FILL] delta 반영: symbol=%s +%s주 @$%.4f (누적체결 %s) oid=%s",
+            symbol, delta, delta_avg, lc.filled_qty, oid)
 
-    def _us_handle_sell_filled(self, lc) -> None:
-        """US SELL FILLED 시 포지션 감소·삭제 + 실현손익 + 재진입차단을 1회 반영.
+        def _on_commit():
+            self._us_fill_events.append({
+                "side": "BUY", "symbol": symbol, "name": name,
+                "qty": delta, "price": delta_avg,
+            })
 
-        ★ rt_cd=0(접수)에는 아무 것도 부킹하지 않는다. 실제 FILLED 후 이 콜백에서만
-          pos_mgr.remove/update, pnl_guard.record, reentry.record_sell 를 수행한다.
-          full_fill(on_filled=updater) 경유 멱등 → 중복 체결에도 1회만 반영.
-        """
-        meta = self._us_pending_sell_meta.pop(lc.order_lifecycle_id, None)
-        if meta is None:
+        return _undo, _on_commit
+
+    def _us_book_sell_delta(self, lc, delta, delta_avg):
+        """SELL delta 만큼 포지션 감소 + 실현손익 기록(원가는 감소 전 평단).
+        전량 청산 시 재진입 등록은 커밋 확정 후 수행. (undo, on_commit) 반환."""
+        oid    = lc.order_lifecycle_id
+        symbol = lc.code
+        meta   = self._us_pending_sell_meta.get(oid, {})
+        name   = meta.get("name", symbol)
+        reason = meta.get("reason", "")
+        pos    = self.pos_mgr.positions.get(symbol)
+        if pos is None:
             logger.warning(
-                "[US SELL FILLED] pending_sell_meta 없음 — 반영 스킵: "
-                "order_lifecycle_id=%s code=%s",
-                lc.order_lifecycle_id, lc.code,
-            )
-            return
-        symbol  = lc.code
-        name    = meta.get("name", symbol)
-        reason  = meta.get("reason", "")
-        want_full = meta.get("is_full", True)
-        qty     = lc.filled_qty if lc.filled_qty > 0 else meta.get("qty", 0)
-        price   = lc.avg_fill_price if lc.avg_fill_price else meta.get("price", 0.0)
-        pos     = self.pos_mgr.positions.get(symbol)
-        avg_p   = pos.avg_price if pos is not None else meta.get("avg_price", price)
-        if qty <= 0 or price <= 0:
-            logger.error(
-                "[US SELL FILLED] 수량/가격 이상 — 반영 스킵: "
-                "order_lifecycle_id=%s qty=%s price=%s",
-                lc.order_lifecycle_id, qty, price,
-            )
-            return
+                "[US SELL FILL] 포지션 없음 — delta 반영 스킵: symbol=%s oid=%s",
+                symbol, oid)
+            return None
 
-        # ── 포지션 감소/삭제 (부분매도는 수량만 감소) ──
-        if pos is not None and not want_full and pos.qty > qty:
-            self.pos_mgr.update(symbol, pos.qty - qty, avg_p, pos.current_level)
-            sold_full = False
+        prev_qty, prev_avg, prev_lvl = pos.qty, pos.avg_price, pos.current_level
+        sell_qty  = min(int(delta), int(prev_qty))
+        remaining = prev_qty - sell_qty
+        if remaining > 0:
+            self.pos_mgr.update(symbol, remaining, prev_avg, prev_lvl)
+            closed = False
         else:
-            if pos is not None:
-                self.pos_mgr.remove(symbol)
-            sold_full = True
+            self.pos_mgr.remove(symbol)
+            closed = True
 
-        # ── 실현손익 기록 (USD → KRW) ──
-        pnl_usd = (price - avg_p) * qty
+        pnl_usd = (delta_avg - prev_avg) * sell_qty
         try:
             fx = self.api.get_usd_exchange_rate() or 1350.0
         except Exception:
@@ -834,26 +940,33 @@ class USStrategyManager:
         pnl_krw = pnl_usd * fx
         self.pnl_guard.record(pnl_krw)
 
-        # ── 재진입 차단 등록 (전량 청산 시에만) ──
-        if sold_full:
-            _is_sl = _is_stoploss_reason(reason)
-            self.reentry.record_sell(
-                market="US", code=symbol, name=name,
-                reason=reason, is_stoploss=_is_sl,
-            )
-
-        pnl_st = self.pnl_guard.status_dict()
         logger.info(
-            "[US SELL FILLED] 반영 완료: symbol=%s %s%s주 @$%.2f "
-            "실현 $%.2f (₩%.0f) 일일실현 ₩%.0f order_lifecycle_id=%s",
-            symbol, ("전량" if sold_full else "부분"), qty, price,
-            pnl_usd, pnl_krw, pnl_st["realized_pnl"], lc.order_lifecycle_id,
-        )
-        self._us_fill_events.append({
-            "side": "SELL", "symbol": symbol, "name": name,
-            "qty": qty, "price": price,
-            "pnl_usd": pnl_usd, "is_full": sold_full,
-        })
+            "[US SELL FILL] delta 반영: symbol=%s -%s주 @$%.4f 실현 $%.2f(₩%.0f) %s oid=%s",
+            symbol, sell_qty, delta_avg, pnl_usd, pnl_krw,
+            ("전량청산" if closed else "부분"), oid)
+
+        def _undo():
+            if self.pos_mgr.positions.get(symbol) is None:
+                p = USPosition(symbol, name, meta.get("excd", "NASD"),
+                               prev_qty, prev_avg)
+                p.current_level = prev_lvl
+                self.pos_mgr.add(p)
+            else:
+                self.pos_mgr.update(symbol, prev_qty, prev_avg, prev_lvl)
+            self.pnl_guard.record(-pnl_krw)   # 손익 원복
+
+        def _on_commit():
+            self._us_fill_events.append({
+                "side": "SELL", "symbol": symbol, "name": name,
+                "qty": sell_qty, "price": delta_avg,
+                "pnl_usd": pnl_usd, "is_full": closed,
+            })
+            if closed:   # 전량 청산 시에만 재진입 1회
+                self.reentry.record_sell(
+                    market="US", code=symbol, name=name,
+                    reason=reason, is_stoploss=_is_stoploss_reason(reason))
+
+        return _undo, _on_commit
 
     def _us_has_active_order(self, symbol: str, side: str = None) -> bool:
         """동일 종목(선택적으로 동일 방향)에 ACTIVE(접수/부분체결) US 주문이
@@ -959,13 +1072,12 @@ class USStrategyManager:
             return
 
         try:
+            # 1) lifecycle 상태 전이 (누적 filled_qty/avg_fill_price 갱신).
+            #    부킹은 on_filled 콜백이 아니라 delta 기반으로 처리하므로
+            #    on_filled 은 전달하지 않는다(부분체결도 반영하기 위함).
             if is_full:
                 self._us_lifecycle_mgr.full_fill(
-                    lc,
-                    delta     = filled_qty,
-                    avg_price = avg_fill_price,
-                    on_filled = self._us_updater,
-                )
+                    lc, delta=filled_qty, avg_price=avg_fill_price)
             else:
                 self._us_lifecycle_mgr.partial_fill(lc, filled_qty, avg_fill_price)
         except Exception as exc:
@@ -975,6 +1087,11 @@ class USStrategyManager:
                 order_lifecycle_id, is_full, exc,
             )
             raise
+
+        # 2) 갱신된 누적 체결 기준으로 신규 체결분(delta)만 포지션·손익에 반영.
+        #    PARTIALLY_FILLED / FILLED 모두 여기서 처리된다(멱등·이중부킹 방지).
+        lc2 = self._us_lifecycle_mgr.load(order_lifecycle_id) or lc
+        self._us_apply_fill_delta(lc2)
 
     def run_us_fill_poll(self) -> dict:
         """US FillObserver.poll_once() → us_dispatch_fill() 자동 연결.
@@ -2048,36 +2165,41 @@ class USStrategyManager:
         """
         try:
             avail = self.api.get_us_available_amounts()
-            usd_avail = avail.get("usd", 0.0)   # frcr_ord_psbl_amt1 — 핵심
-            krw_avail = avail.get("krw", 0.0)   # ovrs_ord_psbl_amt  — 보조
-
-            need_usd = cur_price * qty
-
-            if usd_avail >= need_usd:
-                return True, f"USD가능(${usd_avail:.2f} >= 필요${need_usd:.2f})"
-
-            # USD 부족 → KRW 보조 확인 (ovrs_ord_psbl_amt > 0 인 경우만)
-            if krw_avail > 0:
-                fx = 1350.0
-                try:
-                    fx = self.api.get_usd_exchange_rate()
-                except Exception:
-                    pass
-                need_krw = need_usd * fx * 1.005
-                if krw_avail >= need_krw:
-                    return True, (
-                        f"USD부족(${usd_avail:.2f}) => 원화환전 "
-                        f"필요{need_krw:,.0f}원 <= 가용{krw_avail:,.0f}원"
-                    )
-
-            # 모두 부족
-            return False, (
-                f"USD${usd_avail:.2f} < 필요${need_usd:.2f} "
-                f"(ovrs_ord_psbl={krw_avail:,.0f}원)"
-            )
         except Exception as e:
-            logger.warning(f"[{symbol}] 주문가능금액 조회 실패(주문 그대로 시도): {e}")
-            return True, "가능금액조회실패→주문시도"
+            # ★ 조회 실패 시 '주문 시도'가 아니라 '차단' (사전검증 실패 → 미제출)
+            logger.warning(f"[{symbol}] 주문가능금액 조회 실패 → 차단: {e}")
+            return False, "주문가능금액 조회 실패 → 차단"
+
+        # ★ ok=False(오류/타임아웃/파싱실패/rt_cd!=0) → 차단
+        if not avail.get("ok", False):
+            return False, "주문가능금액 사전검증 실패 → 차단"
+
+        usd_avail = float(avail.get("usd", 0.0) or 0.0)   # frcr_ord_psbl_amt1 — 핵심
+        krw_avail = float(avail.get("krw", 0.0) or 0.0)   # ovrs_ord_psbl_amt  — 보조
+        need_usd  = cur_price * qty
+
+        if usd_avail >= need_usd:
+            return True, f"USD가능(${usd_avail:.2f} >= 필요${need_usd:.2f})"
+
+        # USD 부족 → KRW 보조 확인 (ovrs_ord_psbl_amt > 0 인 경우만)
+        if krw_avail > 0:
+            fx = 1350.0
+            try:
+                fx = self.api.get_usd_exchange_rate() or 1350.0
+            except Exception:
+                pass
+            need_krw = need_usd * fx * 1.005
+            if krw_avail >= need_krw:
+                return True, (
+                    f"USD부족(${usd_avail:.2f}) => 원화환전 "
+                    f"필요{need_krw:,.0f}원 <= 가용{krw_avail:,.0f}원"
+                )
+
+        # 모두 부족
+        return False, (
+            f"USD${usd_avail:.2f} < 필요${need_usd:.2f} "
+            f"(ovrs_ord_psbl={krw_avail:,.0f}원)"
+        )
 
     # ── 매수 실행 ──────────────────────────────────────────
     def _do_buy(self, symbol, name, excd, cur_price, sess, iv,
@@ -2111,15 +2233,32 @@ class USStrategyManager:
                 "session": sess.get("session", ""),
             }
 
-        # ── 실제 USD 주문가능금액 기준 동적 수량 계산 ──────────
-        # 매수 종목 기준 TTTS3007R 조회 → 정확한 ovrs_ord_psbl_amt 확보
+        # ── ★ 주문 직전 KIS 해외 주문가능금액 사전검증 (확정액만 사용) ──────
+        #   조회 오류/타임아웃/파싱 실패/rt_cd!=0 → ok=False → 주문 미제출(BUY_BLOCKED).
+        #   국내 원화 예수금 기반 폴백은 제거했다 — KIS 로 확인된 해외 주문가능
+        #   금액이 없으면 실주문을 시도하지 않는다.
         try:
             avail = self.api.get_us_available_amounts(symbol=symbol, excd=excd)
-            usd_avail = avail.get("usd", 0.0)
-            krw_avail = avail.get("krw", 0.0)
-        except Exception:
-            usd_avail = 0.0
-            krw_avail = 0.0
+        except Exception as _ae:
+            avail = {"ok": False}
+            logger.warning("[%s] 해외 주문가능 조회 예외 → BUY_BLOCKED: %s", symbol, _ae)
+
+        if not avail.get("ok", False):
+            logger.warning("[%s] 해외 주문가능 조회 실패/미확인 → 주문 미제출(BUY_BLOCKED)", symbol)
+            return {"action": "BUY_BLOCKED", "symbol": symbol, "name": name,
+                    "reason": "해외 주문가능금액 사전검증 실패 — 주문 미제출",
+                    "session": sess.get("session", "")}
+
+        usd_avail = float(avail.get("usd", 0.0) or 0.0)
+        krw_avail = float(avail.get("krw", 0.0) or 0.0)
+        if usd_avail <= 0 and krw_avail <= 0:
+            logger.warning(
+                "[%s] 해외 주문가능금액 0 (usd=%.2f krw=%.0f) → 주문 미제출(BUY_BLOCKED)",
+                symbol, usd_avail, krw_avail)
+            return {"action": "BUY_BLOCKED", "symbol": symbol, "name": name,
+                    "reason": "해외 주문가능금액 0 — 주문 미제출",
+                    "session": sess.get("session", "")}
+
         # 원화 가능금액도 USD로 환산해서 예산 계산
         # ovrs_ord_psbl_amt > 0 이면 원화결제 사용 가능
         if krw_avail > 0:

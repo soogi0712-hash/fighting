@@ -1384,6 +1384,8 @@ def _us_trading_loop():
                 )
             elif action == "BUY_FAIL":
                 _log(f"❌ [US BUY_FAIL] {name}({symbol}) — {result.get('reason','')}", "error")
+            elif action == "BUY_BLOCKED":
+                _log(f"⛔ [US BUY_BLOCKED] {name}({symbol}) — {result.get('reason','')}", "warning")
             elif action == "SELL_ACCEPTED":
                 est = float(result.get("est_pnl_usd", 0))
                 _log(
