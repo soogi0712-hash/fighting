@@ -2664,8 +2664,12 @@ class USStrategyManager:
                 _us_jnl._inc_error("us_submitted", _uje)
 
         # ── 주문 실행 (allow_krw_order=True → USD 실패 시 KIS 내부 원화환전) ──
-        #   ★ 주문가능금액 부족 오류 시 '더 작은 수량으로 1회만' 재조회·재산정·재시도.
-        #     동일 수량 반복 주문·무검증 재시도는 금지(축소되지 않으면 중단).
+        #   ★ 축소 재시도는 '주문번호 없는 명확한 잔액부족 거절'에서만 1회.
+        #     중복 제출 방지 원칙:
+        #       - rt_cd=="9"(예외/타임아웃 래핑) → 접수 여부 불명확 → 재시도 금지
+        #       - output.ODNO 존재(접수 정황) → 재시도 금지
+        #       - 명시적 잔액/한도 부족 메시지일 때만 축소·재조회 후 재시도
+        #     재조회 실패·수량 미축소 시에도 중단(동일수량 반복·무검증 재시도 금지).
         def _eff_usd(_av):
             _u = float(_av.get("usd", 0.0) or 0.0)
             _k = float(_av.get("krw", 0.0) or 0.0)
@@ -2677,6 +2681,23 @@ class USStrategyManager:
                 return max(_u, (_k / _fx) * 0.99)
             return _u
 
+        def _clean_balance_reject(_res):
+            """주문번호 없이 KIS 가 '명확히 잔액부족으로 거절'한 경우만 True.
+
+            접수됐거나(주문번호 존재) 접수 여부가 불명확한 응답(예외/타임아웃
+            래핑 rt_cd=9, 또는 성공 rt_cd=0)에서는 재주문하지 않는다."""
+            _rt = str(_res.get("rt_cd", ""))
+            if _rt in ("0", "9"):
+                return False     # 성공 or 접수불명확(예외 래핑) → 재시도 금지
+            _out = _res.get("output") or {}
+            if isinstance(_out, list):
+                _out = _out[0] if _out else {}
+            if str(_out.get("ODNO", "") or "").strip() not in ("", "0"):
+                return False     # 주문번호 존재 → 이미 접수 → 재주문 금지
+            _msg = _res.get("msg1", "") or ""
+            return any(_kw in _msg for _kw in
+                       ("부족", "금액", "초과", "주문가능", "한도"))
+
         _resized_once = False
         while True:
             result   = self.api.buy_us(symbol, qty, cur_price, excd,
@@ -2685,8 +2706,8 @@ class USStrategyManager:
             fail_msg = result.get("msg1", "")
             if order_ok or _resized_once:
                 break
-            # 주문가능금액 부족류 오류에서만 1회 재산정
-            if not any(_k in fail_msg for _k in ("부족", "금액", "초과")):
+            # 주문번호 없는 명확한 잔액부족 거절에서만 1회 재산정(중복 제출 방지)
+            if not _clean_balance_reject(result):
                 break
             try:
                 _re = self.api.get_us_available_amounts(
@@ -2700,8 +2721,8 @@ class USStrategyManager:
             if _re_qty <= 0 or _re_qty >= qty:
                 break   # 더 작아지지 않으면 재시도 안 함(동일수량 반복 금지)
             logger.warning(
-                "[%s] 주문가능금액 부족 → 재조회 후 축소 재시도 %d→%d주(1회 한정)",
-                symbol, qty, _re_qty)
+                "[%s] 잔액부족 거절(주문번호 없음) → 재조회 후 축소 재시도 "
+                "%d→%d주(1회 한정)", symbol, qty, _re_qty)
             qty = _re_qty
             _resized_once = True
 

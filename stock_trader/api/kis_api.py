@@ -1638,7 +1638,10 @@ class KISApi:
                 krw = float(output.get("ovrs_ord_psbl_amt",  0) or 0)
                 usd = float(output.get("frcr_ord_psbl_amt1", 0) or 0)
                 # 해외주식은 미수/신용 개념이 없어 KIS 최대주문가능수량 자체가 현금 기준.
-                max_qty = int(float(output.get("ovrs_max_ord_psbl_qty", 0) or 0))
+                # 필드명은 TR/버전에 따라 ovrs_max_ord_psbl_qty 또는 max_ord_psbl_qty.
+                max_qty = int(float(
+                    output.get("ovrs_max_ord_psbl_qty",
+                               output.get("max_ord_psbl_qty", 0)) or 0))
             except (TypeError, ValueError):
                 logger.warning("[해외주문가능] 금액/수량 파싱 실패")
                 return {"krw": 0.0, "usd": 0.0, "qty": 0, "raw": output, "ok": False}
