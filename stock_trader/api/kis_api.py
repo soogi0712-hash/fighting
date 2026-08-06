@@ -569,6 +569,69 @@ class KISApi:
                     "_cash_guard": True}
         return None
 
+    def get_kr_available_amounts(self, stock_code: str, ord_unpr,
+                                 ord_dvsn: str = "00") -> dict:
+        """국내주식 현금 주문가능금액·수량 조회 (inquire-psbl-order, 주문별 검증용).
+
+        ★ 실제 주문과 동일 계좌(CANO/ACNT_PRDT_CD)·종목(PDNO)·주문가격(ORD_UNPR)·
+          주문구분(ORD_DVSN) 기준으로 조회한다. 예수금 단독이 아니라 이 값들을
+          권위값으로 쓴다. 신용·미수 제외(현금)만 사용:
+            - amount = ord_psbl_cash  (주문가능현금 = 현금, 미수·신용 미포함)
+            - qty    = nrcvb_buy_qty  (미수 없는 매수 가능 수량 = 현금 최대수량)
+          max_buy_amt / max_buy_qty (미수 포함)는 사용하지 않는다.
+        반환: {"amount": float, "qty": int, "cash": float, "ok": bool}
+          - ok=False: 종목없음 / rt_cd!=0 / 타임아웃 / 네트워크 / 파싱 실패 → 미제출 신호
+        개인정보·계좌번호는 로그에 남기지 않는다(숫자 필드만 기록).
+        """
+        if not stock_code:
+            return {"amount": 0.0, "qty": 0, "cash": 0.0, "ok": False}
+        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-psbl-order"
+        from config import Config as _cfg
+        tr_id = "TTTC8908R" if _cfg.KIS_IS_REAL else "VTTC8908R"
+        acc_no, acc_prod = self.account_no.split("-") \
+            if "-" in self.account_no else (self.account_no, "01")
+        # ★ 실제 주문가격 반영(지정가). 시장가/0 이면 "0" → KIS 현재가 기준 산정.
+        try:
+            _unpr = str(int(float(ord_unpr))) if ord_unpr and float(ord_unpr) > 0 else "0"
+        except (TypeError, ValueError):
+            _unpr = "0"
+        params = {
+            "CANO":         acc_no,
+            "ACNT_PRDT_CD": acc_prod,
+            "PDNO":         stock_code,          # ★ 실제 종목
+            "ORD_UNPR":     _unpr,               # ★ 실제 주문가격
+            "ORD_DVSN":     ord_dvsn or "00",
+            "CMA_EVLU_AMT_ICLD_YN": "N",
+            "OVRS_ICLD_YN": "N",
+        }
+        try:
+            resp = requests.get(url, headers=self._headers(tr_id),
+                                params=params, timeout=8)
+            resp.raise_for_status()
+            data = resp.json()
+            # ★ rt_cd != 0 → 조회 실패 → ok=False (주문 미제출)
+            if str(data.get("rt_cd", "1")) != "0":
+                logger.warning("[국내주문가능] 조회 실패 rt_cd=%s msg=%s",
+                               data.get("rt_cd"), data.get("msg1", ""))
+                return {"amount": 0.0, "qty": 0, "cash": 0.0, "ok": False}
+            output = data.get("output", {})
+            if isinstance(output, list):
+                output = output[0] if output else {}
+            try:
+                # 현금(미수 없는) 기준만 권위값으로 사용
+                amount = float(output.get("ord_psbl_cash", 0) or 0)   # 주문가능현금
+                qty    = int(float(output.get("nrcvb_buy_qty", 0) or 0))  # 미수없는 수량
+            except (TypeError, ValueError):
+                logger.warning("[국내주문가능] 금액/수량 파싱 실패")
+                return {"amount": 0.0, "qty": 0, "cash": 0.0, "ok": False}
+            logger.info("[국내주문가능] %s 현금가능=%.0f원 미수없는수량=%d주",
+                        stock_code, amount, qty)
+            return {"amount": amount, "qty": qty, "cash": amount, "ok": True}
+        except Exception as e:
+            # 타임아웃/네트워크/HTTP 오류 → ok=False (주문 미제출 신호)
+            logger.error(f"국내주식 주문가능 조회 오류: {e}")
+            return {"amount": 0.0, "qty": 0, "cash": 0.0, "ok": False}
+
     def _order(self, stock_code: str, order_type: str,
                qty: int, price: int = 0,
                ord_dvsn: str = None) -> dict:
@@ -1505,8 +1568,10 @@ class KISApi:
         ★ 실제 주문과 동일한 계좌(CANO/ACNT_PRDT_CD) · 거래소(OVRS_EXCG_CD) ·
           종목(ITEM_CD=symbol) · 주문가격(OVRS_ORD_UNPR=ord_unpr) 기준으로 조회한다.
           ord_unpr 를 넘기면 해당 지정가 기준 주문가능수량/금액이 반영된다.
-        반환: {"krw": float, "usd": float, "raw": dict, "ok": bool}
+        반환: {"krw": float, "usd": float, "qty": int, "raw": dict, "ok": bool}
           - krw = ovrs_ord_psbl_amt (원화 주문가능), usd = frcr_ord_psbl_amt1 (외화)
+          - qty = ovrs_max_ord_psbl_qty (해당 주문가 기준 KIS 최대 주문가능수량)
+                  → 예수금 나눗셈이 아니라 KIS 확정 주문가능수량을 권위값으로 사용
           - ok=False: rt_cd!=0 / 타임아웃 / 네트워크 / 파싱 실패 → 주문 미제출 신호
         """
         url   = f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-psamount"
@@ -1560,28 +1625,31 @@ class KISApi:
                 logger.warning(
                     "[해외주문가능] 조회 실패 rt_cd=%s msg=%s",
                     data.get("rt_cd"), data.get("msg1", ""))
-                return {"krw": 0.0, "usd": 0.0, "raw": data, "ok": False}
+                return {"krw": 0.0, "usd": 0.0, "qty": 0, "raw": data, "ok": False}
 
             output = data.get("output", {})
             if isinstance(output, list):
                 output = output[0] if output else {}
 
-            # ★ KIS 해외 주문가능금액만 사용한다(확정액). 국내 예수금 기반 폴백은
+            # ★ KIS 해외 주문가능금액·수량만 사용한다(확정값). 국내 예수금 기반 폴백은
             #   제거했다 — 해외 주문가능이 KIS 로 확인되지 않으면 주문하지 않는다.
             #   파싱 실패 시 ok=False.
             try:
                 krw = float(output.get("ovrs_ord_psbl_amt",  0) or 0)
                 usd = float(output.get("frcr_ord_psbl_amt1", 0) or 0)
+                # 해외주식은 미수/신용 개념이 없어 KIS 최대주문가능수량 자체가 현금 기준.
+                max_qty = int(float(output.get("ovrs_max_ord_psbl_qty", 0) or 0))
             except (TypeError, ValueError):
-                logger.warning("[해외주문가능] 금액 파싱 실패 output=%r", output)
-                return {"krw": 0.0, "usd": 0.0, "raw": output, "ok": False}
+                logger.warning("[해외주문가능] 금액/수량 파싱 실패")
+                return {"krw": 0.0, "usd": 0.0, "qty": 0, "raw": output, "ok": False}
 
-            return {"krw": krw, "usd": usd, "raw": output, "ok": True}
+            return {"krw": krw, "usd": usd, "qty": max_qty,
+                    "raw": output, "ok": True}
 
         except Exception as e:
             # 타임아웃/네트워크/HTTP 오류 → ok=False (주문 미제출 신호)
             logger.error(f"해외주식 주문가능금액 조회 오류: {e}")
-            return {"krw": 0.0, "usd": 0.0, "raw": {}, "ok": False}
+            return {"krw": 0.0, "usd": 0.0, "qty": 0, "raw": {}, "ok": False}
 
     def buy_us(self, symbol: str, qty: int, price: float = 0,
                excd: str = "NASD",

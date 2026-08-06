@@ -57,6 +57,7 @@ from utils.market_session     import (
 )
 from strategies.daily_pnl_guard import DailyPnLGuard
 from strategies.reentry_guard   import ReentryGuard, _is_stoploss_reason
+from utils.order_sizing        import finalize_order_qty, qty_from_cash
 
 # ── Trading Journal (선택적 로드 — 실패 시 매매 루프 중단 없음) ──
 try:
@@ -2597,6 +2598,25 @@ class USStrategyManager:
         ratio_label = f"EARLY{entry_ratio:.0%}" if entry_ratio < 1.0 else "FULL100%"
         logger.info(f"[{symbol}] 예산${budget_usd:.2f}({ratio_label}) / ${cur_price:.2f} = {qty}주")
 
+        # ── ★ KIS 현금 주문가능수량·금액으로 최종수량 확정 ─────────────
+        #   예수금 나눗셈이 아니라 KIS 확정값을 권위로:
+        #     최종 = min(전략수량, KIS주문가능수량(ovrs_max_ord_psbl_qty),
+        #               floor(현금가능금액 * 0.98 / 실제주문가))
+        #   해외주식은 미수/신용이 없어 KIS 주문가능수량 자체가 현금 기준이다.
+        _kis_qty = int(avail.get("qty", 0) or 0)
+        _final_qty = finalize_order_qty(qty, _kis_qty, effective_usd, cur_price)
+        logger.info(
+            "[%s] 수량확정 = min(전략%d, KIS가능%d, 금액환산%d) → %d주",
+            symbol, qty, _kis_qty,
+            qty_from_cash(effective_usd, cur_price), _final_qty)
+        if _final_qty <= 0:
+            logger.warning(
+                "[%s] KIS 현금 주문가능수량/금액 0 → 주문 미제출(BUY_BLOCKED)", symbol)
+            return {"action": "BUY_BLOCKED", "symbol": symbol, "name": name,
+                    "reason": "KIS 현금 주문가능수량/금액 0 — 주문 미제출",
+                    "session": sess.get("session", "")}
+        qty = _final_qty
+
         # ── 사전 잔고 체크 (USD + KRW 통합) ──────────────────
         can_buy, capacity_msg = self._check_buy_capacity(symbol, cur_price, qty)
         logger.info(f"[💰잔고체크] {symbol} {qty}주 ${cur_price:.2f} → {capacity_msg}")
@@ -2643,9 +2663,47 @@ class USStrategyManager:
             except Exception as _uje:
                 _us_jnl._inc_error("us_submitted", _uje)
 
-        result   = self.api.buy_us(symbol, qty, cur_price, excd, allow_krw_order=True)
-        order_ok = result.get("rt_cd") == "0"
-        fail_msg = result.get("msg1", "")
+        # ── 주문 실행 (allow_krw_order=True → USD 실패 시 KIS 내부 원화환전) ──
+        #   ★ 주문가능금액 부족 오류 시 '더 작은 수량으로 1회만' 재조회·재산정·재시도.
+        #     동일 수량 반복 주문·무검증 재시도는 금지(축소되지 않으면 중단).
+        def _eff_usd(_av):
+            _u = float(_av.get("usd", 0.0) or 0.0)
+            _k = float(_av.get("krw", 0.0) or 0.0)
+            if _k > 0:
+                try:
+                    _fx = self.api.get_usd_exchange_rate() or 1350.0
+                except Exception:
+                    _fx = 1350.0
+                return max(_u, (_k / _fx) * 0.99)
+            return _u
+
+        _resized_once = False
+        while True:
+            result   = self.api.buy_us(symbol, qty, cur_price, excd,
+                                       allow_krw_order=True)
+            order_ok = result.get("rt_cd") == "0"
+            fail_msg = result.get("msg1", "")
+            if order_ok or _resized_once:
+                break
+            # 주문가능금액 부족류 오류에서만 1회 재산정
+            if not any(_k in fail_msg for _k in ("부족", "금액", "초과")):
+                break
+            try:
+                _re = self.api.get_us_available_amounts(
+                    symbol=symbol, excd=excd, ord_unpr=cur_price)
+            except Exception:
+                _re = {"ok": False}
+            if not _re.get("ok", False):
+                break   # 재조회 실패 → 무검증 재시도 금지
+            _re_qty = finalize_order_qty(
+                qty, int(_re.get("qty", 0) or 0), _eff_usd(_re), cur_price)
+            if _re_qty <= 0 or _re_qty >= qty:
+                break   # 더 작아지지 않으면 재시도 안 함(동일수량 반복 금지)
+            logger.warning(
+                "[%s] 주문가능금액 부족 → 재조회 후 축소 재시도 %d→%d주(1회 한정)",
+                symbol, qty, _re_qty)
+            qty = _re_qty
+            _resized_once = True
 
         if not order_ok:
             # ── [US 훅 C] ORDER_REJECTED ──
