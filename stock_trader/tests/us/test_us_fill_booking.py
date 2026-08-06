@@ -21,8 +21,13 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
+from datetime import timedelta   # noqa: E402
+
 from strategies.us_strategy_manager import (   # noqa: E402
     USStrategyManager, USPosition, _USFillOutbox, _USAppEffectLedger,
+)
+from utils.market_session import (   # noqa: E402
+    us_trading_session_id, us_session_phase, _to_et,
 )
 
 
@@ -72,9 +77,13 @@ class FakeReentry:
         self.sells.append(kw)
 
 
+# 고정 접수시각(KST). EDT 정규장 중 → US 세션 2026-08-06.
+_ACCEPTED_AT = "2026-08-06T23:00:00"
+
+
 class FakeLC:
     def __init__(self, oid, code, filled_qty, avg_fill_price,
-                 side="BUY", order_qty=10):
+                 side="BUY", order_qty=10, accepted_at=_ACCEPTED_AT):
         self.order_lifecycle_id = oid
         self.code = code
         self.filled_qty = filled_qty
@@ -82,6 +91,9 @@ class FakeLC:
         self.side = side
         self.order_qty = order_qty
         self.trade_id = ""
+        self.accepted_at = accepted_at
+        self.submitted_at = accepted_at
+        self.created_at = accepted_at
 
 
 def make_us(db_path, pos_mgr=None, pnl_guard=None, reentry=None):
@@ -131,10 +143,10 @@ def crash_ledger_on(us, target_effect):
     강제종료 모사."""
     orig = us._us_app_ledger.mark
 
-    def failing(ek, et, day="", amount=0.0):
+    def failing(ek, et, session_id="", amount=0.0):
         if et == target_effect:
             raise RuntimeError(f"crash before mark {et}")
-        return orig(ek, et, day, amount)
+        return orig(ek, et, session_id, amount)
     us._us_app_ledger.mark = failing
 
 
@@ -369,18 +381,18 @@ class TestUSAppEffectsLedger(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _day(self, us, ev):
-        return ev.get("day", "") or ""
+    def _sess(self, ev):
+        return ev.get("session_id", "") or ""
 
     def test_B1_trade_count_survives_restart(self):
         us1 = make_us(self.db)
         ev = seed_fill(us1, "BUY")
         us1.us_apply_app_effects(ev, _build_fns(us1, ev))
-        day = self._day(us1, ev)
-        self.assertEqual(us1.us_today_trade_count(day), 1)
+        sess = self._sess(ev)
+        self.assertEqual(us1.us_session_trade_count(sess), 1)
         # 재시작: 객체 폐기, 동일 DB 새 매니저
         us2 = make_us(self.db, pos_mgr=us1.pos_mgr)
-        self.assertEqual(us2.us_today_trade_count(day), 1)   # 0 아님, 재구성됨
+        self.assertEqual(us2.us_session_trade_count(sess), 1)   # 0 아님, 재구성됨
 
     def test_B2_pnl_survives_restart(self):
         us1 = make_us(self.db)
@@ -393,41 +405,41 @@ class TestUSAppEffectsLedger(unittest.TestCase):
         us1._us_apply_fill_delta(FakeLC(oid, "AAPL", 10, 95.0, "SELL", 10))
         ev = us1._us_pending_app_events()[0]
         us1.us_apply_app_effects(ev, _build_fns(us1, ev))
-        day = ev["day"]
-        self.assertEqual(us1.us_today_realized_krw(day), -50000.0)
+        sess = ev["session_id"]
+        self.assertEqual(us1.us_session_realized_krw(sess), -50000.0)
         us2 = make_us(self.db, pos_mgr=us1.pos_mgr)
-        self.assertEqual(us2.us_today_realized_krw(day), -50000.0)   # 동일 −X
+        self.assertEqual(us2.us_session_realized_krw(sess), -50000.0)   # 동일 −X
 
     def test_B3_redelivery_no_change(self):
         us = make_us(self.db)
         ev = seed_fill(us, "SELL")   # 익절 (110), pnl=+100000
-        day = ev["day"]
+        sess = ev["session_id"]
         us.us_apply_app_effects(ev, _build_fns(us, ev))
         us.us_apply_app_effects(ev, _build_fns(us, ev))   # 재전달
         us.us_apply_app_effects(ev, _build_fns(us, ev))
-        self.assertEqual(us.us_today_trade_count(day), 1)         # 불변
-        self.assertEqual(us.us_today_realized_krw(day), 100000.0)  # 불변
-        # 실제 SQLite 행 UNIQUE 확인
+        self.assertEqual(us.us_session_trade_count(sess), 1)         # 불변
+        self.assertEqual(us.us_session_realized_krw(sess), 100000.0)  # 불변
+        # 실제 SQLite 행 UNIQUE 확인 — trade_count 는 order_key 로 1행
         import sqlite3
         c = sqlite3.connect(self.db)
         n = c.execute("SELECT COUNT(*) FROM us_app_effects "
                       "WHERE event_key=? AND effect_type='trade_count'",
-                      (ev["event_key"],)).fetchone()[0]
+                      (ev["order_key"],)).fetchone()[0]
         c.close()
         self.assertEqual(n, 1)
 
     def test_B4_repeated_restarts_stable(self):
         us = make_us(self.db)
         ev = seed_fill(us, "SELL")
-        day = ev["day"]
+        sess = ev["session_id"]
         us.us_apply_app_effects(ev, _build_fns(us, ev))
         pos = us.pos_mgr
         for _ in range(3):   # 재시작 반복 + 재전달
             us = make_us(self.db, pos_mgr=pos)
             for e in us._us_pending_app_events():
                 us.us_apply_app_effects(e, _build_fns(us, e))
-            self.assertEqual(us.us_today_trade_count(day), 1)
-            self.assertEqual(us.us_today_realized_krw(day), 100000.0)
+            self.assertEqual(us.us_session_trade_count(sess), 1)
+            self.assertEqual(us.us_session_realized_krw(sess), 100000.0)
 
 
 class TestUSExternalEffectIdempotency(unittest.TestCase):
@@ -548,19 +560,19 @@ class TestUSAppDoneGating(unittest.TestCase):
         us1 = make_us(self.db)
         ev = seed_fill(us1, "BUY")   # effects: trade_count(집계) + watch_entry(외부)
         ek = ev["event_key"]
-        day = ev["day"]
+        sess = ev["session_id"]
 
         def failing_watch(ekey, evt):
             raise RuntimeError("crash during watch_entry")
         us1.us_apply_app_effects(ev, {"watch_entry": failing_watch})
-        self.assertEqual(us1.us_today_trade_count(day), 1)       # 집계는 완료
+        self.assertEqual(us1.us_session_trade_count(sess), 1)    # 집계는 완료
         self.assertFalse(us1._us_app_ledger.done(ek, "watch_entry"))
         self.assertEqual(us1._us_outbox.get(ek)["app_done"], 0)  # 미확정
         # 재시작: watch_entry 만 이어서, 집계 재실행 없음(원장 UNIQUE)
         us2 = make_us(self.db, pos_mgr=us1.pos_mgr)
         e2 = us2._us_pending_app_events()[0]
         us2.us_apply_app_effects(e2, {"watch_entry": eff.fn("watch_entry")})
-        self.assertEqual(us2.us_today_trade_count(day), 1)       # 불변
+        self.assertEqual(us2.us_session_trade_count(sess), 1)    # 불변
         self.assertEqual(eff.applied_count(ek, "watch_entry"), 1)
         self.assertEqual(us2._us_outbox.get(ek)["app_done"], 1)  # 이제 확정
         self.assertEqual(len(us2._us_pending_app_events()), 0)
@@ -570,7 +582,7 @@ class TestUSAppDoneGating(unittest.TestCase):
         us1 = make_us(self.db)
         ev = seed_fill(us1, "BUY")
         ek = ev["event_key"]
-        day = ev["day"]
+        sess = ev["session_id"]
         orig = us1._us_outbox.set_flag
 
         def skip_app_done(ekey, flag):
@@ -583,8 +595,213 @@ class TestUSAppDoneGating(unittest.TestCase):
         us2 = make_us(self.db, pos_mgr=us1.pos_mgr)
         us2.us_apply_app_effects(us2._us_pending_app_events()[0],
                                  {"watch_entry": lambda a, b: None})
-        self.assertEqual(us2.us_today_trade_count(day), 1)       # 재집계 없음
+        self.assertEqual(us2.us_session_trade_count(sess), 1)    # 재집계 없음
         self.assertEqual(us2._us_outbox.get(ek)["app_done"], 1)
+
+
+class TestUSPerOrderTradeCount(unittest.TestCase):
+    """부분체결 trade_count 과다집계 방지 — 거래건수는 delta(누적체결)별이 아니라
+    '주문(order_key = order_lifecycle_id:side)별 1회'만 집계한다."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "us.db")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _buy(self, us, oid, code="AAPL", qty=10):
+        us._us_pending_buy_meta[oid] = {
+            "code": code, "name": code, "excd": "NASD", "level": 1, "qty": qty}
+
+    def _apply_pending(self, us):
+        """대기 app event 를 모두 처리하고, 처리 전에 세션 id 를 확보해 반환."""
+        pend = us._us_pending_app_events()
+        sess = pend[0]["session_id"] if pend else us_trading_session_id(_ACCEPTED_AT)
+        for ev in pend:
+            us.us_apply_app_effects(ev, _build_fns(us, ev))
+        return sess
+
+    def test_E1_cumulative_3_5_10_counts_1(self):
+        """한 주문 누적체결 3→5→10 → trade_count=1 (delta 3건이어도 주문 1개)."""
+        us = make_us(self.db)
+        oid = "US_BUY_AAPL_1"
+        self._buy(us, oid)
+        us._us_apply_fill_delta(FakeLC(oid, "AAPL", 3, 100.0, "BUY", 10))
+        us._us_apply_fill_delta(FakeLC(oid, "AAPL", 5, 104.0, "BUY", 10))
+        us._us_apply_fill_delta(FakeLC(oid, "AAPL", 10, 112.0, "BUY", 10))
+        sess = self._apply_pending(us)
+        self.assertEqual(us.us_session_trade_count(sess), 1)
+
+    def test_E2_partial_then_cancel_counts_1(self):
+        """부분체결 3주 후 취소(추가 체결 없음) → 실체결 있으므로 trade_count=1."""
+        us = make_us(self.db)
+        oid = "US_BUY_AAPL_1"
+        self._buy(us, oid)
+        us._us_apply_fill_delta(FakeLC(oid, "AAPL", 3, 100.0, "BUY", 10))
+        # 취소는 apply 를 호출하지 않음 → 체결분 3주만 존재
+        sess = self._apply_pending(us)
+        self.assertEqual(us.us_session_trade_count(sess), 1)
+
+    def test_E3_unfilled_cancel_counts_0(self):
+        """미체결 취소/거부 → 체결 event 자체가 없어 trade_count=0."""
+        us = make_us(self.db)
+        oid = "US_BUY_AAPL_1"
+        self._buy(us, oid)
+        # 접수만 되고 체결 없이 취소 → _us_apply_fill_delta 호출 없음
+        sess = us_trading_session_id(_ACCEPTED_AT)
+        self.assertEqual(len(us._us_pending_app_events()), 0)
+        self.assertEqual(us.us_session_trade_count(sess), 0)
+
+    def test_E4_two_distinct_orders_count_2(self):
+        """서로 다른 주문 2개(다른 order_lifecycle_id) → trade_count=2."""
+        us = make_us(self.db)
+        self._buy(us, "US_BUY_AAPL_1", "AAPL")
+        self._buy(us, "US_BUY_TSLA_1", "TSLA")
+        us._us_apply_fill_delta(FakeLC("US_BUY_AAPL_1", "AAPL", 10, 100.0, "BUY", 10))
+        us._us_apply_fill_delta(FakeLC("US_BUY_TSLA_1", "TSLA", 10, 200.0, "BUY", 10))
+        sess = self._apply_pending(us)
+        self.assertEqual(us.us_session_trade_count(sess), 2)
+
+    def test_E5_requery_and_restart_unchanged(self):
+        """동일 주문 재조회·재시작 반복 → trade_count 불변(1)."""
+        us = make_us(self.db)
+        oid = "US_BUY_AAPL_1"
+        self._buy(us, oid)
+        us._us_apply_fill_delta(FakeLC(oid, "AAPL", 3, 100.0, "BUY", 10))
+        us._us_apply_fill_delta(FakeLC(oid, "AAPL", 10, 105.0, "BUY", 10))
+        sess = self._apply_pending(us)
+        self.assertEqual(us.us_session_trade_count(sess), 1)
+        # 재조회(동일 lc 재적용 → last_cum 이후 없음) 후 재처리
+        us._us_apply_fill_delta(FakeLC(oid, "AAPL", 10, 105.0, "BUY", 10))
+        for ev in us._us_pending_app_events():
+            us.us_apply_app_effects(ev, _build_fns(us, ev))
+        self.assertEqual(us.us_session_trade_count(sess), 1)
+        # 재시작 반복(새 매니저, 동일 DB) → replay + 재처리해도 불변
+        pos = us.pos_mgr
+        for _ in range(3):
+            us = make_us(self.db, pos_mgr=pos)
+            us._us_replay_outbox()
+            for ev in us._us_pending_app_events():
+                us.us_apply_app_effects(ev, _build_fns(us, ev))
+            self.assertEqual(us.us_session_trade_count(sess), 1)
+
+    def test_E6_pnl_uses_delta_identity_not_order(self):
+        """PnL 은 delta 별 SUM 유지(event_key), trade_count 와 다른 event identity."""
+        us = make_us(self.db, reentry=FakeReentry())
+        us.pos_mgr.add(USPosition("AAPL", "Apple", "NASD", 10, 100.0))
+        oid = "US_SELL_AAPL_1"
+        us._us_pending_sell_meta[oid] = {
+            "code": "AAPL", "name": "Apple", "excd": "NASD",
+            "reason": "익절", "qty": 10}
+        us._us_apply_fill_delta(FakeLC(oid, "AAPL", 4, 110.0, "SELL", 10))
+        us._us_apply_fill_delta(FakeLC(oid, "AAPL", 10, 110.0, "SELL", 10))
+        sess = self._apply_pending(us)
+        self.assertEqual(us.us_session_trade_count(sess), 1)           # 주문 1회
+        # PnL delta SUM: (110-100)*4*1000 + (110-100)*6*1000 = 100000
+        self.assertEqual(us.us_session_realized_krw(sess), 100000.0)
+        # 실제 SQLite: pnl_stats 는 delta 별(event_key) 2행, trade_count 는 1행
+        import sqlite3
+        c = sqlite3.connect(self.db)
+        n_pnl = c.execute("SELECT COUNT(*) FROM us_app_effects "
+                          "WHERE effect_type='pnl_stats'").fetchone()[0]
+        n_tc = c.execute("SELECT COUNT(*) FROM us_app_effects "
+                         "WHERE effect_type='trade_count'").fetchone()[0]
+        c.close()
+        self.assertEqual((n_pnl, n_tc), (2, 1))
+
+
+class TestUSSessionAttribution(unittest.TestCase):
+    """미국 세션 중 KST 자정 한도 초기화 방지 — 집계는 KST 날짜가 아니라
+    US 거래세션(session_id, America/New_York 기준 ET 거래일)에 귀속한다."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "us.db")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _buy(self, us, oid, code="AAPL", qty=10):
+        us._us_pending_buy_meta[oid] = {
+            "code": code, "name": code, "excd": "NASD", "level": 1, "qty": qty}
+
+    def test_F1_kst_2359_fill_then_next_day_restart_same_session(self):
+        """KST 23:59 체결 후 (다음 KST 날짜에) 재시작 → 동일 세션 집계 유지."""
+        us1 = make_us(self.db)
+        oid = "US_BUY_AAPL_1"
+        self._buy(us1, oid)
+        # 접수 KST 2026-08-06 23:59 → EDT 10:59 → 세션 2026-08-06
+        us1._us_apply_fill_delta(
+            FakeLC(oid, "AAPL", 10, 100.0, "BUY", 10,
+                   accepted_at="2026-08-06T23:59:00"))
+        pend = us1._us_pending_app_events()
+        sess = pend[0]["session_id"]
+        self.assertEqual(sess, "2026-08-06")
+        for ev in pend:
+            us1.us_apply_app_effects(ev, _build_fns(us1, ev))
+        self.assertEqual(us1.us_session_trade_count(sess), 1)
+        # 재시작: KST 날짜가 바뀌어도 집계는 session_id 로 귀속 → 리셋 안 됨
+        us2 = make_us(self.db, pos_mgr=us1.pos_mgr)
+        us2._us_replay_outbox()
+        self.assertEqual(us2.us_session_trade_count(sess), 1)
+
+    def test_F2_partial_across_kst_midnight_count1_pnl_accurate(self):
+        """동일 주문이 KST 자정 전후로 부분체결 → trade_count=1, PnL 합계 정확.
+        세션은 접수시각으로 고정되므로 모든 delta 가 같은 세션에 귀속된다."""
+        us = make_us(self.db, reentry=FakeReentry())
+        us.pos_mgr.add(USPosition("AAPL", "Apple", "NASD", 10, 100.0))
+        oid = "US_SELL_AAPL_1"
+        us._us_pending_sell_meta[oid] = {
+            "code": "AAPL", "name": "Apple", "excd": "NASD",
+            "reason": "익절", "qty": 10}
+        at = "2026-08-06T23:50:00"   # 접수 KST 23:50 → 세션 2026-08-06
+        # 첫 delta(KST 자정 전) + 둘째 delta(KST 자정 후) — 동일 주문/세션
+        us._us_apply_fill_delta(FakeLC(oid, "AAPL", 4, 110.0, "SELL", 10, accepted_at=at))
+        us._us_apply_fill_delta(FakeLC(oid, "AAPL", 10, 110.0, "SELL", 10, accepted_at=at))
+        pend = us._us_pending_app_events()
+        sess = pend[0]["session_id"]
+        self.assertEqual(sess, "2026-08-06")
+        for ev in pend:
+            us.us_apply_app_effects(ev, _build_fns(us, ev))
+        self.assertEqual(us.us_session_trade_count(sess), 1)          # 부분체결 1주문
+        self.assertEqual(us.us_session_realized_krw(sess), 100000.0)  # 합계 정확
+
+    def test_F3_limit_resets_only_on_new_session(self):
+        """세션 A 집계는 세션 B 시작으로 리셋되지 않고 각 세션 독립.
+        새 거래일(체결 전) 조회 → 0 → 실제 세션 종료·신규 거래일에만 0에서 시작."""
+        us = make_us(self.db)
+        self._buy(us, "oA", "AAPL")
+        self._buy(us, "oB", "TSLA")
+        # 세션 A: KST 2026-08-06 23:00 → 세션 2026-08-06
+        us._us_apply_fill_delta(
+            FakeLC("oA", "AAPL", 10, 100.0, "BUY", 10,
+                   accepted_at="2026-08-06T23:00:00"))
+        # 세션 B: KST 2026-08-07 23:00 → 세션 2026-08-07
+        us._us_apply_fill_delta(
+            FakeLC("oB", "TSLA", 10, 200.0, "BUY", 10,
+                   accepted_at="2026-08-07T23:00:00"))
+        for ev in us._us_pending_app_events():
+            us.us_apply_app_effects(ev, _build_fns(us, ev))
+        self.assertEqual(us.us_session_trade_count("2026-08-06"), 1)  # A 유지
+        self.assertEqual(us.us_session_trade_count("2026-08-07"), 1)  # B 독립
+        self.assertEqual(us.us_session_trade_count("2026-08-08"), 0)  # 신규 세션만 0
+
+    def test_F4_dst_vs_non_dst_session_ids(self):
+        """DST(EDT, UTC-4)일과 비DST(EST, UTC-5)일 세션 식별자 — 고정 오프셋 아님."""
+        # DST(여름): KST 2026-07-15 22:00 → ET 2026-07-15 09:00, EDT(UTC-4)
+        self.assertEqual(us_trading_session_id("2026-07-15T22:00:00"), "2026-07-15")
+        self.assertEqual(_to_et("2026-07-15T22:00:00").utcoffset(),
+                         timedelta(hours=-4))
+        # 비DST(겨울): KST 2026-01-15 22:00 → ET 2026-01-15 08:00, EST(UTC-5)
+        self.assertEqual(us_trading_session_id("2026-01-15T22:00:00"), "2026-01-15")
+        self.assertEqual(_to_et("2026-01-15T22:00:00").utcoffset(),
+                         timedelta(hours=-5))
+        # KST 날짜(08-07)와 US 세션(08-06)이 다름 — KST 날짜 귀속이 아님을 증명
+        self.assertEqual(us_trading_session_id("2026-08-07T12:00:00"), "2026-08-06")
+        # phase: ET 정규장/애프터/오버나잇 경계
+        self.assertEqual(us_session_phase("2026-08-06T22:30:00"), "REGULAR")  # ET 09:30
+        self.assertEqual(us_session_phase("2026-08-07T05:30:00"), "AFTER")    # ET 16:30
 
 
 def _build_fns(us, ev):

@@ -24,11 +24,60 @@
   - allow_new_buy: 신규 매수 허용 여부 (15:20 이후 False)
   - sell_only:     매도 전용 여부 (15:20 이후 True)
 """
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 import pytz
 
 KST = pytz.timezone("Asia/Seoul")
 US_EASTERN = pytz.timezone("America/New_York")
+
+
+# ══════════════════════════════════════════════════════════════
+# 미국 거래세션 식별자 (거래일 귀속) — trade_count/PnL/손실한도 스코프
+# ══════════════════════════════════════════════════════════════
+#
+# 정책:
+#   - 타임존은 America/New_York 로 계산(DST 자동, 고정 오프셋 금지).
+#   - 하나의 "미국 거래일 세션" 은 ET 04:00(프리마켓 개장) ~ 다음날 03:59:59.
+#     ET 00:00~03:59 는 '전 거래일 세션' 에 귀속(오버나이트 연속성).
+#   - session_id = 그 거래일의 ET 날짜(YYYY-MM-DD).
+#   - phase: PRE(04:00~09:30) / REGULAR(09:30~16:00) / AFTER(16:00~20:00) /
+#            OVERNIGHT(20:00~다음날 04:00).
+#   - KST 자정은 미국 정규장 도중(ET 오전)이므로 session_id 가 바뀌지 않는다
+#     → 동일 세션 도중 KST 날짜 변경으로 한도가 초기화되지 않는다.
+
+def _to_et(dt=None) -> datetime:
+    """naive(서버 KST) 또는 tz-aware datetime/ISO 문자열 → ET aware."""
+    if dt is None:
+        return datetime.now(US_EASTERN)
+    if isinstance(dt, str):
+        try:
+            dt = datetime.fromisoformat(dt)
+        except Exception:
+            return datetime.now(US_EASTERN)
+    if dt.tzinfo is None:
+        dt = KST.localize(dt)   # 서버 로컬(KST) 로 간주
+    return dt.astimezone(US_EASTERN)
+
+
+def us_trading_session_id(dt=None) -> str:
+    """미국 거래일(세션) 식별자 = ET 거래일 YYYY-MM-DD (04:00 ET 경계)."""
+    et = _to_et(dt)
+    if et.hour < 4:
+        et = et - timedelta(days=1)
+    return et.strftime("%Y-%m-%d")
+
+
+def us_session_phase(dt=None) -> str:
+    """PRE / REGULAR / AFTER / OVERNIGHT."""
+    et = _to_et(dt)
+    m = et.hour * 60 + et.minute
+    if 4 * 60 <= m < 9 * 60 + 30:
+        return "PRE"
+    if 9 * 60 + 30 <= m < 16 * 60:
+        return "REGULAR"
+    if 16 * 60 <= m < 20 * 60:
+        return "AFTER"
+    return "OVERNIGHT"
 
 # ── 세션 이름 상수 ──────────────────────────────────────────
 SESSION_PRE        = "장전시간외"       # 08:00~09:00
