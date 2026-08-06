@@ -164,8 +164,8 @@ class StaleReconcileTest(unittest.TestCase):
         self.assertEqual(self.reg.get_by_trade_id(lc_id)["status"],
                          PendingStatus.FILLED)
 
-    # ── odno 없음 → 대조 불가 → 보수적 ACTIVE 유지 ───────────────────────
-    def test_no_odno_kept_unverified(self):
+    # ── odno 없으면 PendingRegistry 등록 거부(오인 매칭 방지, P0-5) ────────
+    def test_no_odno_registration_rejected(self):
         lc = self.mgr.create(trade_id="grp", market="KR", code="005930",
                              side="SELL", order_qty=7)
         lc_id = lc.order_lifecycle_id
@@ -173,12 +173,17 @@ class StaleReconcileTest(unittest.TestCase):
         self.mgr.submit(lc)
         self.mgr.accept(lc)   # odno 없음
         old = (datetime.now() - timedelta(minutes=10)).isoformat()
-        self.reg.register("KR", lc_id, "005930", "SELL", 7, old, odno="")
+        # P0-5: odno 가 비면 등록을 거부한다(return 0, 행 미생성).
+        rowid = self.reg.register("KR", lc_id, "005930", "SELL", 7, old, odno="")
+        self.assertEqual(rowid, 0)
+        # 행 자체가 없으므로 어떤 pending 목록에도 나타나지 않는다.
+        self.assertIsNone(self.reg.get_by_trade_id(lc_id))
+        self.assertFalse(self.reg.has_active_sell("KR", "005930"))
+        # reconcile 도 후보가 없어 아무 것도 EXPIRE 하지 않는다.
         flow = Flow(FakeApi((True, [])), self.mgr, self.reg)
         rep = flow.reconcile_stale_pendings(poll_first=False)
         self.assertEqual(rep["expired"], [])
-        self.assertIn(lc_id, rep["kept_unverified"])
-        self.assertTrue(self.reg.has_active_sell("KR", "005930"))
+        self.assertNotIn(lc_id, rep["kept_unverified"])
 
 
 if __name__ == "__main__":
