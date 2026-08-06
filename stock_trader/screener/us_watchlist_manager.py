@@ -41,6 +41,7 @@ STALE_HOURS        = 48    # 48시간 이상 성과 없으면 제거
 PENALTY_DAYS       = 7     # 손절 후 7일간 가중치 하향
 PENALTY_SCORE      = -20   # 손절 종목 점수 패널티
 COOLDOWN_HOURS     = 24    # 익절 후 24h 재매수 억제
+_APPLIED_EVENTS_KEEP = 200 # update_watch_trade 멱등용 최근 event_key 보존 개수
 
 
 # ════════════════════════════════════════════════════════════════
@@ -94,8 +95,10 @@ def record_watch_entry(symbol: str, price: float, source: str = "screener",
         }
         logger.debug(f"[WatchMgr] 관심종목 진입기록: {symbol} @${price:.2f} ({source})")
     else:
-        # 이미 있는 종목은 진입시각만 갱신 (완전 교체 방지) — 결정론적 값
-        data[symbol]["entered_at"]  = ts
+        # 이미 있는 종목은 '최초 진입시각(MIN)' 유지 — 부분체결마다 덮어써서
+        # 진입시각이 뒤로 밀리지 않도록 한다(결정론적·멱등).
+        _prev = data[symbol].get("entered_at") or ts
+        data[symbol]["entered_at"]  = min(_prev, ts)
         data[symbol]["entry_price"] = price
         data[symbol]["source"]      = source
 
@@ -110,7 +113,7 @@ def update_watch_trade(symbol: str, pnl_usd: float, is_profit: bool,
 
     ★ event_key 멱등: 동일 event_key 로 이미 반영된 종목이면 누적을 건너뛴다
       (실행 후 flag 저장 전 crash 재실행에도 중복 집계 없음). 최근 처리한
-      event_key 는 종목별 applied_events(최대 50개)에 영속 저장한다.
+      event_key 는 종목별 applied_events(최대 _APPLIED_EVENTS_KEEP개)에 영속 저장한다.
     """
     data = _load_json(WATCH_PERF_FILE)
     ts   = at or datetime.now().isoformat()
@@ -132,6 +135,12 @@ def update_watch_trade(symbol: str, pnl_usd: float, is_profit: bool,
     if event_key and event_key in applied:
         return   # 이미 반영됨 → 멱등 no-op(중복 누적 방지)
 
+    # ★ 집계값(trade_count/total_pnl)은 '먼저 누적·영속'되므로 보존된다.
+    #   applied_events 는 중복 누적 방지용 '상세 event 창'으로, 최근 N개만
+    #   유지(오래된 상세만 정리)한다. 종목당 한 세션 체결 수는 소수이므로 창을
+    #   벗어난 아주 오래된 event_key 의 재유입 가능성은 사실상 없다. 활성 위험
+    #   통제(거래건수·PnL·손실한도)는 SQLite effect 원장(us_app_effects, 세션·
+    #   주문키)이 권위이며 이 창의 정리와 무관하다.
     rec["trade_count"] = int(rec.get("trade_count", 0)) + 1
     rec["total_pnl"]   = float(rec.get("total_pnl", 0.0)) + pnl_usd
     rec["last_trade"]  = ts
@@ -139,8 +148,8 @@ def update_watch_trade(symbol: str, pnl_usd: float, is_profit: bool,
     rec["last_profit"] = is_profit
     if event_key:
         applied.append(event_key)
-        if len(applied) > 50:
-            del applied[:-50]
+        if len(applied) > _APPLIED_EVENTS_KEEP:
+            del applied[:-_APPLIED_EVENTS_KEEP]
 
     _save_json(WATCH_PERF_FILE, data)
     logger.debug(f"[WatchMgr] 성과 업데이트: {symbol} ${pnl_usd:+.2f} ({'익절' if is_profit else '손절'})")

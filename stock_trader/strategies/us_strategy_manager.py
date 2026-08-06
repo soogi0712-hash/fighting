@@ -53,6 +53,7 @@ from utils.market_session     import (
     us_session_info, is_us_tradeable,
     get_us_trading_phase, us_phase_info,
     US_PHASE_PRIME, US_PHASE_NEUTRAL, US_PHASE_CONSERVATIVE,
+    us_trading_session_id, us_session_phase,
 )
 from strategies.daily_pnl_guard import DailyPnLGuard
 from strategies.reentry_guard   import ReentryGuard, _is_stoploss_reason
@@ -631,7 +632,7 @@ class USPositionManager:
 _OUTBOX_COLS = (
     "event_key", "oid", "cum_qty", "cum_cost", "delta", "delta_avg",
     "side", "symbol", "name", "excd", "reason",
-    "pos_qty_before", "pnl_krw", "closed",
+    "pos_qty_before", "pnl_krw", "closed", "session_id",
     "pos_done", "pnl_done", "reentry_done", "event_done", "app_done",
     "created_at",
 )
@@ -677,6 +678,7 @@ class _USFillOutbox:
                         pos_qty_before INTEGER NOT NULL DEFAULT 0,
                         pnl_krw        REAL    NOT NULL DEFAULT 0,
                         closed         INTEGER NOT NULL DEFAULT 0,
+                        session_id     TEXT,
                         pos_done       INTEGER NOT NULL DEFAULT 0,
                         pnl_done       INTEGER NOT NULL DEFAULT 0,
                         reentry_done   INTEGER NOT NULL DEFAULT 0,
@@ -773,14 +775,14 @@ class _USAppEffectLedger:
                     CREATE TABLE IF NOT EXISTS us_app_effects (
                         event_key   TEXT NOT NULL,
                         effect_type TEXT NOT NULL,
-                        day         TEXT,
+                        session_id  TEXT,
                         amount      REAL NOT NULL DEFAULT 0,
                         done_at     TEXT,
                         PRIMARY KEY (event_key, effect_type)
                     )
                 """)
-                c.execute("CREATE INDEX IF NOT EXISTS ix_appfx_type_day "
-                          "ON us_app_effects(effect_type, day)")
+                c.execute("CREATE INDEX IF NOT EXISTS ix_appfx_type_session "
+                          "ON us_app_effects(effect_type, session_id)")
         except Exception as exc:
             logger.warning("[US AppEffect] 초기화 실패: %s", exc)
 
@@ -792,28 +794,32 @@ class _USAppEffectLedger:
         return row is not None
 
     def mark(self, event_key: str, effect_type: str,
-             day: str = "", amount: float = 0.0) -> None:
+             session_id: str = "", amount: float = 0.0) -> None:
         """(event_key, effect_type) 를 UNIQUE 키로 1회만 기록(INSERT OR IGNORE).
-        day/amount 는 집계(거래건수·PnL) 재구성용."""
+        session_id/amount 는 세션별 집계(거래건수·PnL) 재구성용."""
         from datetime import datetime as _dt
         with self._conn() as c:
             c.execute(
                 "INSERT OR IGNORE INTO us_app_effects "
-                "(event_key, effect_type, day, amount, done_at) VALUES (?,?,?,?,?)",
-                (event_key, effect_type, day, float(amount), _dt.now().isoformat()))
+                "(event_key, effect_type, session_id, amount, done_at) "
+                "VALUES (?,?,?,?,?)",
+                (event_key, effect_type, session_id, float(amount),
+                 _dt.now().isoformat()))
 
-    def count(self, effect_type: str, day: str) -> int:
+    def count(self, effect_type: str, session_id: str) -> int:
         with self._conn() as c:
             row = c.execute(
                 "SELECT COUNT(*) FROM us_app_effects "
-                "WHERE effect_type=? AND day=?", (effect_type, day)).fetchone()
+                "WHERE effect_type=? AND session_id=?",
+                (effect_type, session_id)).fetchone()
         return int(row[0] or 0) if row else 0
 
-    def sum_amount(self, effect_type: str, day: str) -> float:
+    def sum_amount(self, effect_type: str, session_id: str) -> float:
         with self._conn() as c:
             row = c.execute(
                 "SELECT COALESCE(SUM(amount),0) FROM us_app_effects "
-                "WHERE effect_type=? AND day=?", (effect_type, day)).fetchone()
+                "WHERE effect_type=? AND session_id=?",
+                (effect_type, session_id)).fetchone()
         return float(row[0] or 0.0) if row else 0.0
 
     def done_types(self, event_key: str) -> set:
@@ -1007,6 +1013,17 @@ class USStrategyManager:
             pnl_krw = (delta_avg - prev_avg) * sell_qty * fx
             closed  = 1 if (pos is not None and pos_qty_before - sell_qty <= 0) else 0
 
+        # ★ US 거래세션 귀속: 주문 접수시각(lc.accepted_at, 영속) 기준으로 계산해
+        #   부분체결이 KST 자정/세션 경계를 넘어도 동일 주문의 모든 delta 가 같은
+        #   세션에 귀속되게 한다. 재시작해도 lc 에서 동일하게 재계산된다.
+        _anchor = (getattr(lc, "accepted_at", None)
+                   or getattr(lc, "submitted_at", None)
+                   or getattr(lc, "created_at", None))
+        try:
+            session_id = us_trading_session_id(_anchor)
+        except Exception:
+            session_id = us_trading_session_id(None)
+
         # ── write-ahead: 부수효과 적용 전에 event 를 먼저 영속화 ──
         ek = ob.event_key(oid, cum_qty)
         ob.insert_if_absent({
@@ -1014,7 +1031,7 @@ class USStrategyManager:
             "delta": int(delta), "delta_avg": float(delta_avg), "side": side,
             "symbol": symbol, "name": name, "excd": excd, "reason": reason,
             "pos_qty_before": pos_qty_before, "pnl_krw": float(pnl_krw),
-            "closed": int(closed),
+            "closed": int(closed), "session_id": session_id,
             "pos_done": 0, "pnl_done": 0, "reentry_done": 0,
             "event_done": 0, "app_done": 0,
         })
@@ -1103,10 +1120,14 @@ class USStrategyManager:
         except Exception as exc:
             logger.warning("[US Outbox] replay 로드 실패: %s", exc)
             return
+        # ★ 손실한도(DailyPnLGuard)는 '현재 US 거래세션' 스코프로만 재구성한다.
+        #   KST 자정이 아니라 세션 경계에서만 초기화되며, 재시작해도 현재 세션의
+        #   실현손익이 그대로 복원된다(이전 세션 rows 는 합산 제외).
+        cur_sess = us_trading_session_id(None)
         rebuilt = 0.0
         for row in rows:
-            # (1) pnl 반영이 이미 확정된 매도 → 재시작으로 초기화된 일일 guard 복원
-            if row["side"] == "SELL" and row["pnl_done"]:
+            if (row["side"] == "SELL" and row["pnl_done"]
+                    and (row.get("session_id") or "") == cur_sess):
                 try:
                     self.pnl_guard.record(float(row["pnl_krw"]))
                     rebuilt += float(row["pnl_krw"])
@@ -1119,7 +1140,8 @@ class USStrategyManager:
             if not done:
                 self._us_process_outbox_row(row)
         if rebuilt:
-            logger.info("[US Outbox] 재시작 실현손익 재구성: ₩%.0f", rebuilt)
+            logger.info("[US Outbox] 재시작 현세션(%s) 실현손익 재구성: ₩%.0f",
+                        cur_sess, rebuilt)
 
     def _us_has_active_order(self, symbol: str, side: str = None) -> bool:
         """동일 종목(선택적으로 동일 방향)에 ACTIVE(접수/부분체결) US 주문이
@@ -1347,9 +1369,12 @@ class USStrategyManager:
                 "qty": int(r["delta"]), "price": float(r["delta_avg"]),
                 "pnl_krw": float(r["pnl_krw"]), "is_full": bool(r["closed"]),
                 "event_key": r["event_key"],
-                # ★ 결정론적 event 시각/일자(부수효과 멱등·재구성용, now() 아님)
+                # ★ 주문 identity(부분체결 delta 무관, 주문별 1회 집계용)
+                "order_key": f"{r['oid']}:{r['side']}",
+                # ★ US 거래세션 귀속(KST 날짜 아님) — 자정 넘어도 동일 세션
+                "session_id": r.get("session_id") or "",
+                # ★ 결정론적 event 시각(외부효과 멱등·재구성용, now() 아님)
                 "event_time": _ct,
-                "day": (_ct[:10] if _ct else ""),
             })
         return out
 
@@ -1384,13 +1409,17 @@ class USStrategyManager:
         ek  = (event or {}).get("event_key", "")
         if ledger is None or not ek:
             return False
-        day  = event.get("day", "") or ""
+        sess = event.get("session_id", "") or ""
         side = event.get("side")
+        # ★ 거래건수는 delta(event_key)별이 아니라 '주문(order_key)별 1회'만 기록.
+        #   3→5→10 부분체결이라도 주문 1개 = trade_count 1. 미체결 취소·거부는
+        #   체결 event 자체가 없어 0. PnL 은 delta 별 SUM 유지(event_key 사용).
+        order_key = event.get("order_key") or ek
 
-        # 1) 집계 effect — 원장 자체가 상태(UNIQUE, 재구성 가능)
-        ledger.mark(ek, "trade_count", day, 1.0)
+        # 1) 집계 effect — 원장 자체가 상태(UNIQUE, 세션별 재구성 가능)
+        ledger.mark(order_key, "trade_count", sess, 1.0)     # 주문별 1회
         if side == "SELL":
-            ledger.mark(ek, "pnl_stats", day, float(event.get("pnl_krw", 0.0)))
+            ledger.mark(ek, "pnl_stats", sess, float(event.get("pnl_krw", 0.0)))
 
         # 2) 외부 effect — gate + 멱등 fn
         ok = True
@@ -1406,11 +1435,13 @@ class USStrategyManager:
                              ek, et, exc)
                 ok = False
                 break
-            ledger.mark(ek, et, day, 0.0)
+            ledger.mark(ek, et, sess, 0.0)
 
-        # 3) 모든 effect 완료 시에만 app_done 확정
+        # 3) 모든 effect 완료 시에만 app_done 확정 (effect 별 키 사용)
+        def _effect_key(et):
+            return order_key if et == "trade_count" else ek
         effects = self._us_effect_types(event)
-        if ok and all(ledger.done(ek, et) for et in effects):
+        if ok and all(ledger.done(_effect_key(et), et) for et in effects):
             ob = getattr(self, "_us_outbox", None)
             if ob is not None:
                 try:
@@ -1421,15 +1452,20 @@ class USStrategyManager:
             return True
         return False
 
-    def us_today_trade_count(self, day: str) -> int:
-        """당일(day) US 거래건수 — effect 원장에서 결정론적 재구성(재시작 불변)."""
-        ledger = getattr(self, "_us_app_ledger", None)
-        return ledger.count("trade_count", day) if ledger else 0
+    def us_current_session_id(self):
+        """지금 시각 기준 미국 거래세션 식별자(ET 거래일)."""
+        return us_trading_session_id(None)
 
-    def us_today_realized_krw(self, day: str) -> float:
-        """당일(day) US 실현손익(KRW) — effect 원장에서 결정론적 재구성."""
+    def us_session_trade_count(self, session_id: str) -> int:
+        """세션(session_id) US 거래건수 — effect 원장에서 결정론적 재구성.
+        주문별 1회(order_key) 집계 → 부분체결 과다집계 없음. 재시작 불변."""
         ledger = getattr(self, "_us_app_ledger", None)
-        return ledger.sum_amount("pnl_stats", day) if ledger else 0.0
+        return ledger.count("trade_count", session_id) if ledger else 0
+
+    def us_session_realized_krw(self, session_id: str) -> float:
+        """세션(session_id) US 실현손익(KRW) — delta 별 SUM(pnl_stats)."""
+        ledger = getattr(self, "_us_app_ledger", None)
+        return ledger.sum_amount("pnl_stats", session_id) if ledger else 0.0
 
     def us_mark_app_done(self, event_key: str) -> None:
         """(호환용) 모든 부수효과 완료를 전제로 outbox app_done 확정."""

@@ -1469,15 +1469,14 @@ def _us_trading_loop():
                     _us_strategy.us_apply_app_effects(_ev, _fns)
                 except Exception as _ev_e:
                     _log(f"⚠️ [US체결이벤트 처리 오류] {_ev_e}", "error")
-            # ★ 당일 US 거래건수·실현손익은 effect 원장에서 결정론적으로 재구성
-            #   (인메모리 아님 → 재시작해도 동일값, 위험통제 유지)
+            # ★ US 거래건수·실현손익은 effect 원장에서 세션별로 결정론적 재구성
+            #   (인메모리 아님 → KST 자정/재시작에도 동일값, 위험통제 유지)
             if _pend:
                 try:
-                    from datetime import date as _date
-                    _uday = _date.today().isoformat()
-                    _utc  = _us_strategy.us_today_trade_count(_uday)
-                    _upnl = _us_strategy.us_today_realized_krw(_uday)
-                    _log(f"📊 [US당일] 거래 {_utc}회 · 실현 ₩{_upnl:+,.0f} "
+                    _usess = _us_strategy.us_current_session_id()
+                    _utc   = _us_strategy.us_session_trade_count(_usess)
+                    _upnl  = _us_strategy.us_session_realized_krw(_usess)
+                    _log(f"📊 [US세션 {_usess}] 거래 {_utc}회 · 실현 ₩{_upnl:+,.0f} "
                          f"(effect 원장 재구성)", "info")
                 except Exception:
                     pass
