@@ -599,14 +599,15 @@ def _make_us_manager_stub(tmp_dir: str):
         }
         usm._us_pending_buy_meta  = {}
         usm._us_pending_sell_meta = {}
+        usm._us_fill_events       = []
 
         # lifecycle / FillObserver 수동 초기화
         db_path = os.path.join(tmp_dir, "us_journal.db")
         usm._us_lifecycle_mgr    = OrderLifecycleManager(db_path)
-        usm._us_updater          = ExecutionDrivenPositionUpdater(
-            on_buy_filled  = lambda lc: None,
-            on_sell_filled = lambda lc: None,
-        )
+        usm._us_updater          = None
+        # delta 부킹 스토어는 None → us_dispatch_fill 의 delta 반영은 no-op
+        # (이 스위트는 register/odno/restore/poll 파이프라인만 검증)
+        usm._us_applied_store     = None
         usm._us_pending_registry  = None
         usm._us_fill_observer     = None
 
@@ -616,8 +617,7 @@ def _make_us_manager_stub(tmp_dir: str):
         usm._us_restore_pending_meta   = _USM._us_restore_pending_meta.__get__(usm)
         usm.run_us_fill_poll           = _USM.run_us_fill_poll.__get__(usm)
         usm.us_dispatch_fill           = _USM.us_dispatch_fill.__get__(usm)
-        usm._us_handle_buy_filled      = _USM._us_handle_buy_filled.__get__(usm)
-        usm._us_handle_sell_filled     = _USM._us_handle_sell_filled.__get__(usm)
+        usm._us_apply_fill_delta       = _USM._us_apply_fill_delta.__get__(usm)
         return usm
 
 

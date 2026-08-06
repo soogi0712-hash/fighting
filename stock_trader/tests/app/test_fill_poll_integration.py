@@ -107,6 +107,7 @@ def _make_us_strategy_stub(tmp_dir: str):
         us._us_pending_buy_meta  = {}
         us._us_pending_sell_meta = {}
         us._us_fill_events       = []
+        us._us_applied_store     = None   # delta 부킹 비활성(디스패치 경로만 검증)
 
         db_path = os.path.join(tmp_dir, "us_journal.db")
         us._us_lifecycle_mgr = OrderLifecycleManager(db_path)
