@@ -45,6 +45,7 @@ import time
 from datetime import datetime
 from utils.logger import get_logger
 from utils.market_session import session_info, is_tradeable, allow_new_buy_now, BUY_CUTOFF_TIME
+from utils.order_sizing import finalize_order_qty, qty_from_cash
 from config import Config
 from strategies.pyramid_strategy   import PyramidStrategyManager
 from strategies.indicator_validator import IndicatorValidator
@@ -538,6 +539,44 @@ class StrategyManager:
             return self._pending_registry.has_active_order(market, code, "BUY")
         except Exception:
             return False
+
+    def _kr_finalize_buy_qty(self, code: str, strategy_qty: int,
+                             query_price, ord_dvsn: str = "00",
+                             deposit_cash=None) -> tuple[int, str]:
+        """국내 매수수량을 KIS 현금 주문가능금액·수량으로 최종 확정한다.
+
+        최종수량 = min(전략수량, KIS현금주문가능수량, floor(현금가능금액*0.98/주문가)).
+        - 계좌·종목·실제주문가격 기준으로 KIS inquire-psbl-order 를 주문별 조회.
+        - 예수금(deposit_cash)은 교차검증/로그용, 권위값은 KIS 주문가능금액·수량.
+        - 조회실패/rt_cd오류/파싱실패/금액·수량 0 → (0, 사유) → 호출측 BUY_BLOCKED.
+        반환: (최종수량, 사유문자열)
+        """
+        try:
+            avail = self.api.get_kr_available_amounts(code, query_price, ord_dvsn)
+        except Exception as e:
+            return 0, f"주문가능 조회 예외 → 미제출: {e}"
+        if not avail.get("ok", False):
+            return 0, "주문가능 사전검증 실패(rt_cd/파싱/네트워크) → 미제출"
+        kis_qty = int(avail.get("qty", 0) or 0)
+        kis_amt = float(avail.get("amount", 0.0) or 0.0)
+        final_qty = finalize_order_qty(strategy_qty, kis_qty, kis_amt, query_price)
+        # 예수금 교차검증(로그용) — 권위값 아님
+        _dep = ""
+        if deposit_cash is not None:
+            try:
+                _dep = f" | 예수금(교차검증)={float(deposit_cash):,.0f}원"
+            except (TypeError, ValueError):
+                _dep = ""
+        logger.info(
+            "[국내 수량확정] %s = min(전략%d, KIS가능%d, 금액환산%d) → %d주"
+            " (현금가능=%.0f원, 주문가=%s)%s",
+            code, int(strategy_qty), kis_qty,
+            qty_from_cash(kis_amt, query_price), final_qty, kis_amt,
+            str(query_price), _dep)
+        if final_qty <= 0:
+            return 0, (f"KIS 현금 주문가능수량/금액 부족(가능수량={kis_qty}, "
+                       f"현금={kis_amt:,.0f}원) → 미제출")
+        return final_qty, "OK"
 
     def active_order_codes(self, market: str = "KR") -> set:
         """해당 시장에서 ACTIVE(ACCEPTED/PARTIALLY_FILLED) 주문이 걸린 코드 집합.
@@ -1942,30 +1981,37 @@ class StrategyManager:
                     use_price = _base_price  # 안전망
 
             # ══════════════════════════════════════════════════════
-            # ★ [국내장 BUY 사전검증] 주문 직전 잔고 충분 여부 확인
+            # ★ [국내장 BUY 사전검증] 주문 직전 KIS 현금 주문가능금액·수량으로
+            #   최종수량 확정 (예수금 나눗셈 아님). 계좌·종목·실제주문가격 기준.
+            #   조회실패/rt_cd오류/파싱실패/금액·수량 0 → 주문 미제출(BUY_BLOCKED).
+            #   예수금(cash)은 교차검증/로그용이며 권위값은 KIS 주문가능금액·수량.
             # ══════════════════════════════════════════════════════
-            _est_order_amt = (use_price if use_price > 0 else int(cur_price)) * qty
-            _avail_cash    = cash if cash is not None else 0.0
-            _cash_ok       = (_avail_cash >= _est_order_amt * 0.95)  # 5% 슬리피지 허용
-            logger.info(
-                f"[국내장 BUY 사전검증] 종목={name}({code}) | "
-                f"주문수량={qty}주 | ORD_DVSN={ord_dvsn} | ORD_UNPR={use_price}원 | "
-                f"현재가={cur_price:.0f}원 | "
-                f"예상주문금액={_est_order_amt:,}원 | "
-                f"주문가능현금={_avail_cash:,.0f}원 | "
-                f"잔고충분={'✅OK' if _cash_ok else '⚠️부족'}"
-            )
-            if not _cash_ok:
+            _query_price = use_price if use_price > 0 else int(cur_price)
+            _final_qty, _cap_reason = self._kr_finalize_buy_qty(
+                code, qty, _query_price, ord_dvsn=ord_dvsn or "00",
+                deposit_cash=cash)
+            if _final_qty <= 0:
                 logger.warning(
-                    f"⚠️ [국내장 BUY 잔고부족] {name}({code}) 주문 스킵 | "
-                    f"필요={_est_order_amt:,}원 > 가용={_avail_cash:,.0f}원"
-                )
+                    f"🚫 [국내장 BUY 미제출] {name}({code}) → {_cap_reason}")
                 return {
-                    "action":  "SKIP",
+                    "action":  "BUY_BLOCKED",
                     "code":    code, "name": name,
-                    "reason":  f"잔고부족 (필요={_est_order_amt:,}원 > 가용={_avail_cash:,.0f}원)",
+                    "reason":  _cap_reason,
                     "session": sess["session"],
                 }
+            if _final_qty != qty:
+                logger.info(
+                    f"[국내장 BUY 수량조정] {name}({code}) 전략 {qty}주 → "
+                    f"KIS 현금기준 {_final_qty}주")
+                qty = _final_qty
+            # 예수금(잔고) 교차검증 — 로그 경고만(권위값 아님, 하드 차단 아님)
+            _est_order_amt = (use_price if use_price > 0 else int(cur_price)) * qty
+            _avail_cash    = cash if cash is not None else 0.0
+            if _avail_cash and _avail_cash < _est_order_amt * 0.95:
+                logger.warning(
+                    f"⚠️ [예수금 교차검증 경고] {name}({code}) 예수금 스냅샷"
+                    f"({_avail_cash:,.0f}원) < 예상주문금액({_est_order_amt:,}원) — "
+                    f"KIS 현금 주문가능 기준으로는 통과. 참고용.")
 
             # ── [훅 1/2] SIGNAL_CONFIRMED + trade_id 생성 ────────
             _trade_id = ""
@@ -2845,6 +2891,20 @@ class StrategyManager:
                     continue
                 qty       = add_dec["qty"]
                 use_price = cur_price if ord_dvsn == "05" else 0
+                # ★ 재배분 추가매수도 KIS 현금 주문가능금액·수량으로 최종수량 확정.
+                #   조회실패/금액·수량 0 → 이 종목 추가매수 미제출(continue).
+                _q_price = use_price if use_price > 0 else int(cur_price)
+                _add_qty, _add_reason = self._kr_finalize_buy_qty(
+                    code, qty, _q_price, ord_dvsn=ord_dvsn or "00",
+                    deposit_cash=cash)
+                if _add_qty <= 0:
+                    logger.warning(
+                        f"🚫 [재배분 추가매수 미제출] {tgt['name']}({code}) → {_add_reason}")
+                    continue
+                if _add_qty != qty:
+                    logger.info(
+                        f"[재배분 수량조정] {tgt['name']}({code}) {qty}주 → {_add_qty}주")
+                    qty = _add_qty
                 res       = self.api.buy(code, qty, use_price, ord_dvsn=ord_dvsn)
                 if res.get("rt_cd") == "0":
                     # ── ★ Phase 3: 재배분 추가매수도 lifecycle 등록 ──
