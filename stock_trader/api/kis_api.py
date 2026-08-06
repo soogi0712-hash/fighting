@@ -1549,6 +1549,24 @@ class KISApi:
 
             krw = float(output.get("ovrs_ord_psbl_amt",  0) or 0)
             usd = float(output.get("frcr_ord_psbl_amt1", 0) or 0)
+
+            # ★ 통합증거금(원화) 계좌 폴백:
+            #   해외주문가능 원화(ovrs_ord_psbl_amt)·외화(frcr_ord_psbl_amt1)가
+            #   둘 다 0으로 내려오면(외화 환전잔고 없음 + 해외원화한도 미반영),
+            #   국내 주문가능현금(예수금, ord_psbl_cash)을 원화 예산으로 사용한다.
+            #   → buy_us(allow_krw_order=True) 의 원화주문(자동환전) 경로로 US 매수 가능.
+            if krw <= 0 and usd <= 0:
+                try:
+                    _kr_cash = self.get_orderable_cash()
+                except Exception:
+                    _kr_cash = -1.0
+                if _kr_cash and _kr_cash > 0:
+                    krw = float(_kr_cash)
+                    logger.info(
+                        "[해외주문가능] ovrs/frcr 0 → 국내 예수금 폴백: "
+                        f"krw={krw:,.0f}원 (원화주문·자동환전으로 US 매수)"
+                    )
+
             return {"krw": krw, "usd": usd, "raw": output}
 
         except Exception as e:
