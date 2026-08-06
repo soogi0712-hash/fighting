@@ -773,10 +773,14 @@ class _USAppEffectLedger:
                     CREATE TABLE IF NOT EXISTS us_app_effects (
                         event_key   TEXT NOT NULL,
                         effect_type TEXT NOT NULL,
+                        day         TEXT,
+                        amount      REAL NOT NULL DEFAULT 0,
                         done_at     TEXT,
                         PRIMARY KEY (event_key, effect_type)
                     )
                 """)
+                c.execute("CREATE INDEX IF NOT EXISTS ix_appfx_type_day "
+                          "ON us_app_effects(effect_type, day)")
         except Exception as exc:
             logger.warning("[US AppEffect] 초기화 실패: %s", exc)
 
@@ -787,13 +791,30 @@ class _USAppEffectLedger:
                 (event_key, effect_type)).fetchone()
         return row is not None
 
-    def mark(self, event_key: str, effect_type: str) -> None:
+    def mark(self, event_key: str, effect_type: str,
+             day: str = "", amount: float = 0.0) -> None:
+        """(event_key, effect_type) 를 UNIQUE 키로 1회만 기록(INSERT OR IGNORE).
+        day/amount 는 집계(거래건수·PnL) 재구성용."""
         from datetime import datetime as _dt
         with self._conn() as c:
             c.execute(
                 "INSERT OR IGNORE INTO us_app_effects "
-                "(event_key, effect_type, done_at) VALUES (?,?,?)",
-                (event_key, effect_type, _dt.now().isoformat()))
+                "(event_key, effect_type, day, amount, done_at) VALUES (?,?,?,?,?)",
+                (event_key, effect_type, day, float(amount), _dt.now().isoformat()))
+
+    def count(self, effect_type: str, day: str) -> int:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT COUNT(*) FROM us_app_effects "
+                "WHERE effect_type=? AND day=?", (effect_type, day)).fetchone()
+        return int(row[0] or 0) if row else 0
+
+    def sum_amount(self, effect_type: str, day: str) -> float:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT COALESCE(SUM(amount),0) FROM us_app_effects "
+                "WHERE effect_type=? AND day=?", (effect_type, day)).fetchone()
+        return float(row[0] or 0.0) if row else 0.0
 
     def done_types(self, event_key: str) -> set:
         with self._conn() as c:
@@ -1320,45 +1341,76 @@ class USStrategyManager:
             return []
         out = []
         for r in rows:
+            _ct = r.get("created_at") or ""
             out.append({
                 "side": r["side"], "symbol": r["symbol"], "name": r["name"],
                 "qty": int(r["delta"]), "price": float(r["delta_avg"]),
                 "pnl_krw": float(r["pnl_krw"]), "is_full": bool(r["closed"]),
                 "event_key": r["event_key"],
+                # ★ 결정론적 event 시각/일자(부수효과 멱등·재구성용, now() 아님)
+                "event_time": _ct,
+                "day": (_ct[:10] if _ct else ""),
             })
         return out
 
-    def us_apply_app_effects(self, event: dict, fns: dict) -> bool:
-        """체결이벤트의 app 부수효과를 (event_key, effect_type) 단위로 정확히 1회
-        적용한다.
+    def _us_external_effect_types(self, event: dict) -> list:
+        """이 event 의 외부(비집계) 부수효과 목록."""
+        if event.get("side") == "BUY":
+            return ["watch_entry"]
+        if event.get("side") == "SELL" and event.get("is_full"):
+            return ["on_sell_complete"]
+        return []
 
-        fns: {effect_type: callable(event_key, event)} — 예: trade_count /
-             pnl_stats / watch_entry / on_sell_complete / reentry_penalty.
-        - 각 effect 는 app effect 원장에 done 이면 건너뛴다(재전달·재시작 안전).
-        - effect 실행 후 원장에 mark. 실행 후 mark 전 crash 로 재실행돼도, 각 fn 은
-          event_key 로 멱등 처리하는 것을 계약으로 한다(중복 페널티/집계 방지).
-        - 한 effect 실패 시 그 effect 만 미완료로 남기고 이후 effect 도 보류
-          → 다음 폴에서 미완료 effect 만 이어서 처리.
-        - 모든 effect 완료된 뒤에만 outbox 의 app_done 을 확정한다.
-        반환: 모든 effect 완료(app_done 확정)면 True.
+    def _us_effect_types(self, event: dict) -> list:
+        """이 event 의 전체 effect 목록(집계 + 외부)."""
+        agg = ["trade_count"] + (["pnl_stats"] if event.get("side") == "SELL" else [])
+        return agg + self._us_external_effect_types(event)
+
+    def us_apply_app_effects(self, event: dict, external_fns: dict = None) -> bool:
+        """체결이벤트의 app 부수효과를 (event_key, effect_type) UNIQUE 원장으로
+        정확히 1회 적용한다.
+
+        - 집계 effect(trade_count/pnl_stats): 원장에 (day, amount) 로 INSERT OR
+          IGNORE 만 한다. 별도 인메모리 카운터가 없으므로 crash 창이 없고,
+          당일 거래건수·PnL 은 원장에서 COUNT/SUM 으로 '매번 결정론적 재구성'된다.
+        - 외부 effect(watch_entry/on_sell_complete): 원장 done 이면 skip, 아니면
+          fn(event_key, event) 실행 후 mark. fn 은 event 의 결정론적 시각/키로
+          멱등 처리(재실행해도 쿨다운 만료·집계 불변)하는 것을 계약으로 한다.
+        - 한 effect 실패 시 그것만 미완료로 남기고 이후 보류 → 다음 폴 재처리.
+        - 모든 effect 완료 후에만 outbox app_done 확정.
+        반환: 모든 effect 완료면 True.
         """
         ledger = getattr(self, "_us_app_ledger", None)
-        ek = (event or {}).get("event_key", "")
-        if ledger is None or not ek or not fns:
+        ek  = (event or {}).get("event_key", "")
+        if ledger is None or not ek:
             return False
-        for et, fn in fns.items():
+        day  = event.get("day", "") or ""
+        side = event.get("side")
+
+        # 1) 집계 effect — 원장 자체가 상태(UNIQUE, 재구성 가능)
+        ledger.mark(ek, "trade_count", day, 1.0)
+        if side == "SELL":
+            ledger.mark(ek, "pnl_stats", day, float(event.get("pnl_krw", 0.0)))
+
+        # 2) 외부 effect — gate + 멱등 fn
+        ok = True
+        for et in self._us_external_effect_types(event):
             if ledger.done(ek, et):
                 continue
+            fn = (external_fns or {}).get(et)
             try:
                 if fn is not None:
                     fn(ek, event)
             except Exception as exc:
                 logger.error("[US app effect] %s/%s 실패 — 다음 폴 재시도: %s",
                              ek, et, exc)
-                return False   # 실패 effect 이후는 보류(app_done 미확정)
-            ledger.mark(ek, et)
-        # 모든 effect 완료 시에만 app_done 확정
-        if all(ledger.done(ek, et) for et in fns):
+                ok = False
+                break
+            ledger.mark(ek, et, day, 0.0)
+
+        # 3) 모든 effect 완료 시에만 app_done 확정
+        effects = self._us_effect_types(event)
+        if ok and all(ledger.done(ek, et) for et in effects):
             ob = getattr(self, "_us_outbox", None)
             if ob is not None:
                 try:
@@ -1368,6 +1420,16 @@ class USStrategyManager:
                                    ek, exc)
             return True
         return False
+
+    def us_today_trade_count(self, day: str) -> int:
+        """당일(day) US 거래건수 — effect 원장에서 결정론적 재구성(재시작 불변)."""
+        ledger = getattr(self, "_us_app_ledger", None)
+        return ledger.count("trade_count", day) if ledger else 0
+
+    def us_today_realized_krw(self, day: str) -> float:
+        """당일(day) US 실현손익(KRW) — effect 원장에서 결정론적 재구성."""
+        ledger = getattr(self, "_us_app_ledger", None)
+        return ledger.sum_amount("pnl_stats", day) if ledger else 0.0
 
     def us_mark_app_done(self, event_key: str) -> None:
         """(호환용) 모든 부수효과 완료를 전제로 outbox app_done 확정."""

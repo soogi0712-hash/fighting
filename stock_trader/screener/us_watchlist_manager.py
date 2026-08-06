@@ -70,18 +70,22 @@ def _save_json(path: str, data: dict):
 # ── 1. 관심종목 성과 추적 (Watch Performance)
 # ════════════════════════════════════════════════════════════════
 
-def record_watch_entry(symbol: str, price: float, source: str = "screener"):
+def record_watch_entry(symbol: str, price: float, source: str = "screener",
+                       entered_at: str = None, event_key: str = None):
     """
-    관심종목 진입 시각·가격 기록.
-    스크리닝 결과로 watchlist에 신규 추가될 때 호출.
+    관심종목 진입 시각·가격 기록. 종목키로 덮어쓰므로 중복 항목이 생기지 않는다.
+
+    entered_at: 결정론적 진입시각(ISO). 지정 시 재실행해도 값이 불변
+                (now() 사용 시 재실행마다 시각 드리프트). event_key 는 예약(현재
+                종목키 덮어쓰기로 이미 멱등).
     """
     data = _load_json(WATCH_PERF_FILE)
-    now  = datetime.now().isoformat()
+    ts   = entered_at or datetime.now().isoformat()
 
     if symbol not in data:
         data[symbol] = {
             "symbol":     symbol,
-            "entered_at": now,
+            "entered_at": ts,
             "entry_price": price,
             "source":     source,
             "trade_count": 0,
@@ -90,38 +94,53 @@ def record_watch_entry(symbol: str, price: float, source: str = "screener"):
         }
         logger.debug(f"[WatchMgr] 관심종목 진입기록: {symbol} @${price:.2f} ({source})")
     else:
-        # 이미 있는 종목은 진입시각만 갱신 (완전 교체 방지)
-        data[symbol]["entered_at"]  = now
+        # 이미 있는 종목은 진입시각만 갱신 (완전 교체 방지) — 결정론적 값
+        data[symbol]["entered_at"]  = ts
         data[symbol]["entry_price"] = price
         data[symbol]["source"]      = source
 
     _save_json(WATCH_PERF_FILE, data)
 
 
-def update_watch_trade(symbol: str, pnl_usd: float, is_profit: bool):
+def update_watch_trade(symbol: str, pnl_usd: float, is_profit: bool,
+                       event_key: str = None, at: str = None):
     """
-    매매 완료 후 성과 업데이트.
+    매매 완료 후 성과 업데이트 (trade_count/total_pnl 누적).
     app.py _us_stock_loop SELL 처리 후 호출.
+
+    ★ event_key 멱등: 동일 event_key 로 이미 반영된 종목이면 누적을 건너뛴다
+      (실행 후 flag 저장 전 crash 재실행에도 중복 집계 없음). 최근 처리한
+      event_key 는 종목별 applied_events(최대 50개)에 영속 저장한다.
     """
     data = _load_json(WATCH_PERF_FILE)
-    now  = datetime.now().isoformat()
+    ts   = at or datetime.now().isoformat()
 
     if symbol not in data:
         data[symbol] = {
             "symbol":      symbol,
-            "entered_at":  now,
+            "entered_at":  ts,
             "entry_price": 0.0,
             "source":      "unknown",
             "trade_count": 0,
             "total_pnl":   0.0,
             "last_trade":  None,
+            "applied_events": [],
         }
 
-    data[symbol]["trade_count"] += 1
-    data[symbol]["total_pnl"]   += pnl_usd
-    data[symbol]["last_trade"]   = now
-    data[symbol]["last_pnl"]     = pnl_usd
-    data[symbol]["last_profit"]  = is_profit
+    rec = data[symbol]
+    applied = rec.setdefault("applied_events", [])
+    if event_key and event_key in applied:
+        return   # 이미 반영됨 → 멱등 no-op(중복 누적 방지)
+
+    rec["trade_count"] = int(rec.get("trade_count", 0)) + 1
+    rec["total_pnl"]   = float(rec.get("total_pnl", 0.0)) + pnl_usd
+    rec["last_trade"]  = ts
+    rec["last_pnl"]    = pnl_usd
+    rec["last_profit"] = is_profit
+    if event_key:
+        applied.append(event_key)
+        if len(applied) > 50:
+            del applied[:-50]
 
     _save_json(WATCH_PERF_FILE, data)
     logger.debug(f"[WatchMgr] 성과 업데이트: {symbol} ${pnl_usd:+.2f} ({'익절' if is_profit else '손절'})")
@@ -205,15 +224,16 @@ def get_today_profit_symbols() -> set:
 # ── 4. 7일 손절 페널티
 # ════════════════════════════════════════════════════════════════
 
-def record_penalty(symbol: str, pnl_usd: float):
+def record_penalty(symbol: str, pnl_usd: float, at: str = None):
     """
     손절 종목을 7일 페널티 목록에 등록.
     app.py SELL(손절) 완료 시 호출.
+    at: 결정론적 등록시각(ISO) — 재실행해도 페널티 만료시각 불변.
     """
     data = _load_json(PENALTY_FILE)
     data[symbol] = {
         "pnl_usd":    pnl_usd,
-        "penalty_at": datetime.now().isoformat(),
+        "penalty_at": at or datetime.now().isoformat(),
     }
     _save_json(PENALTY_FILE, data)
     logger.info(f"[WatchMgr] 7일 손절페널티 등록: {symbol} ${pnl_usd:.2f}")
@@ -235,10 +255,13 @@ def get_penalty_symbols() -> set:
 # ── 5. 24h 쿨다운 (익절 후 재매수 억제)
 # ════════════════════════════════════════════════════════════════
 
-def record_cooldown(symbol: str):
-    """익절 종목을 24h 쿨다운에 등록 (screener 점수 -15점)."""
+def record_cooldown(symbol: str, at: str = None):
+    """익절 종목을 24h 쿨다운에 등록 (screener 점수 -15점).
+
+    at: 결정론적 등록시각(ISO). 지정 시 재실행해도 쿨다운 만료시각이 불변
+        (now() 사용 시 재실행마다 연장되는 문제 방지)."""
     data = _load_json(COOLDOWN_FILE)
-    data[symbol] = datetime.now().isoformat()
+    data[symbol] = at or datetime.now().isoformat()
     _save_json(COOLDOWN_FILE, data)
 
 
@@ -253,12 +276,13 @@ def get_cooldown_symbols() -> set:
 # ── 6. 3일 손실 페널티 (기존 호환)
 # ════════════════════════════════════════════════════════════════
 
-def record_recent_loss(symbol: str, pnl_usd: float):
-    """손실 청산 종목 기록 (3일 패널티 — 기존 save_recent_loss 호환)."""
+def record_recent_loss(symbol: str, pnl_usd: float, at: str = None):
+    """손실 청산 종목 기록 (3일 패널티 — 기존 save_recent_loss 호환).
+    at: 결정론적 청산시각(ISO) — 재실행해도 만료시각 불변."""
     data = _load_json(RECENT_LOSS_FILE)
     data[symbol] = {
         "pnl_usd":   pnl_usd,
-        "closed_at": datetime.now().isoformat(),
+        "closed_at": at or datetime.now().isoformat(),
     }
     _save_json(RECENT_LOSS_FILE, data)
 
@@ -431,33 +455,36 @@ def log_daily_screener_result(
 # ── 9. SELL 완료 후 일괄 처리 (app.py에서 호출)
 # ════════════════════════════════════════════════════════════════
 
-def on_sell_complete(symbol: str, pnl_usd: float):
+def on_sell_complete(symbol: str, pnl_usd: float,
+                     event_key: str = None, event_time: str = None):
     """
     SELL 완료 후 호출 — 익절/손절 여부에 따라 자동 분기 처리.
 
-    app.py _us_stock_loop의 action == 'SELL' 블록에서 호출:
-        from screener.us_watchlist_manager import on_sell_complete
-        on_sell_complete(symbol, pnl_usd_val)
+    ★ event_key + event_time(결정론적 시각)으로 멱등 처리한다. 실행 후 상위
+      ledger mark 전 crash 로 재실행돼도:
+        - 성과 누적(update_watch_trade)은 event_key 로 중복 방지
+        - 쿨다운/페널티/손실기록 만료시각은 event_time 기준이라 불변(연장 없음)
+      → 중복 페널티/집계가 발생하지 않는다.
     """
     is_profit = pnl_usd >= 0
-    now_str   = datetime.now().strftime("%H:%M:%S")
+    _at = event_time or datetime.now().isoformat()
 
-    # 성과 업데이트
-    update_watch_trade(symbol, pnl_usd, is_profit)
+    # 성과 업데이트 (event_key 멱등)
+    update_watch_trade(symbol, pnl_usd, is_profit, event_key=event_key, at=_at)
 
     if is_profit:
-        # 익절: 당일 재진입 금지 + 24h 쿨다운
+        # 익절: 당일 재진입 금지 + 24h 쿨다운 (결정론적 시각)
         record_daily_profit(symbol)
-        record_cooldown(symbol)
+        record_cooldown(symbol, at=_at)
         logger.info(
             f"✅ [WatchMgr] {symbol} 익절 ${pnl_usd:+.2f} | "
-            f"당일 재진입 금지 + 24h 쿨다운 등록 ({now_str})"
+            f"당일 재진입 금지 + 24h 쿨다운 등록"
         )
     else:
-        # 손절: 7일 페널티 + 3일 손실기록
-        record_penalty(symbol, pnl_usd)
-        record_recent_loss(symbol, pnl_usd)
+        # 손절: 7일 페널티 + 3일 손실기록 (결정론적 시각)
+        record_penalty(symbol, pnl_usd, at=_at)
+        record_recent_loss(symbol, pnl_usd, at=_at)
         logger.info(
             f"🔴 [WatchMgr] {symbol} 손절 ${pnl_usd:.2f} | "
-            f"7일 페널티 + 3일 손실기록 등록 ({now_str})"
+            f"7일 페널티 + 3일 손실기록 등록"
         )
