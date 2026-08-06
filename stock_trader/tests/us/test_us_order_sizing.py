@@ -127,6 +127,35 @@ class TestUSBuyOrderSizing(unittest.TestCase):
         self.assertEqual(us.api.buy_us.call_count, 2)              # 정확히 1회 재시도
         self.assertEqual(us.api.buy_us.call_args_list[1][0][1], 2)  # 축소수량=2
 
+    def test_ambiguous_response_no_retry(self):
+        """접수 여부 불명확(rt_cd=9, 예외/타임아웃 래핑) → 메시지에 '부족' 있어도
+        재주문하지 않는다(중복 제출 방지)."""
+        us = make_us_buy(
+            order_avails=[
+                {"ok": True, "usd": 1e9, "krw": 0.0, "qty": 50},
+                {"ok": True, "usd": 1e9, "krw": 0.0, "qty": 2},
+            ],
+            buy_results=[
+                {"rt_cd": "9", "msg1": "타임아웃: 주문가능금액 부족?"},   # 불명확
+                {"rt_cd": "0"},
+            ])
+        us._do_buy("AAPL", "Apple", "NASD", 10.0, SESS, IV)
+        self.assertEqual(us.api.buy_us.call_count, 1)   # 재시도 없음
+
+    def test_reject_with_order_number_no_retry(self):
+        """응답에 주문번호(ODNO)가 있으면 이미 접수된 것으로 보고 재주문 금지."""
+        us = make_us_buy(
+            order_avails=[
+                {"ok": True, "usd": 1e9, "krw": 0.0, "qty": 50},
+                {"ok": True, "usd": 1e9, "krw": 0.0, "qty": 2},
+            ],
+            buy_results=[
+                {"rt_cd": "1", "msg1": "금액 부족", "output": {"ODNO": "0000123"}},
+                {"rt_cd": "0"},
+            ])
+        us._do_buy("AAPL", "Apple", "NASD", 10.0, SESS, IV)
+        self.assertEqual(us.api.buy_us.call_count, 1)   # 재시도 없음
+
     def test_no_infinite_retry_when_not_smaller(self):
         """재조회해도 수량이 안 줄면(동일수량) 재시도하지 않는다."""
         us = make_us_buy(
