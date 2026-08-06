@@ -605,9 +605,9 @@ def _make_us_manager_stub(tmp_dir: str):
         db_path = os.path.join(tmp_dir, "us_journal.db")
         usm._us_lifecycle_mgr    = OrderLifecycleManager(db_path)
         usm._us_updater          = None
-        # delta 부킹 스토어는 None → us_dispatch_fill 의 delta 반영은 no-op
+        # outbox None → us_dispatch_fill 의 delta 반영은 no-op
         # (이 스위트는 register/odno/restore/poll 파이프라인만 검증)
-        usm._us_applied_store     = None
+        usm._us_outbox            = None
         usm._us_pending_registry  = None
         usm._us_fill_observer     = None
 

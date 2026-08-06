@@ -1497,11 +1497,17 @@ class KISApi:
             logger.error(f"해외주식 원화 주문가능금액 조회 오류: {e}")
             return 0.0
 
-    def get_us_available_amounts(self, symbol: str = "", excd: str = "") -> dict:
+    def get_us_available_amounts(self, symbol: str = "", excd: str = "",
+                                 ord_unpr: float = 0.0) -> dict:
         """
-        해외주식 주문가능금액 전체 조회 (원화 + USD 동시)
-        symbol/excd 를 지정하면 해당 종목 기준으로 조회 (더 정확한 ovrs_ord_psbl_amt)
-        반환: {"krw": float, "usd": float, "raw": dict}
+        해외주식 주문가능금액 조회 (KIS inquire-psamount, 주문별 검증용).
+
+        ★ 실제 주문과 동일한 계좌(CANO/ACNT_PRDT_CD) · 거래소(OVRS_EXCG_CD) ·
+          종목(ITEM_CD=symbol) · 주문가격(OVRS_ORD_UNPR=ord_unpr) 기준으로 조회한다.
+          ord_unpr 를 넘기면 해당 지정가 기준 주문가능수량/금액이 반영된다.
+        반환: {"krw": float, "usd": float, "raw": dict, "ok": bool}
+          - krw = ovrs_ord_psbl_amt (원화 주문가능), usd = frcr_ord_psbl_amt1 (외화)
+          - ok=False: rt_cd!=0 / 타임아웃 / 네트워크 / 파싱 실패 → 주문 미제출 신호
         """
         url   = f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-psamount"
         from config import Config as _cfg
@@ -1527,11 +1533,16 @@ class KISApi:
                 _item_cd2 = "BBAI"
                 _excd     = "NYSE"
 
+        # ★ 주문가격 반영: 지정가 주문이면 실제 주문가로 조회(주문별 검증)
+        try:
+            _unpr = f"{float(ord_unpr):.4f}" if ord_unpr and float(ord_unpr) > 0 else "0"
+        except (TypeError, ValueError):
+            _unpr = "0"
         params = {
             "CANO":          acc_no,
             "ACNT_PRDT_CD":  acc_prod,
             "OVRS_EXCG_CD":  _excd,
-            "OVRS_ORD_UNPR": "0",
+            "OVRS_ORD_UNPR": _unpr,
             "ITEM_CD":       _item_cd2,   # ★ 필수
         }
         try:
