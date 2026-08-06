@@ -24,11 +24,6 @@ _kis_fail_cache: dict = {}
 _KIS_FAIL_THRESHOLD  = 3     # 연속 N회 실패 → yfinance 자동 전환
 _KIS_COOLDOWN_SEC    = 1800  # 30분 쿨다운 후 KIS 재시도
 
-# ★ 통합증거금 US 폴백: 해외 주문가능금액이 0으로 조회될 때 국내 주문가능현금을
-#   "참고 예산"으로만 노출하되, 국내 매매용 현금 보존을 위해 보수적 비율만 사용한다.
-#   실제 매수 가능 여부는 buy_us→KIS 주문 접수(rt_cd)로 최종 검증된다.
-_US_KRW_FALLBACK_RATIO = 0.50
-
 logger = get_logger("KIS_API")
 
 
@@ -1548,46 +1543,34 @@ class KISApi:
             )
             resp.raise_for_status()
             data   = resp.json()
+
+            # ★ rt_cd != 0 은 조회 실패 → ok=False (주문 사전검증 불가 → 차단 신호)
+            if str(data.get("rt_cd", "1")) != "0":
+                logger.warning(
+                    "[해외주문가능] 조회 실패 rt_cd=%s msg=%s",
+                    data.get("rt_cd"), data.get("msg1", ""))
+                return {"krw": 0.0, "usd": 0.0, "raw": data, "ok": False}
+
             output = data.get("output", {})
             if isinstance(output, list):
                 output = output[0] if output else {}
 
-            krw = float(output.get("ovrs_ord_psbl_amt",  0) or 0)
-            usd = float(output.get("frcr_ord_psbl_amt1", 0) or 0)
+            # ★ KIS 해외 주문가능금액만 사용한다(확정액). 국내 예수금 기반 폴백은
+            #   제거했다 — 해외 주문가능이 KIS 로 확인되지 않으면 주문하지 않는다.
+            #   파싱 실패 시 ok=False.
+            try:
+                krw = float(output.get("ovrs_ord_psbl_amt",  0) or 0)
+                usd = float(output.get("frcr_ord_psbl_amt1", 0) or 0)
+            except (TypeError, ValueError):
+                logger.warning("[해외주문가능] 금액 파싱 실패 output=%r", output)
+                return {"krw": 0.0, "usd": 0.0, "raw": output, "ok": False}
 
-            # ★ 통합증거금(원화) 계좌 폴백 (참고 예산 only):
-            #   해외주문가능 원화(ovrs_ord_psbl_amt)·외화(frcr_ord_psbl_amt1)가
-            #   둘 다 0으로 내려올 때만(외화 환전잔고 없음 + 해외원화한도 미반영),
-            #   국내 주문가능현금을 "참고 예산"으로 노출한다.
-            #   ── 안전장치 ──
-            #   • ord_psbl_cash 는 국내 미체결 예약금·정산 반영 후 값(묶인 현금 제외).
-            #   • 국내 매매용 현금 보존을 위해 보수적 비율(_US_KRW_FALLBACK_RATIO)만 사용.
-            #   • 이 값은 추정치이며 확정 주문가능액이 아니다. 실제 매수 가능 여부는
-            #     buy_us→KIS 원화주문 접수(rt_cd)로 최종 검증되고, KIS 가 거절하면
-            #     _do_buy 가 BUY_FAIL 로 차단한다(허용이 아니라 차단).
-            #   • 예수금 조회 실패(-1)/0 이면 폴백하지 않는다 → krw=0 유지 → 매수 차단.
-            krw_is_fallback = False
-            if krw <= 0 and usd <= 0:
-                try:
-                    _kr_cash = self.get_orderable_cash()
-                except Exception:
-                    _kr_cash = -1.0
-                if _kr_cash and _kr_cash > 0:
-                    krw = float(_kr_cash) * _US_KRW_FALLBACK_RATIO
-                    krw_is_fallback = True
-                    logger.info(
-                        "[해외주문가능] ovrs/frcr 0 → 국내 예수금 참고폴백: "
-                        "예수금 %.0f원 × %.2f = %.0f원 "
-                        "(추정치 — 실주문은 KIS 접수로 최종검증)",
-                        _kr_cash, _US_KRW_FALLBACK_RATIO, krw,
-                    )
-
-            return {"krw": krw, "usd": usd, "raw": output,
-                    "krw_is_fallback": krw_is_fallback}
+            return {"krw": krw, "usd": usd, "raw": output, "ok": True}
 
         except Exception as e:
+            # 타임아웃/네트워크/HTTP 오류 → ok=False (주문 미제출 신호)
             logger.error(f"해외주식 주문가능금액 조회 오류: {e}")
-            return {"krw": 0.0, "usd": 0.0, "raw": {}}
+            return {"krw": 0.0, "usd": 0.0, "raw": {}, "ok": False}
 
     def buy_us(self, symbol: str, qty: int, price: float = 0,
                excd: str = "NASD",
