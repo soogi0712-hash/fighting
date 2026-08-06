@@ -1415,8 +1415,10 @@ def _us_trading_loop():
                     "info",
                 )
             # ★ 실체결 이벤트 처리 — 접수가 아니라 FILLED 시점에 거래집계/워치엔트리/
-            #   on_sell_complete 를 정확히 1회 구동한다.
+            #   on_sell_complete 를 정확히 1회 구동한다. 처리 후 us_mark_app_done 으로
+            #   확정 → 재시작해도 미처리(app_done=0) 이벤트만 재전달되어 중복 없음.
             for _ev in _us_poll.get("fill_events", []):
+                _ek = _ev.get("event_key", "")
                 try:
                     _sym = _ev.get("symbol", "")
                     if _ev.get("side") == "BUY":
@@ -1432,23 +1434,26 @@ def _us_trading_loop():
                             "buy",
                         )
                     elif _ev.get("side") == "SELL":
-                        _pnl = float(_ev.get("pnl_usd", 0))
-                        _record_trade_pnl(pnl_usd=_pnl, is_trade=True)
-                        _emoji = "💰" if _pnl >= 0 else "🔴"
+                        _pnl_krw = float(_ev.get("pnl_krw", 0))
+                        _record_trade_pnl(pnl_krw=_pnl_krw, is_trade=True)
+                        _emoji = "💰" if _pnl_krw >= 0 else "🔴"
                         _log(
                             f"{_emoji} [US체결] 매도 {_ev.get('name', _sym)}({_sym}) "
                             f"{_ev.get('qty',0)}주 @${float(_ev.get('price',0)):.2f} "
-                            f"실현 ${_pnl:+.2f}",
+                            f"실현 ₩{_pnl_krw:+,.0f}",
                             "sell",
                         )
                         # 전량 청산 체결 시에만 on_sell_complete (재진입/쿨다운 훅)
                         if _ev.get("is_full"):
                             try:
                                 from screener.us_watchlist_manager import on_sell_complete
-                                on_sell_complete(_sym, _pnl)
+                                on_sell_complete(_sym, _pnl_krw)
                             except Exception as _hook_err:
                                 _log(f"⚠️ [매도훅 오류] {_sym}: {_hook_err}", "error")
+                    # ★ 처리 완료 확정(영속) — 중복 실행 방지
+                    _us_strategy.us_mark_app_done(_ek)
                 except Exception as _ev_e:
+                    # 처리 실패 시 app_done 을 세우지 않음 → 다음 폴에서 재시도
                     _log(f"⚠️ [US체결이벤트 처리 오류] {_ev_e}", "error")
         except Exception as _ufp_e:
             _log(f"❌ [US FillPoll] 체결 폴링 오류: {_ufp_e}", "error")

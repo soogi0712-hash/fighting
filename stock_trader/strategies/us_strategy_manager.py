@@ -628,13 +628,25 @@ class USPositionManager:
 # ── 주문별 반영(부킹) 완료 누적 체결 워터마크 영속화
 # ════════════════════════════════════════════════════════════
 
-class _USAppliedFillStore:
-    """주문(order_lifecycle_id)별로 '이미 포지션/손익에 반영(부킹)한' 누적 체결
-    수량과 누적 원가를 영속화한다.
+_OUTBOX_COLS = (
+    "event_key", "oid", "cum_qty", "cum_cost", "delta", "delta_avg",
+    "side", "symbol", "name", "excd", "reason",
+    "pos_qty_before", "pnl_krw", "closed",
+    "pos_done", "pnl_done", "reentry_done", "event_done", "app_done",
+    "created_at",
+)
 
-    delta = cumulative_filled_qty - applied_qty 만 반영하므로, 부분체결 누적·
-    중복 폴링·프로세스 재시작 후 재조회에서도 이중부킹이 발생하지 않는다.
-    반영 성공 후에만 applied 를 원자적으로 UPSERT 한다.
+
+class _USFillOutbox:
+    """crash-safe 체결 execution ledger (outbox).
+
+    ★ 고유키 event_key = f"{oid}:{cum_qty}" — 주문번호 + 누적체결수량으로
+      각 체결 구간(delta)을 1행으로 영속화한다.
+    ★ 처리할 delta event 를 부수효과 적용 '전에' 먼저 영속화한다(write-ahead).
+    ★ 각 부수효과(pos/pnl/reentry/event/app)의 처리 상태를 개별 플래그로
+      영속 기록한다.
+    ★ 재시작 시 미완료(플래그 0) 부수효과만 재처리하고, 완료된 것은 다시
+      실행하지 않는다. 단일 프로세스 rollback 에 의존하지 않는다.
     """
 
     def __init__(self, db_path: str):
@@ -645,60 +657,91 @@ class _USAppliedFillStore:
         import sqlite3
         conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.row_factory = sqlite3.Row
         return conn
 
     def _init_db(self):
         try:
             with self._conn() as c:
                 c.execute("""
-                    CREATE TABLE IF NOT EXISTS us_applied_fills (
-                        order_lifecycle_id TEXT PRIMARY KEY,
-                        applied_qty        INTEGER NOT NULL DEFAULT 0,
-                        applied_cost       REAL    NOT NULL DEFAULT 0,
-                        updated_at         TEXT
+                    CREATE TABLE IF NOT EXISTS us_fill_outbox (
+                        event_key      TEXT PRIMARY KEY,
+                        oid            TEXT NOT NULL,
+                        cum_qty        INTEGER NOT NULL,
+                        cum_cost       REAL    NOT NULL,
+                        delta          INTEGER NOT NULL,
+                        delta_avg      REAL    NOT NULL,
+                        side           TEXT NOT NULL,
+                        symbol         TEXT NOT NULL,
+                        name           TEXT, excd TEXT, reason TEXT,
+                        pos_qty_before INTEGER NOT NULL DEFAULT 0,
+                        pnl_krw        REAL    NOT NULL DEFAULT 0,
+                        closed         INTEGER NOT NULL DEFAULT 0,
+                        pos_done       INTEGER NOT NULL DEFAULT 0,
+                        pnl_done       INTEGER NOT NULL DEFAULT 0,
+                        reentry_done   INTEGER NOT NULL DEFAULT 0,
+                        event_done     INTEGER NOT NULL DEFAULT 0,
+                        app_done       INTEGER NOT NULL DEFAULT 0,
+                        created_at     TEXT
                     )
                 """)
+                c.execute("CREATE INDEX IF NOT EXISTS ix_outbox_oid "
+                          "ON us_fill_outbox(oid)")
         except Exception as exc:
-            logger.warning("[US AppliedStore] 초기화 실패: %s", exc)
+            logger.warning("[US Outbox] 초기화 실패: %s", exc)
 
-    def get(self, oid: str):
-        """→ (applied_qty:int, applied_cost:float). 없으면 (0, 0.0)."""
-        try:
-            with self._conn() as c:
-                row = c.execute(
-                    "SELECT applied_qty, applied_cost FROM us_applied_fills "
-                    "WHERE order_lifecycle_id=?", (oid,),
-                ).fetchone()
-            if row:
-                return int(row[0] or 0), float(row[1] or 0.0)
-        except Exception as exc:
-            logger.warning("[US AppliedStore] get 실패: oid=%s error=%s", oid, exc)
+    @staticmethod
+    def event_key(oid: str, cum_qty: int) -> str:
+        return f"{oid}:{int(cum_qty)}"
+
+    def last_cum(self, oid: str):
+        """oid 의 마지막 기록 누적(수량, 원가). 없으면 (0, 0.0). delta 계산 기준."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT cum_qty, cum_cost FROM us_fill_outbox "
+                "WHERE oid=? ORDER BY cum_qty DESC LIMIT 1", (oid,)).fetchone()
+        if row:
+            return int(row["cum_qty"] or 0), float(row["cum_cost"] or 0.0)
         return 0, 0.0
 
-    def set(self, oid: str, applied_qty: int, applied_cost: float):
-        """반영 성공 후 원자적 UPSERT (실패 시 예외 전파 → 호출자가 보상)."""
+    def insert_if_absent(self, row: dict) -> None:
+        """delta event 를 영속화(write-ahead). 이미 있으면 무시(재처리)."""
         from datetime import datetime as _dt
+        row = dict(row)
+        row.setdefault("created_at", _dt.now().isoformat())
+        cols = ",".join(_OUTBOX_COLS)
+        ph   = ",".join([":" + k for k in _OUTBOX_COLS])
         with self._conn() as c:
             c.execute(
-                """
-                INSERT INTO us_applied_fills
-                    (order_lifecycle_id, applied_qty, applied_cost, updated_at)
-                VALUES (?,?,?,?)
-                ON CONFLICT(order_lifecycle_id) DO UPDATE SET
-                    applied_qty  = excluded.applied_qty,
-                    applied_cost = excluded.applied_cost,
-                    updated_at   = excluded.updated_at
-                """,
-                (oid, int(applied_qty), float(applied_cost), _dt.now().isoformat()),
-            )
+                f"INSERT OR IGNORE INTO us_fill_outbox ({cols}) VALUES ({ph})",
+                {k: row.get(k) for k in _OUTBOX_COLS})
 
-    def clear(self, oid: str):
-        try:
-            with self._conn() as c:
-                c.execute("DELETE FROM us_applied_fills WHERE order_lifecycle_id=?",
-                          (oid,))
-        except Exception:
-            pass
+    def get(self, event_key: str):
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM us_fill_outbox WHERE event_key=?",
+                            (event_key,)).fetchone()
+        return dict(row) if row else None
+
+    def set_flag(self, event_key: str, flag: str) -> None:
+        assert flag in ("pos_done", "pnl_done", "reentry_done",
+                        "event_done", "app_done")
+        with self._conn() as c:
+            c.execute(f"UPDATE us_fill_outbox SET {flag}=1 WHERE event_key=?",
+                      (event_key,))
+
+    def all_rows(self):
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM us_fill_outbox ORDER BY oid, cum_qty").fetchall()
+        return [dict(r) for r in rows]
+
+    def pending_app_rows(self):
+        """fill_event 생성 완료(event_done=1) & app 미처리(app_done=0) 행."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM us_fill_outbox "
+                "WHERE event_done=1 AND app_done=0 ORDER BY oid, cum_qty").fetchall()
+        return [dict(r) for r in rows]
 
 
 # ════════════════════════════════════════════════════════════
@@ -761,7 +804,7 @@ class USStrategyManager:
         # ── Phase 4: OrderLifecycle + FillObserver (US Pipeline) ──────
         self._us_lifecycle_mgr   = None
         self._us_updater         = None
-        self._us_applied_store   = None
+        self._us_outbox          = None
         self._us_pending_registry = None
         self._us_fill_observer   = None
         self._us_pending_buy_meta: dict  = {}
@@ -776,13 +819,13 @@ class USStrategyManager:
                     os.path.dirname(__file__), "..", "data", "trading_journal.db"
                 )
                 self._us_lifecycle_mgr = OrderLifecycleManager(_jnl_db)
-                # ★ 부분체결 delta 부킹용 applied 워터마크 영속화
-                self._us_applied_store = _USAppliedFillStore(_jnl_db)
+                # ★ crash-safe 체결 outbox(execution ledger)
+                self._us_outbox = _USFillOutbox(_jnl_db)
                 logger.info("[US Lifecycle] OrderLifecycleManager 초기화 완료")
             except Exception as _us_le:
                 logger.warning(f"[US Lifecycle] 초기화 실패: {_us_le}")
                 self._us_lifecycle_mgr = None
-                self._us_applied_store = None
+                self._us_outbox = None
 
         if _US_FILL_OBSERVER_ENABLED:
             try:
@@ -793,6 +836,8 @@ class USStrategyManager:
                 )
                 logger.info("[US FillObserver] PendingOrderRegistry + FillObserver 초기화 완료")
                 self._us_restore_pending_meta()
+                # ★ 재시작: outbox 의 미완료 부수효과만 재처리(이중부킹 없음)
+                self._us_replay_outbox()
             except Exception as _us_foe2:
                 logger.warning(f"[US FillObserver] 초기화 실패: {_us_foe2}")
                 self._us_pending_registry = None
@@ -805,168 +850,193 @@ class USStrategyManager:
     # Phase 4: US Pipeline — lifecycle 콜백 + PendingRegistry
     # ══════════════════════════════════════════════════════════
 
-    def _us_apply_fill_delta(self, lc) -> None:
-        """부분/전량 체결 공통 — 신규 체결분(delta)만 포지션·손익에 반영한다.
+    # ── 포지션 저수준 헬퍼 (idempotent 적용에 사용) ──
+    def _us_pos_add(self, symbol, name, excd, delta, delta_avg, level=1):
+        existing = self.pos_mgr.positions.get(symbol)
+        if existing is not None:
+            new_qty = existing.qty + int(delta)
+            new_avg = ((existing.avg_price * existing.qty + delta_avg * delta) / new_qty
+                       if new_qty > 0 else delta_avg)
+            self.pos_mgr.update(symbol, new_qty, new_avg,
+                                max(existing.current_level, level))
+        else:
+            pos = USPosition(symbol, name, excd or "NASD", int(delta), float(delta_avg))
+            pos.current_level = level
+            self.pos_mgr.add(pos)
 
-        delta      = cumulative_filled_qty(lc.filled_qty) − applied_qty(영속)
-        delta_avg  = (누적원가 − applied원가) / delta   ← 단계별 평균체결가
-        - delta ≤ 0 이면 아무 것도 반영하지 않는다(중복 폴링·재시작 재조회 안전).
-        - 반영(부킹) 성공 후에만 applied 를 원자적으로 저장한다.
-        - applied 저장 실패 시 방금 반영분을 되돌려(보상) 이중부킹을 방지한다.
-        - 재진입 등록·체결이벤트 등 부수효과는 저장 커밋 확정 후에만 수행한다.
+    def _us_pos_reduce(self, symbol, delta):
+        pos = self.pos_mgr.positions.get(symbol)
+        if pos is None:
+            return
+        remaining = pos.qty - int(delta)
+        if remaining > 0:
+            self.pos_mgr.update(symbol, remaining, pos.avg_price, pos.current_level)
+        else:
+            self.pos_mgr.remove(symbol)
+
+    def _us_apply_fill_delta(self, lc) -> None:
+        """체결(부분/전량)을 outbox 에 write-ahead 로 기록하고 부수효과를 적용한다.
+        (엔트리: us_dispatch_fill 이 lifecycle 전이 후 호출)
+
+        delta     = cumulative_filled_qty − outbox 마지막 누적(last_cum)
+        delta_avg = (누적원가 − 이전 누적원가) / delta   ← 단계별 평균체결가
+        cum_qty ≤ last_cum 이면 신규 체결분 없음(중복 폴링/재시작 재조회 무시).
         """
-        if getattr(self, "_us_applied_store", None) is None:
+        ob = getattr(self, "_us_outbox", None)
+        if ob is None:
             return
         oid  = lc.order_lifecycle_id
         side = (getattr(lc, "side", "") or "").upper()
+        symbol  = lc.code
         cum_qty = int(lc.filled_qty or 0)
         cum_avg = float(lc.avg_fill_price or 0.0)
         if cum_qty <= 0 or cum_avg <= 0:
             return
 
-        applied_qty, applied_cost = self._us_applied_store.get(oid)
-        delta = cum_qty - applied_qty
-        if delta <= 0:
-            return   # 신규 체결분 없음 → 이중부킹 방지
-
+        prev_cum, prev_cost = ob.last_cum(oid)
+        if cum_qty <= prev_cum:
+            return   # 신규 체결분 없음
+        delta      = cum_qty - prev_cum
         cum_cost   = cum_qty * cum_avg
-        delta_cost = cum_cost - applied_cost
+        delta_cost = cum_cost - prev_cost
         delta_avg  = (delta_cost / delta) if delta > 0 else cum_avg
         if delta_avg <= 0:
             delta_avg = cum_avg
 
-        booked = (self._us_book_buy_delta if side == "BUY"
-                  else self._us_book_sell_delta)(lc, delta, delta_avg)
-        if booked is None:
-            return   # 반영 대상 없음(포지션 부재 등)
-        undo, on_commit = booked
+        meta = (self._us_pending_buy_meta if side == "BUY"
+                else self._us_pending_sell_meta).get(oid, {})
+        name   = meta.get("name", symbol)
+        excd   = meta.get("excd", "NASD")
+        reason = meta.get("reason", "")
 
-        # ── 반영 성공 후에만 applied 원자적 저장. 실패 시 보상(되돌림) ──
-        try:
-            self._us_applied_store.set(oid, cum_qty, cum_cost)
-        except Exception as exc:
-            logger.error(
-                "[US applied 저장 실패] 반영분 되돌림(보상): oid=%s error=%s", oid, exc)
+        pos = self.pos_mgr.positions.get(symbol)
+        pos_qty_before = int(pos.qty) if pos is not None else 0
+
+        # 매도 실현손익/청산여부 사전 계산(원가 = 감소 전 평단) — outbox 에 영속
+        pnl_krw, closed = 0.0, 0
+        if side == "SELL":
+            prev_avg = pos.avg_price if pos is not None else delta_avg
+            sell_qty = min(int(delta), pos_qty_before) if pos is not None else int(delta)
             try:
-                undo()
-            except Exception as uexc:
-                logger.critical(
-                    "[US applied 보상 실패] 수동 정합 필요: oid=%s error=%s", oid, uexc)
-            return
+                fx = self.api.get_usd_exchange_rate() or 1350.0
+            except Exception:
+                fx = 1350.0
+            pnl_krw = (delta_avg - prev_avg) * sell_qty * fx
+            closed  = 1 if (pos is not None and pos_qty_before - sell_qty <= 0) else 0
 
-        # ── 커밋 확정 후 부수효과(체결이벤트/재진입) ──
-        if on_commit is not None:
-            try:
-                on_commit()
-            except Exception as cexc:
-                logger.error("[US fill on_commit 오류] oid=%s error=%s", oid, cexc)
+        # ── write-ahead: 부수효과 적용 전에 event 를 먼저 영속화 ──
+        ek = ob.event_key(oid, cum_qty)
+        ob.insert_if_absent({
+            "event_key": ek, "oid": oid, "cum_qty": cum_qty, "cum_cost": cum_cost,
+            "delta": int(delta), "delta_avg": float(delta_avg), "side": side,
+            "symbol": symbol, "name": name, "excd": excd, "reason": reason,
+            "pos_qty_before": pos_qty_before, "pnl_krw": float(pnl_krw),
+            "closed": int(closed),
+            "pos_done": 0, "pnl_done": 0, "reentry_done": 0,
+            "event_done": 0, "app_done": 0,
+        })
+        row = ob.get(ek)
+        if row is not None:
+            self._us_process_outbox_row(row)
 
-        # ── 주문 완전 종료(누적 == 주문수량) 시 meta 정리 ──
+        # 주문 완전 종료(누적 == 주문수량) 시 meta 정리
         if cum_qty >= int(getattr(lc, "order_qty", 0) or 0):
             (self._us_pending_buy_meta if side == "BUY"
              else self._us_pending_sell_meta).pop(oid, None)
 
-    def _us_book_buy_delta(self, lc, delta, delta_avg):
-        """BUY delta 를 포지션에 가중평균 병합. (undo, on_commit) 반환."""
-        oid    = lc.order_lifecycle_id
-        symbol = lc.code
-        meta   = self._us_pending_buy_meta.get(oid, {})
-        name   = meta.get("name", symbol)
-        excd   = meta.get("excd", "NASD")
-        level  = meta.get("level", 1)
+    def _us_process_outbox_row(self, row: dict) -> None:
+        """outbox 1행의 미완료 부수효과만 idempotent 하게 적용하고, 각 효과 적용
+        직후 해당 플래그를 영속 기록한다(effect→flag). 재시작 후 재처리해도
+        - 포지션: pos_qty_before 스냅샷 vs 현재 수량 비교로 이중 반영 차단
+        - 재진입: reentry.check 로 이미 등록됐으면 재등록 안 함
+        """
+        ob     = self._us_outbox
+        ek     = row["event_key"]
+        side   = row["side"]
+        symbol = row["symbol"]
+        delta  = int(row["delta"])
+        davg   = float(row["delta_avg"])
+        before = int(row["pos_qty_before"])
 
-        existing = self.pos_mgr.positions.get(symbol)
-        if existing is not None:
-            prev_qty, prev_avg, prev_lvl = (
-                existing.qty, existing.avg_price, existing.current_level)
-            new_qty = prev_qty + delta
-            new_avg = ((prev_qty * prev_avg + delta * delta_avg) / new_qty
-                       if new_qty > 0 else delta_avg)
-            self.pos_mgr.update(symbol, new_qty, new_avg, max(prev_lvl, level))
+        if side == "BUY":
+            if not row["pos_done"]:
+                cur = self.pos_mgr.positions.get(symbol)
+                cur_qty = cur.qty if cur is not None else 0
+                if cur is not None and cur_qty == before + delta:
+                    pass   # 이미 반영됨(crash after pos, before flag) → 재적용 안 함
+                else:
+                    self._us_pos_add(symbol, row["name"], row["excd"], delta, davg)
+                ob.set_flag(ek, "pos_done")
+            if not row["event_done"]:
+                self._us_fill_events.append({
+                    "side": "BUY", "symbol": symbol, "name": row["name"],
+                    "qty": delta, "price": davg, "event_key": ek})
+                ob.set_flag(ek, "event_done")
+        else:   # SELL
+            if not row["pos_done"]:
+                cur = self.pos_mgr.positions.get(symbol)
+                cur_qty = cur.qty if cur is not None else 0
+                expected_after = max(0, before - delta)
+                if cur is None and expected_after == 0:
+                    pass   # 이미 전량청산됨
+                elif cur is not None and cur_qty == expected_after:
+                    pass   # 이미 반영됨
+                else:
+                    self._us_pos_reduce(symbol, delta)
+                ob.set_flag(ek, "pos_done")
+            if not row["pnl_done"]:
+                self.pnl_guard.record(float(row["pnl_krw"]))
+                ob.set_flag(ek, "pnl_done")
+            if row["closed"] and not row["reentry_done"]:
+                already = False
+                try:
+                    blocked, _info = self.reentry.check("US", symbol, row["name"])
+                    already = bool(blocked)
+                except Exception:
+                    already = False
+                if not already:
+                    self.reentry.record_sell(
+                        market="US", code=symbol, name=row["name"],
+                        reason=row["reason"],
+                        is_stoploss=_is_stoploss_reason(row["reason"]))
+                ob.set_flag(ek, "reentry_done")
+            if not row["event_done"]:
+                self._us_fill_events.append({
+                    "side": "SELL", "symbol": symbol, "name": row["name"],
+                    "qty": delta, "price": davg,
+                    "pnl_krw": float(row["pnl_krw"]),
+                    "is_full": bool(row["closed"]), "event_key": ek})
+                ob.set_flag(ek, "event_done")
 
-            def _undo():
-                self.pos_mgr.update(symbol, prev_qty, prev_avg, prev_lvl)
-        else:
-            pos = USPosition(symbol, name, excd, delta, delta_avg)
-            pos.current_level = level
-            pos.trade_id = meta.get("trade_id", "") or (getattr(lc, "trade_id", "") or "")
-            self.pos_mgr.add(pos)
-
-            def _undo():
-                self.pos_mgr.remove(symbol)
-
-        logger.info(
-            "[US BUY FILL] delta 반영: symbol=%s +%s주 @$%.4f (누적체결 %s) oid=%s",
-            symbol, delta, delta_avg, lc.filled_qty, oid)
-
-        def _on_commit():
-            self._us_fill_events.append({
-                "side": "BUY", "symbol": symbol, "name": name,
-                "qty": delta, "price": delta_avg,
-            })
-
-        return _undo, _on_commit
-
-    def _us_book_sell_delta(self, lc, delta, delta_avg):
-        """SELL delta 만큼 포지션 감소 + 실현손익 기록(원가는 감소 전 평단).
-        전량 청산 시 재진입 등록은 커밋 확정 후 수행. (undo, on_commit) 반환."""
-        oid    = lc.order_lifecycle_id
-        symbol = lc.code
-        meta   = self._us_pending_sell_meta.get(oid, {})
-        name   = meta.get("name", symbol)
-        reason = meta.get("reason", "")
-        pos    = self.pos_mgr.positions.get(symbol)
-        if pos is None:
-            logger.warning(
-                "[US SELL FILL] 포지션 없음 — delta 반영 스킵: symbol=%s oid=%s",
-                symbol, oid)
-            return None
-
-        prev_qty, prev_avg, prev_lvl = pos.qty, pos.avg_price, pos.current_level
-        sell_qty  = min(int(delta), int(prev_qty))
-        remaining = prev_qty - sell_qty
-        if remaining > 0:
-            self.pos_mgr.update(symbol, remaining, prev_avg, prev_lvl)
-            closed = False
-        else:
-            self.pos_mgr.remove(symbol)
-            closed = True
-
-        pnl_usd = (delta_avg - prev_avg) * sell_qty
+    def _us_replay_outbox(self) -> None:
+        """재시작: outbox 를 권위로 (1) 완료 매도의 실현손익을 (재시작 시 0 이 된)
+        pnl_guard 에 재구성하고 (2) 미완료 부수효과 행만 재처리한다.
+        이미 완료된 부수효과는 다시 실행하지 않는다."""
+        ob = getattr(self, "_us_outbox", None)
+        if ob is None:
+            return
         try:
-            fx = self.api.get_usd_exchange_rate() or 1350.0
-        except Exception:
-            fx = 1350.0
-        pnl_krw = pnl_usd * fx
-        self.pnl_guard.record(pnl_krw)
-
-        logger.info(
-            "[US SELL FILL] delta 반영: symbol=%s -%s주 @$%.4f 실현 $%.2f(₩%.0f) %s oid=%s",
-            symbol, sell_qty, delta_avg, pnl_usd, pnl_krw,
-            ("전량청산" if closed else "부분"), oid)
-
-        def _undo():
-            if self.pos_mgr.positions.get(symbol) is None:
-                p = USPosition(symbol, name, meta.get("excd", "NASD"),
-                               prev_qty, prev_avg)
-                p.current_level = prev_lvl
-                self.pos_mgr.add(p)
-            else:
-                self.pos_mgr.update(symbol, prev_qty, prev_avg, prev_lvl)
-            self.pnl_guard.record(-pnl_krw)   # 손익 원복
-
-        def _on_commit():
-            self._us_fill_events.append({
-                "side": "SELL", "symbol": symbol, "name": name,
-                "qty": sell_qty, "price": delta_avg,
-                "pnl_usd": pnl_usd, "is_full": closed,
-            })
-            if closed:   # 전량 청산 시에만 재진입 1회
-                self.reentry.record_sell(
-                    market="US", code=symbol, name=name,
-                    reason=reason, is_stoploss=_is_stoploss_reason(reason))
-
-        return _undo, _on_commit
+            rows = ob.all_rows()
+        except Exception as exc:
+            logger.warning("[US Outbox] replay 로드 실패: %s", exc)
+            return
+        rebuilt = 0.0
+        for row in rows:
+            # (1) pnl 반영이 이미 확정된 매도 → 재시작으로 초기화된 일일 guard 복원
+            if row["side"] == "SELL" and row["pnl_done"]:
+                try:
+                    self.pnl_guard.record(float(row["pnl_krw"]))
+                    rebuilt += float(row["pnl_krw"])
+                except Exception:
+                    pass
+            # (2) 미완료 부수효과 재처리
+            done = (row["pos_done"] and row["event_done"] and
+                    (row["side"] == "BUY" or
+                     (row["pnl_done"] and (not row["closed"] or row["reentry_done"]))))
+            if not done:
+                self._us_process_outbox_row(row)
+        if rebuilt:
+            logger.info("[US Outbox] 재시작 실현손익 재구성: ₩%.0f", rebuilt)
 
     def _us_has_active_order(self, symbol: str, side: str = None) -> bool:
         """동일 종목(선택적으로 동일 방향)에 ACTIVE(접수/부분체결) US 주문이
@@ -1160,8 +1230,11 @@ class USStrategyManager:
                     lifecycle_id, exc,
                 )
 
-        # 체결 콜백이 쌓은 이벤트를 드레인해 app.py 측 부수효과 구동에 전달
-        fill_events = getattr(self, "_us_fill_events", [])
+        # ★ app.py 측 부수효과(거래집계/워치엔트리/on_sell_complete)는 outbox 의
+        #   미처리(event_done=1 & app_done=0) 행에서 가져온다. app.py 가 처리 후
+        #   us_mark_app_done(event_key) 로 확정 → 재시작해도 미처리분만 재전달(1회).
+        fill_events = self._us_pending_app_events()
+        # 인메모리 미러는 비운다(로그/단위테스트용; 권위는 outbox)
         self._us_fill_events = []
 
         return {
@@ -1173,6 +1246,35 @@ class USStrategyManager:
             "dispatched": dispatched,
             "fill_events": fill_events,
         }
+
+    def _us_pending_app_events(self) -> list:
+        """outbox 의 event_done=1 & app_done=0 행 → app 처리 대기 체결이벤트."""
+        ob = getattr(self, "_us_outbox", None)
+        if ob is None:
+            return []
+        try:
+            rows = ob.pending_app_rows()
+        except Exception:
+            return []
+        out = []
+        for r in rows:
+            out.append({
+                "side": r["side"], "symbol": r["symbol"], "name": r["name"],
+                "qty": int(r["delta"]), "price": float(r["delta_avg"]),
+                "pnl_krw": float(r["pnl_krw"]), "is_full": bool(r["closed"]),
+                "event_key": r["event_key"],
+            })
+        return out
+
+    def us_mark_app_done(self, event_key: str) -> None:
+        """app.py 가 체결이벤트 부수효과 처리를 마친 뒤 호출 → 재전달 방지."""
+        ob = getattr(self, "_us_outbox", None)
+        if ob is not None and event_key:
+            try:
+                ob.set_flag(event_key, "app_done")
+            except Exception as exc:
+                logger.warning("[US Outbox] app_done 마킹 실패: %s error=%s",
+                               event_key, exc)
 
     def _us_restore_pending_meta(self) -> None:
         """재시작 후 ACCEPTED 상태의 US OrderLifecycle → pending meta 복원."""
@@ -2238,7 +2340,9 @@ class USStrategyManager:
         #   국내 원화 예수금 기반 폴백은 제거했다 — KIS 로 확인된 해외 주문가능
         #   금액이 없으면 실주문을 시도하지 않는다.
         try:
-            avail = self.api.get_us_available_amounts(symbol=symbol, excd=excd)
+            # 실제 주문과 동일 기준(계좌·거래소·종목·주문가격)으로 주문별 검증
+            avail = self.api.get_us_available_amounts(
+                symbol=symbol, excd=excd, ord_unpr=cur_price)
         except Exception as _ae:
             avail = {"ok": False}
             logger.warning("[%s] 해외 주문가능 조회 예외 → BUY_BLOCKED: %s", symbol, _ae)
