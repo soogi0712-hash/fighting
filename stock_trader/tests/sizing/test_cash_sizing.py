@@ -126,6 +126,14 @@ class TestEarlyThenFull(unittest.TestCase):
 class TestMultiStockLoopDedup(unittest.TestCase):
 
     def test_sequential_buys_do_not_reuse_same_cash(self):
+        """전략 신호가 매번 성립해도, 매수 직전 KIS 현금 주문가능금액(=남은 현금)
+        으로 최종수량을 확정하면 누적 주문금액이 현금을 초과하지 않는다(미수 없음).
+
+        ★ 신규 계약: 예수금 선차단이 아니라 KIS 현금 주문가능금액이 권위값.
+          pyramid.evaluate 는 비중(invest_ratio)만 제안하고, 최종수량은
+          finalize_order_qty(KIS 현금 기준)로 확정된다.
+        """
+        from utils.order_sizing import finalize_order_qty
         initial_cash = 1_000_000.0
         m = _mgr()
         remaining = initial_cash
@@ -134,11 +142,17 @@ class TestMultiStockLoopDedup(unittest.TestCase):
             d = m.evaluate(code, code, PRICE, 5, remaining, buy_score_norm=0.80)
             if not d["action"].startswith("BUY"):
                 continue
-            cost = _total_cost(d["qty"])
-            # app.py 루프의 차감 로직과 동일하게 남은 현금 차감
+            ratio = float(d.get("invest_ratio", 1.0))
+            # 매수 직전 KIS 현금 주문가능금액(= 남은 현금)으로 최종수량 확정
+            ratio_cash = remaining * ratio
+            final_qty  = finalize_order_qty(
+                int(ratio_cash / PRICE), 10**9, ratio_cash, PRICE)
+            if final_qty <= 0:
+                continue
+            cost = _total_cost(final_qty)
             remaining = max(0.0, remaining - cost)
             spent_total += cost
-        # 세 종목 합계가 초기 현금을 절대 초과하지 않음
+        # 세 종목 합계가 초기 현금을 절대 초과하지 않음(0.98 버퍼로 여유)
         self.assertLessEqual(spent_total, initial_cash)
         self.assertGreaterEqual(remaining, 0.0)
 

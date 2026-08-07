@@ -1121,7 +1121,20 @@ class KISApi:
         """보유 주식 및 예수금 조회
         ★ KIS 500 에러 시 캐시된 직전 성공값 반환 (cash=0 SKIP 방지)
         ★ 캐시도 없으면 예수금 전용 API로 cash만 가져와서 합성 반환
+        ★ (req10) TTTC8434R 초당 조회 급증 방지: 짧은 TTL 응답 캐시로 한 스캔
+          사이클의 반복 호출을 1회로 흡수하고, EGW00215(초당 조회건수 초과)
+          발생 시 즉시 반복 호출을 멈추고 지수 백오프한다.
         """
+        # ── 짧은 TTL 캐시 + EGW00215 백오프 ─────────────────────────
+        _bnow  = time.time()
+        _short = getattr(self, "_balance_short_cache", None)
+        if _short is not None:
+            if _bnow < getattr(self, "_balance_backoff_until", 0.0):
+                return _short   # 백오프 중 → 캐시 반환(즉시 반복 호출 금지)
+            if (_bnow - getattr(self, "_balance_short_ts", 0.0)) \
+                    < getattr(self, "_BALANCE_SHORT_TTL", 7.0):
+                return _short   # 정상 TTL 캐시(스캔당 1회만 실제 조회)
+
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
         from config import Config as _cfg
         tr_id = "TTTC8434R" if _cfg.KIS_IS_REAL else "VTTC8434R"
@@ -1160,6 +1173,20 @@ class KISApi:
                 if data.get("rt_cd") != "0":
                     msg_cd = data.get("msg_cd", "")
                     msg1   = data.get("msg1", "")
+                    if msg_cd == "EGW00215":
+                        # ★ 초당 조회건수 초과 → 즉시 반복 호출 금지 + 지수 백오프.
+                        self._balance_egw_strikes = \
+                            getattr(self, "_balance_egw_strikes", 0) + 1
+                        _bo = min(30.0, 2.0 ** self._balance_egw_strikes)
+                        self._balance_backoff_until = time.time() + _bo
+                        self._on_api_error(200, msg_cd, msg1)
+                        logger.warning(
+                            "잔고조회 EGW00215(초당 조회건수 초과) → %.0f초 백오프"
+                            "%s", _bo,
+                            " · 캐시 반환" if _short is not None else "")
+                        if _short is not None:
+                            return _short   # 즉시 반복 호출 대신 캐시
+                        break               # 캐시 없으면 하단 폴백으로
                     if msg_cd == "EGW00201":
                         self._on_api_error(200, msg_cd, msg1)
                         if attempt < 2:
@@ -1225,6 +1252,11 @@ class KISApi:
                 if result["cash"] > 0:
                     self._balance_cache    = result
                     self._balance_cache_ts = time.time()
+                # (req10) 짧은 TTL 캐시 저장 + EGW00215 스트라이크/백오프 리셋
+                self._balance_short_cache   = result
+                self._balance_short_ts      = time.time()
+                self._balance_egw_strikes   = 0
+                self._balance_backoff_until = 0.0
                 self._on_api_success()
                 return result
             except Exception as e:
