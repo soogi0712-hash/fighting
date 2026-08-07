@@ -28,6 +28,40 @@ _KIS_COOLDOWN_SEC    = 1800  # 30분 쿨다운 후 KIS 재시도
 logger = get_logger("KIS_API")
 
 
+# ── 계좌별 BUY 직렬화 락(프로세스 전역·인스턴스 공유) ─────────────────
+#   KISApi 인스턴스가 여러 개 생성돼도 같은 계좌의 BUY 는 동일 락으로 직렬화한다.
+#   최종 nrcvb 재조회~주문응답 수신 구간을 계좌 단위로 직렬화 → 두 매수가 같은
+#   nrcvb 금액을 동시에 소진하지 못한다.
+_KR_ACCOUNT_BUY_LOCKS: dict = {}
+_KR_ACCOUNT_BUY_LOCKS_GUARD = threading.Lock()
+
+
+def _account_buy_lock(account_no: str) -> threading.Lock:
+    _key = account_no or "_default"
+    with _KR_ACCOUNT_BUY_LOCKS_GUARD:
+        lk = _KR_ACCOUNT_BUY_LOCKS.get(_key)
+        if lk is None:
+            lk = threading.Lock()
+            _KR_ACCOUNT_BUY_LOCKS[_key] = lk
+        return lk
+
+
+def _extract_kr_odno(result: dict) -> str:
+    """국내 주문 응답에서 주문번호(ODNO)를 추출. 없으면 빈 문자열.
+    KIS 국내 order-cash 성공 output: ODNO / KRX_FWDG_ORD_ORGNO / (구)KNO_ORD_NO."""
+    try:
+        out = result.get("output", {}) or {}
+        if isinstance(out, list):
+            out = out[0] if out else {}
+        for k in ("ODNO", "odno", "KRX_FWDG_ORD_ORGNO", "KNO_ORD_NO"):
+            v = str(out.get(k, "") or "").strip()
+            if v and v not in ("0", "00000", "0000000"):
+                return v
+    except Exception:
+        pass
+    return ""
+
+
 class KISApi:
     def __init__(self):
         self.app_key    = Config.KIS_APP_KEY
@@ -73,8 +107,9 @@ class KISApi:
         # {code: last_order_ts}
         self._order_cooldown: dict = {}
         self._ORDER_COOLDOWN_SEC: float = 10.0  # 같은 종목 10초 쿨다운
-        # ── 동일계좌 BUY 직렬화 락 (최종조회~제출 사이 nrcvb 동시소진 방지) ──
-        self._kr_buy_lock = threading.Lock()
+        # ── 동일계좌 BUY 직렬화 락은 모듈 전역 _account_buy_lock(account_no)를
+        #    사용한다(인스턴스 여러 개여도 계좌 단위 공유). 여기서 인스턴스 락을
+        #    따로 두지 않는다.
 
     # ──────────────────────────────────────────────────────────
     # 1. OAuth2 토큰 관리
@@ -573,13 +608,27 @@ class KISApi:
         ★ ord_psbl_cash/get_orderable_cash/max_buy_* 는 사용하지 않는다.
           현금 권위값 nrcvb_buy_amt / nrcvb_buy_qty 만으로:
             - qty <= nrcvb_buy_qty
-            - order_price>0 이면 qty*order_price <= nrcvb_buy_amt
-              (시장가=order_price 0 이면 금액검사 생략, 수량검사 nrcvb_qty 로만 판단)
+            - qty*order_price <= nrcvb_buy_amt   (order_price = 실제 지정가 제출가)
           을 만족하지 못하거나 조회 실패/0 이면 차단 dict, 통과면 None.
+        ★ 국내 BUY 는 '지정가(order_price>0)'만 허용한다. 시장가(ORD_UNPR=0)는
+          KIS 주문가능조회가 신뢰 가능한 현금수량을 보장하지 못하고(0원 조회가
+          과대수량 유발), 체결가 상승으로 미수·거절 위험이 있어 이 단계에서 차단한다.
+          (실제 국내 BUY 경로는 정규장·장전 모두 지정가 제출가를 사용한다.)
         ★ 전략비중·0.98 버퍼는 여기서 다시 적용하지 않는다(호출부에서 이미 반영).
           이 함수는 '이미 정해진 qty'를 nrcvb 상한으로만 방어검증한다.
         ★ SELL 에는 호출하지 않는다(현금검증 미적용).
         """
+        try:
+            _op = float(order_price)
+        except (TypeError, ValueError):
+            _op = 0.0
+        if _op <= 0:
+            logger.error(
+                "🚫 [BUY 최종검증] %s 시장가/0원 제출가 → 국내 BUY 미허용(지정가 필요)",
+                stock_code)
+            return {"rt_cd": "9",
+                    "msg1": "시장가 BUY 미허용 — 지정가(order_price>0)로 제출 필요",
+                    "_cash_guard": True}
         try:
             avail = self.get_kr_available_amounts(stock_code, order_price,
                                                   ord_dvsn or "00")
@@ -605,11 +654,8 @@ class KISApi:
             return {"rt_cd": "9",
                     "msg1": f"수량초과 차단(요청 {qty}주 > nrcvb_buy_qty {nrcvb_qty}주)",
                     "_cash_guard": True}
-        try:
-            _op = float(order_price)
-        except (TypeError, ValueError):
-            _op = 0.0
-        if _op > 0 and (qty * _op) > nrcvb_amt:
+        # _op 는 상단에서 이미 검증(>0). 지정가 금액검사는 항상 적용.
+        if (qty * _op) > nrcvb_amt:
             logger.error(
                 f"🚫 [BUY 최종검증] {stock_code} 요청금액 {qty * _op:,.0f}원 > "
                 f"nrcvb_buy_amt {nrcvb_amt:,.0f}원 → 차단")
@@ -845,12 +891,13 @@ class KISApi:
         if _pre_err is not None:
             return _pre_err
 
-        # ── BUY: 최종 nrcvb 검증 + 제출을 '동일계좌 BUY 직렬화 락'으로 보호(item10).
-        #   최종조회~제출 구간을 직렬화 → 두 매수가 같은 nrcvb 금액을 동시에 소진하지
-        #   못한다. 두 번째 주문은 락 획득 후 새로 nrcvb 재조회한다.
-        #   SELL 은 락/현금검증 없이 즉시 제출(item5).
+        # ── BUY: 최종 nrcvb 검증 + 제출을 '계좌별 공유 BUY 직렬화 락'으로 보호.
+        #   최종 nrcvb 재조회~주문응답 수신 구간을 계좌 단위로 직렬화(인스턴스 여러
+        #   개여도 동일 계좌면 같은 락) → 두 매수가 같은 nrcvb 금액을 동시에 소진하지
+        #   못한다. 두 번째 BUY 는 락 획득 후 반드시 최신 nrcvb 를 다시 조회한다.
+        #   SELL·취소·체결조회는 이 락을 기다리지 않는다(락 미사용).
         if order_type == "BUY":
-            with self._kr_buy_lock:
+            with _account_buy_lock(self.account_no):
                 _blk = self._reject_if_nrcvb_insufficient(
                     stock_code, qty, order_price, ord_dvsn)
                 if _blk is not None:
@@ -893,151 +940,129 @@ class KISApi:
             f"계좌번호={acc_no}-{acc_prod}"
         )
 
-        # ── 500 재시도 대기 시간: attempt 0→3초, attempt 1→10초, attempt 2→스킵
-        _500_waits = [3, 10]
-
-        # ── retry (최대 2회 재시도, 총 3회 시도) ────────────────
-        for attempt in range(3):
+        # ── 멱등 안전 단일 POST: 접수여부를 명확히 분류(재제출 금지 규칙) ──
+        #   OK        : rt_cd=0 (접수 성공)
+        #   ODNO      : rt_cd!=0 이나 주문번호 존재 → 접수 정황 → 재제출 금지
+        #   AMBIGUOUS : 500 / 예외 / 파싱실패 → 접수여부 불명확 → 재제출 금지
+        #   REJECTED  : rt_cd!=0, 주문번호 없음 → 명확한 미접수 거절
+        def _post_once(_qty):
+            _body = dict(body)
+            _body["ORD_QTY"] = str(_qty)
             try:
                 self._rate_limit(critical=True)
                 resp = requests.post(
-                    url,
-                    headers=self._headers(tr_id, use_hash=True, body=body),
-                    json=body, timeout=10,
-                )
-
-                # ── 500 에러 → 상세 로그 + 단계별 대기 재시도 ──────
-                if resp.status_code == 500:
-                    # 500 응답 body 파싱
-                    try:
-                        _body500 = resp.json()
-                        _msg_cd  = _body500.get("msg_cd", "")
-                        _msg1    = _body500.get("msg1", "")
-                        _rt_cd   = _body500.get("rt_cd", "")
-                    except Exception:
-                        _body500 = {}
-                        _msg_cd, _msg1, _rt_cd = "", "", ""
-
-                    logger.error(
-                        f"[KIS 주문실패 상세]\n"
-                        f"  종목={stock_code} | 시장=국내 | "
-                        f"현재KST={datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')} | "
-                        f"세션={_sess}\n"
-                        f"  ORD_DVSN={ord_dvsn} | ORD_UNPR={order_price}원 | "
-                        f"주문수량={qty}주 | 주문금액={_order_amt:,}원\n"
-                        f"  계좌번호={acc_no}-{acc_prod} | tr_id={tr_id} | "
-                        f"HTTP status={resp.status_code}\n"
-                        f"  KIS response body={resp.text[:500]}\n"
-                        f"  msg_cd={_msg_cd!r} | msg1={_msg1!r} | rt_cd={_rt_cd!r}"
-                    )
-
-                    self._diagnose_500(url, tr_id, resp)
-                    self._on_api_error(500, _msg_cd)
-
-                    if attempt < 2:
-                        _wait = _500_waits[attempt]
-                        logger.warning(
-                            f"[500재시도] {stock_code} → {_wait}초 대기 후 재시도 "
-                            f"(attempt {attempt + 1}/2)"
-                        )
-                        time.sleep(_wait)
-                        continue
-
-                    # 2회 재시도 후에도 실패 → 스킵
-                    logger.error(
-                        f"[500스킵] {stock_code} — 2회 재시도 후에도 500 지속 → 해당 종목 주문 스킵"
-                    )
-                    return {
-                        "rt_cd":            "9",
-                        "msg1":             "500 Server Error (재시도 2회 후 종목 스킵)",
-                        "msg_cd":           _msg_cd,
-                        "_http_status":     500,
-                        "_response_body":   resp.text[:500],
-                        "_ord_dvsn":        ord_dvsn,
-                        "_ord_unpr":        order_price,
-                        "_sess":            _sess,
-                        "_kst":             datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
-                        "_tr_id":           tr_id,
-                        "_acc":             f"{acc_no}-{acc_prod}",
-                    }
-
+                    url, headers=self._headers(tr_id, use_hash=True, body=_body),
+                    json=_body, timeout=10)
+            except Exception as e:
+                logger.error("[주문] %s 네트워크/타임아웃 예외 → 접수 불명확(재제출 안 함): %s",
+                             stock_code, e)
+                return {"status": "AMBIGUOUS", "reason": f"네트워크/타임아웃: {e}"}
+            if resp.status_code == 500:
+                try:
+                    _b500 = resp.json()
+                except Exception:
+                    _b500 = {}
+                self._diagnose_500(url, tr_id, resp)
+                self._on_api_error(500, _b500.get("msg_cd", ""))
+                logger.error("[주문] %s HTTP 500 → 접수 불명확(재제출 안 함) body=%s",
+                             stock_code, resp.text[:300])
+                return {"status": "AMBIGUOUS", "reason": "HTTP 500"}
+            try:
                 resp.raise_for_status()
                 result = resp.json()
-                rt_cd  = result.get("rt_cd", "")
-                msg_cd = result.get("msg_cd", "")
-                msg1   = result.get("msg1", "")
-
-                if rt_cd == "0":
-                    logger.info(
-                        f"✅ {order_type} 주문 성공 | tr_id={tr_id} "
-                        f"| {stock_code} {qty}주 {price}원 "
-                        f"| rt_cd={rt_cd} msg_cd={msg_cd}"
-                    )
-                    self._order_cooldown[stock_code] = time.time()
-                    # (req13) 주문 접수 → 잔고 캐시 무효화(다음 조회는 최신)
-                    self.invalidate_balance_cache()
-                    self._on_api_success()
-                    return result
-                else:
-                    # EGW00201: TPS 초과 → backoff 후 재시도
-                    if msg_cd == "EGW00201":
-                        self._on_api_error(200, msg_cd, msg1)
-                        logger.warning(
-                            f"주문 EGW00201 TPS초과 {stock_code} "
-                            f"(재시도 {attempt+1}/3)"
-                        )
-                        if attempt < 2:
-                            continue
-                    # 주문 실패 상세 로그
-                    _kst_fail = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
-                    logger.error(
-                        f"[KIS 주문실패 상세]\n"
-                        f"  종목={stock_code} | 시장=국내 | "
-                        f"현재KST={_kst_fail} | "
-                        f"세션={_sess}\n"
-                        f"  ORD_DVSN={ord_dvsn} | ORD_UNPR={order_price}원 | "
-                        f"주문수량={qty}주 | 주문금액={_order_amt:,}원\n"
-                        f"  계좌번호={acc_no}-{acc_prod} | tr_id={tr_id} | "
-                        f"HTTP status={resp.status_code}\n"
-                        f"  KIS response body={resp.text[:500]}\n"
-                        f"  msg_cd={msg_cd!r} | msg1={msg1!r} | rt_cd={rt_cd!r}"
-                    )
-                    # 웹 화면 전달용 상세 필드를 result에 병합
-                    result["_http_status"]   = resp.status_code
-                    result["_response_body"] = resp.text[:500]
-                    result["_ord_dvsn"]      = ord_dvsn
-                    result["_ord_unpr"]      = order_price
-                    result["_sess"]          = _sess
-                    result["_kst"]           = _kst_fail
-                    result["_tr_id"]         = tr_id
-                    result["_acc"]           = f"{acc_no}-{acc_prod}"
-                    return result
-
             except Exception as e:
-                if attempt < 2:
-                    wait = (attempt + 1) * 2.0
-                    logger.warning(
-                        f"주문 오류 {stock_code} (재시도 {attempt+1}/3) "
-                        f"tr_id={tr_id}: {e} → {wait:.1f}초 대기"
-                    )
-                    time.sleep(wait)
-                else:
-                    logger.error(
-                        f"주문 오류 {stock_code} (3회 실패) "
-                        f"tr_id={tr_id}: {e}"
-                    )
-                    return {
-                        "rt_cd":          "9",
-                        "msg1":           str(e),
-                        "_http_status":   "Exception",
-                        "_response_body": str(e),
-                        "_ord_dvsn":      ord_dvsn,
-                        "_ord_unpr":      order_price,
-                        "_sess":          _sess,
-                        "_kst":           datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
-                        "_tr_id":         tr_id,
-                        "_acc":           f"{acc_no}-{acc_prod}",
-                    }
+                logger.error("[주문] %s 응답 파싱/HTTP 오류 → 접수 불명확(재제출 안 함): %s",
+                             stock_code, e)
+                return {"status": "AMBIGUOUS", "reason": f"응답 파싱/HTTP: {e}"}
+            rt_cd  = result.get("rt_cd", "")
+            msg_cd = result.get("msg_cd", "")
+            msg1   = result.get("msg1", "")
+            if rt_cd == "0":
+                return {"status": "OK", "result": result}
+            if msg_cd == "EGW00201":
+                self._on_api_error(200, msg_cd, msg1)   # TPS backoff(재제출은 안 함)
+            odno = _extract_kr_odno(result)
+            if odno:
+                logger.warning(
+                    "[주문] %s rt_cd=%s 이나 ODNO=%s 존재 → 접수 정황, 재제출 금지",
+                    stock_code, rt_cd, odno)
+                return {"status": "ODNO", "result": result}
+            logger.error(
+                "[KIS 주문거절] 종목=%s ORD_DVSN=%s ORD_UNPR=%s 수량=%s | "
+                "rt_cd=%s msg_cd=%s msg1=%r (주문번호 없음)",
+                stock_code, ord_dvsn, order_price, _qty, rt_cd, msg_cd, msg1)
+            return {"status": "REJECTED", "result": result, "msg1": msg1}
+
+        def _finalize_ok(result, _qty):
+            self._order_cooldown[stock_code] = time.time()
+            self.invalidate_balance_cache()      # 접수 → 잔고 캐시 무효화
+            self._on_api_success()
+            logger.info("✅ %s 주문 성공 | tr_id=%s | %s %d주 @%s원 | rt_cd=0",
+                        order_type, tr_id, stock_code, _qty, order_price)
+            return result
+
+        def _attach(result):
+            result.setdefault("_ord_dvsn", ord_dvsn)
+            result.setdefault("_ord_unpr", order_price)
+            result.setdefault("_tr_id", tr_id)
+            result.setdefault("_acc", f"{acc_no}-{acc_prod}")
+            return result
+
+        def _unknown(reason):
+            # 접수여부 불명확 → 재제출하지 않고 종료. 체결/미체결 조회로 확인해야 함.
+            logger.warning("[주문] %s 접수 불명확 → ORDER_PENDING_CONFIRMATION (%s)",
+                           stock_code, reason)
+            return {"rt_cd": "U", "_status": "ORDER_PENDING_CONFIRMATION",
+                    "msg1": f"접수 여부 불명확 — 체결/미체결 조회 필요: {reason}",
+                    "_ord_dvsn": ord_dvsn, "_ord_unpr": order_price,
+                    "_tr_id": tr_id, "_acc": f"{acc_no}-{acc_prod}"}
+
+        # ── 1차 제출 ─────────────────────────────────────────────
+        first = _post_once(qty)
+        if first["status"] == "OK":
+            return _finalize_ok(first["result"], qty)
+        if first["status"] == "ODNO":
+            return _attach(first["result"])            # 접수 정황 → 재제출 금지
+        if first["status"] == "AMBIGUOUS":
+            return _unknown(first.get("reason", ""))    # 접수 불명확 → 재제출 금지
+
+        # first == REJECTED (주문번호 없음, 명확한 미접수 거절)
+        _rej_result = first["result"]
+        _rej_msg    = first.get("msg1", "") or ""
+        _is_balance = any(k in _rej_msg
+                          for k in ("부족", "금액", "초과", "주문가능", "한도", "수량"))
+        # SELL 이거나 잔액류 거절이 아니면 재시도 없이 거절 반환
+        if order_type != "BUY" or not _is_balance:
+            return _attach(_rej_result)
+
+        # ── BUY 잔액/수량 부족 거절(주문번호 없음) → 재조회 후 '축소 1회'만 ──────
+        #   (락 보유 상태에서 최신 nrcvb 재조회. 수량이 실제 감소해야만 재제출.)
+        try:
+            _av = self.get_kr_available_amounts(stock_code, order_price, ord_dvsn)
+        except Exception:
+            return _attach(_rej_result)
+        if not _av.get("ok", False):
+            return _attach(_rej_result)
+        _nq = int(_av.get("qty", 0) or 0)
+        _na = float(_av.get("amount", 0.0) or 0.0)
+        _new_qty = min(qty, _nq)
+        if order_price > 0 and (_new_qty * order_price) > _na:
+            _new_qty = int(_na / order_price)
+        if _new_qty <= 0 or _new_qty >= qty:
+            logger.warning(
+                "[주문] %s 재조회 후 수량 미감소(%d→%d) → 재제출 안 함(동일수량 금지)",
+                stock_code, qty, _new_qty)
+            return _attach(_rej_result)
+        logger.warning("[주문] %s 잔액부족 거절 → 축소 재제출 1회 %d→%d주",
+                       stock_code, qty, _new_qty)
+        second = _post_once(_new_qty)
+        if second["status"] == "OK":
+            return _finalize_ok(second["result"], _new_qty)
+        if second["status"] == "ODNO":
+            return _attach(second["result"])
+        if second["status"] == "AMBIGUOUS":
+            return _unknown(second.get("reason", ""))
+        return _attach(second["result"])                # 재거절 → 추가 재시도 없음
 
     def buy(self, stock_code: str, qty: int, price: int = 0,
            ord_dvsn: str = None) -> dict:
