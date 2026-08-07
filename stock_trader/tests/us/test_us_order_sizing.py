@@ -84,14 +84,23 @@ class TestUSBuyOrderSizing(unittest.TestCase):
         # 버퍼 상한도 준수(현금가능금액*0.98/가 이하)
         self.assertLessEqual(3, qty_from_cash(1e9, 10.0))
 
-    def test_amount_present_but_qty_zero_blocks(self):
-        """금액은 있으나 KIS 주문가능수량 0 → BUY_BLOCKED, buy_us 미호출."""
+    def test_qty_field_zero_falls_back_to_amount(self):
+        """ovrs_max_ord_psbl_qty=0/미제공(장 시작 직후 흔함)이라도 주문가능금액이
+        충분하면 금액기준으로 매수한다(전 종목 차단 버그 방지)."""
         us = make_us_buy(
             order_avails=[{"ok": True, "usd": 1e9, "krw": 0.0, "qty": 0}],
             buy_results=[{"rt_cd": "0"}])
         res = us._do_buy("AAPL", "Apple", "NASD", 10.0, SESS, IV)
-        self.assertEqual(res["action"], "BUY_BLOCKED")
-        us.api.buy_us.assert_not_called()
+        self.assertEqual(res["action"], "BUY_ACCEPTED")   # 차단되지 않음
+        self.assertGreaterEqual(us.api.buy_us.call_args[0][1], 1)  # 실제 매수 수량>0
+
+    def test_qty_field_missing_falls_back_to_amount(self):
+        """qty 키 자체가 없어도(구 응답/필드명 상이) 금액기준으로 매수."""
+        us = make_us_buy(
+            order_avails=[{"ok": True, "usd": 1e9, "krw": 0.0}],  # qty 없음
+            buy_results=[{"rt_cd": "0"}])
+        res = us._do_buy("AAPL", "Apple", "NASD", 10.0, SESS, IV)
+        self.assertEqual(res["action"], "BUY_ACCEPTED")
 
     def test_lookup_failure_no_order(self):
         """주문가능 조회 실패(ok=False) → BUY_BLOCKED, buy_us 미호출."""
