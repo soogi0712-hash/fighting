@@ -1735,19 +1735,39 @@ def _handle_etf_trade(stock: dict, asset_type: str, regime: str, sess: dict,
             "buy"
         )
         try:
-            _api.buy(code, qty, cur)
-            # ★ 반복매수 차단용 최근 매수 시각 기록 (쿨다운 기준)
-            _etf_buy_guard[code] = time.time()
-            notifier.notify_buy(name, code, cur, qty,
-                                f"ETF매수({asset_type}/{regime})")
+            _res = _api.buy(code, qty, cur)
         except Exception as e:
             _log(f"❌ ETF 매수 주문 실패 {name}: {e}", "error")
+            _res = {"rt_cd": "9", "msg1": str(e)}
 
-        _last_signals[code] = {
-            "action": "BUY", "price": cur, "qty": qty,
-            "asset_type": asset_type, "regime": regime,
-            "buy_score": 1, "sell_score": 0,
-        }
+        # ── ★ UNKNOWN(접수 불명확)·UNKNOWN차단 → BUY 로 집계하지 않음 ──────
+        _res_status = (_res or {}).get("_status", "")
+        if (_res or {}).get("rt_cd") == "U" or _res_status in (
+                "ORDER_PENDING_CONFIRMATION", "BUY_BLOCKED_UNKNOWN"):
+            _st = _res_status or "ORDER_PENDING_CONFIRMATION"
+            _log(f"🟠 [{_st}] ETF {name} {qty}주 @{cur:,}원 — 거래완료 미집계", "warning")
+            _last_signals[code] = {
+                "action": _st, "price": cur, "qty": qty,
+                "asset_type": asset_type, "regime": regime,
+                "buy_score": 0, "sell_score": 0,
+            }
+            return
+        if (_res or {}).get("rt_cd") == "0":
+            _etf_buy_guard[code] = time.time()   # 접수 성공에만 쿨다운 기록
+            notifier.notify_buy(name, code, cur, qty,
+                                f"ETF매수({asset_type}/{regime})")
+            _last_signals[code] = {
+                "action": "BUY", "price": cur, "qty": qty,
+                "asset_type": asset_type, "regime": regime,
+                "buy_score": 1, "sell_score": 0,
+            }
+        else:
+            _log(f"⚠️ ETF 매수 미접수 {name}: {(_res or {}).get('msg1','')}", "warning")
+            _last_signals[code] = {
+                "action": "BUY_FAIL", "price": cur, "qty": qty,
+                "asset_type": asset_type, "regime": regime,
+                "buy_score": 0, "sell_score": 0,
+            }
 
     except Exception as e:
         _log(f"❌ ETF 처리 오류 {name}: {e}", "error")

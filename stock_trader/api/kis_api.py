@@ -110,6 +110,13 @@ class KISApi:
         # ── 동일계좌 BUY 직렬화 락은 모듈 전역 _account_buy_lock(account_no)를
         #    사용한다(인스턴스 여러 개여도 계좌 단위 공유). 여기서 인스턴스 락을
         #    따로 두지 않는다.
+        # ── UNKNOWN(접수 불명확) 주문 영속 원장(재시작 후에도 BUY 차단 유지) ──
+        try:
+            from journal.unknown_order_ledger import get_default_unknown_ledger
+            self._unknown_ledger = get_default_unknown_ledger()
+        except Exception as _ule:
+            logger.warning("[UNKNOWN원장] 초기화 실패 — 미사용: %s", _ule)
+            self._unknown_ledger = None
 
     # ──────────────────────────────────────────────────────────
     # 1. OAuth2 토큰 관리
@@ -789,6 +796,23 @@ class KISApi:
         # ★ [제거] ord_psbl_cash/get_orderable_cash 기반 [현금초과 차단] 삭제.
         #   대신 실제 제출가격 기준 nrcvb 최종검증을 제출 직전에 수행한다(아래).
 
+        # ── UNKNOWN(접수 불명확) 미해소 종목 BUY 차단 (영속·재시작 후에도 유지) ──
+        #   과거 ambiguous POST 로 접수여부 불명확한 종목은 정합화로 해소될 때까지
+        #   모든 신규·추가·재배분·ETF BUY 를 차단한다. SELL·취소는 차단하지 않는다.
+        if order_type == "BUY":
+            _uled = getattr(self, "_unknown_ledger", None)
+            if _uled is not None:
+                try:
+                    if _uled.has_active(self.account_no, "KR", stock_code, "BUY"):
+                        logger.warning(
+                            "🚫 [BUY_BLOCKED_UNKNOWN] %s 미해소 UNKNOWN 주문 존재 "
+                            "→ 신규 BUY 차단(정합화 전까지)", stock_code)
+                        return {"rt_cd": "9", "_status": "BUY_BLOCKED_UNKNOWN",
+                                "msg1": "미해소 UNKNOWN 주문 — 정합화까지 신규 BUY 차단",
+                                "code": stock_code}
+                except Exception as _le:
+                    logger.error("[UNKNOWN원장] 조회 실패(%s): %s", stock_code, _le)
+
         # ── 중복 주문 쿨다운 체크 ────────────────────────────────
         last_order_ts = self._order_cooldown.get(stock_code, 0)
         elapsed_since_order = time.time() - last_order_ts
@@ -1008,14 +1032,31 @@ class KISApi:
             result.setdefault("_acc", f"{acc_no}-{acc_prod}")
             return result
 
-        def _unknown(reason):
-            # 접수여부 불명확 → 재제출하지 않고 종료. 체결/미체결 조회로 확인해야 함.
+        def _unknown(reason, _qty):
+            # 접수여부 불명확 → 재제출하지 않고 종료. BUY 는 즉시 영속 UNKNOWN 원장에
+            # 기록해 해당 종목 신규 BUY 를 해소 전까지 차단(재시작 후에도 유지).
+            if order_type == "BUY":
+                _uled = getattr(self, "_unknown_ledger", None)
+                if _uled is not None:
+                    try:
+                        _now = datetime.now(KST)
+                        _uled.record(
+                            self.account_no, "KR", stock_code, "BUY",
+                            _qty, order_price, ord_dvsn,
+                            created_at=_now.isoformat(),
+                            created_hhmmss=_now.strftime("%H%M%S"),
+                            reason=reason)
+                        logger.error(
+                            "🟠 [UNKNOWN 기록] %s BUY %d주 @%s원 접수 불명확 → 영속 "
+                            "원장 기록·해소까지 신규 BUY 차단", stock_code, _qty, order_price)
+                    except Exception as _le:
+                        logger.error("[UNKNOWN원장] 기록 실패(%s): %s", stock_code, _le)
             logger.warning("[주문] %s 접수 불명확 → ORDER_PENDING_CONFIRMATION (%s)",
                            stock_code, reason)
             return {"rt_cd": "U", "_status": "ORDER_PENDING_CONFIRMATION",
+                    "code": stock_code, "qty": _qty, "price": order_price,
                     "msg1": f"접수 여부 불명확 — 체결/미체결 조회 필요: {reason}",
-                    "_ord_dvsn": ord_dvsn, "_ord_unpr": order_price,
-                    "_tr_id": tr_id, "_acc": f"{acc_no}-{acc_prod}"}
+                    "_ord_dvsn": ord_dvsn, "_ord_unpr": order_price, "_tr_id": tr_id}
 
         # ── 1차 제출 ─────────────────────────────────────────────
         first = _post_once(qty)
@@ -1024,7 +1065,7 @@ class KISApi:
         if first["status"] == "ODNO":
             return _attach(first["result"])            # 접수 정황 → 재제출 금지
         if first["status"] == "AMBIGUOUS":
-            return _unknown(first.get("reason", ""))    # 접수 불명확 → 재제출 금지
+            return _unknown(first.get("reason", ""), qty)  # 접수 불명확 → 재제출 금지
 
         # first == REJECTED (주문번호 없음, 명확한 미접수 거절)
         _rej_result = first["result"]
@@ -1061,7 +1102,7 @@ class KISApi:
         if second["status"] == "ODNO":
             return _attach(second["result"])
         if second["status"] == "AMBIGUOUS":
-            return _unknown(second.get("reason", ""))
+            return _unknown(second.get("reason", ""), _new_qty)
         return _attach(second["result"])                # 재거절 → 추가 재시도 없음
 
     def buy(self, stock_code: str, qty: int, price: int = 0,
@@ -2477,6 +2518,82 @@ class KISApi:
         except Exception as e:
             logger.error(f"[KR체결조회] 오류 odno={odno!r}: {e}")
             return {}
+
+    # ──────────────────────────────────────────────────────────
+    # 6-A2. UNKNOWN 정합화용 당일 주문/체결 후보 조회 + 실행
+    # ──────────────────────────────────────────────────────────
+    def _kr_list_orders_today(self, code: str, side: str,
+                              after_hhmmss: str = "") -> dict:
+        """당일 동일 종목·방향 주문/체결 후보 목록(체결+미체결 전체). UNKNOWN 정합화용.
+        반환: {"query_ok": bool, "candidates": [ {odno, qty, price,
+              cum_filled_qty, unfilled_qty, order_status, order_time}, ... ]}
+        조회 실패/오류 → query_ok=False (자동해제 금지)."""
+        from config import Config as _Cfg
+        tr_id = "TTTC0081R" if _Cfg.KIS_IS_REAL else "VTTC0081R"
+        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
+        acc_no, acc_prod = self.account_no.split("-") \
+            if "-" in self.account_no else (self.account_no, "01")
+        today = datetime.now(KST).strftime("%Y%m%d")
+        params = {
+            "CANO": acc_no, "ACNT_PRDT_CD": acc_prod,
+            "INQR_STRT_DT": today, "INQR_END_DT": today,
+            "SLL_BUY_DVSN_CD": "02" if side == "BUY" else "01",
+            "INQR_DVSN": "00", "PDNO": code,
+            "CCLD_DVSN": "00",   # 00=전체(체결+미체결)
+            "ORD_GNO_BRNO": "", "ODNO": "", "INQR_DVSN_3": "00",
+            "INQR_DVSN_1": "", "CTX_AREA_FK100": "", "CTX_AREA_NK100": "",
+        }
+        try:
+            self._rate_limit(critical=True)
+            resp = requests.get(url, headers=self._headers(tr_id),
+                                params=params, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            if str(data.get("rt_cd", "1")) != "0":
+                return {"query_ok": False, "candidates": []}
+            cands = []
+            for it in (data.get("output1", []) or []):
+                _t = str(it.get("ord_tmd", "") or "")
+                if after_hhmmss and _t and _t < after_hhmmss:
+                    continue   # 발생시각 이전 주문 제외
+                if code and it.get("pdno", code) != code:
+                    continue
+                try:
+                    _qty = int(it.get("ord_qty", 0) or 0)
+                    _prc = int(float(it.get("ord_unpr", 0) or 0))
+                    _fil = int(it.get("tot_ccld_qty", 0) or 0)
+                    _rmn = int(it.get("rmn_qty", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                cands.append({
+                    "odno": str(it.get("odno", "") or ""),
+                    "qty": _qty, "price": _prc,
+                    "cum_filled_qty": _fil, "unfilled_qty": _rmn,
+                    "order_status": it.get("ord_stts_name", ""),
+                    "order_time": _t,
+                })
+            self._on_api_success()
+            return {"query_ok": True, "candidates": cands}
+        except Exception as e:
+            logger.error("[UNKNOWN정합화] 당일주문 조회 오류 code=%s: %s", code, e)
+            return {"query_ok": False, "candidates": []}
+
+    def reconcile_kr_unknowns(self, on_promote=None, on_fill=None) -> list:
+        """PENDING UNKNOWN 을 당일 주문/체결 조회로 정합화(증거 기반). 결과 리스트 반환.
+        on_promote(row, cand)->bool: 접수 발견 시 pending 승격(성공 시 True).
+        on_fill(row, cand)->bool:    체결 발견 시 체결 부킹(성공 시 True).
+        훅 미제공/실패 시 해당 건은 MANUAL_REVIEW 로 남아 계속 차단(무단 해제 금지)."""
+        led = getattr(self, "_unknown_ledger", None)
+        if led is None:
+            return []
+        from journal.unknown_order_reconciler import reconcile_unknown_orders
+
+        def _prov(row):
+            return self._kr_list_orders_today(
+                row["code"], row["side"], row.get("created_hhmmss", "") or "")
+        return reconcile_unknown_orders(
+            led, _prov, on_promote=on_promote, on_fill=on_fill,
+            now_iso=datetime.now(KST).isoformat())
 
     # ──────────────────────────────────────────────────────────
     # 6-B. 미국주식 주문·체결 조회 (TTTS3035R)
