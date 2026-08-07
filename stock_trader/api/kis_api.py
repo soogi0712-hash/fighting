@@ -73,6 +73,8 @@ class KISApi:
         # {code: last_order_ts}
         self._order_cooldown: dict = {}
         self._ORDER_COOLDOWN_SEC: float = 10.0  # 같은 종목 10초 쿨다운
+        # ── 동일계좌 BUY 직렬화 락 (최종조회~제출 사이 nrcvb 동시소진 방지) ──
+        self._kr_buy_lock = threading.Lock()
 
     # ──────────────────────────────────────────────────────────
     # 1. OAuth2 토큰 관리
@@ -564,29 +566,61 @@ class KISApi:
         (예수금 dnca_tot_amt 와 달리 미체결 예약금·정산을 반영한 값)."""
         return float(self._get_cash_from_psbl_api())
 
-    def _reject_if_cash_exceeded(self, stock_code: str, qty: int,
-                                 price: float) -> dict | None:
-        """BUY 지정가 총주문금액(매수수수료 포함)이 주문가능현금을 초과하면
-        차단 dict 반환, 아니면 None. (신용·미수 미사용 — 현금 초과 원천 차단)"""
+    def _reject_if_nrcvb_insufficient(self, stock_code: str, qty: int,
+                                      order_price, ord_dvsn: str = "00") -> dict | None:
+        """BUY 최종검증(제출 직전): 실제 종목·실제 제출가격으로 nrcvb 재조회.
+
+        ★ ord_psbl_cash/get_orderable_cash/max_buy_* 는 사용하지 않는다.
+          현금 권위값 nrcvb_buy_amt / nrcvb_buy_qty 만으로:
+            - qty <= nrcvb_buy_qty
+            - order_price>0 이면 qty*order_price <= nrcvb_buy_amt
+              (시장가=order_price 0 이면 금액검사 생략, 수량검사 nrcvb_qty 로만 판단)
+          을 만족하지 못하거나 조회 실패/0 이면 차단 dict, 통과면 None.
+        ★ 전략비중·0.98 버퍼는 여기서 다시 적용하지 않는다(호출부에서 이미 반영).
+          이 함수는 '이미 정해진 qty'를 nrcvb 상한으로만 방어검증한다.
+        ★ SELL 에는 호출하지 않는다(현금검증 미적용).
+        """
         try:
-            from screener.transaction_cost import BUY_COMMISSION_RATE as _comm
-        except Exception:
-            _comm = 0.00015
-        orderable = self.get_orderable_cash()
-        if orderable is None or orderable < 0:
-            # 조회 실패 → 사이징 계층 방어에 위임(차단하지 않되 경고)
-            logger.warning(
-                f"[현금가드] 주문가능현금 조회 실패 — 사이징 방어에 위임 ({stock_code})")
-            return None
-        order_amt = price * qty * (1 + _comm)
-        if order_amt > orderable:
-            logger.error(
-                f"🚫 [현금초과 차단] {stock_code} 주문금액 {order_amt:,.0f}원 > "
-                f"주문가능현금 {orderable:,.0f}원 — 미수 방지 위해 제출 차단")
-            return {"rt_cd": "9",
-                    "msg1": (f"현금초과 차단(주문 {order_amt:,.0f}원 > "
-                             f"가능 {orderable:,.0f}원)"),
+            avail = self.get_kr_available_amounts(stock_code, order_price,
+                                                  ord_dvsn or "00")
+        except Exception as e:
+            logger.error("[BUY 최종검증] 주문가능 조회 예외 → 미제출 (%s): %s",
+                         stock_code, e)
+            return {"rt_cd": "9", "msg1": f"최종 주문가능 조회 예외 → 미제출: {e}",
                     "_cash_guard": True}
+        if not avail.get("ok", False):
+            logger.error("[BUY 최종검증] 주문가능 조회 실패/0 → 미제출 (%s)", stock_code)
+            return {"rt_cd": "9", "msg1": "최종 주문가능 조회 실패/0 → 미제출",
+                    "_cash_guard": True}
+        nrcvb_qty = int(avail.get("qty", 0) or 0)          # nrcvb_buy_qty
+        nrcvb_amt = float(avail.get("amount", 0.0) or 0.0)  # nrcvb_buy_amt
+        if nrcvb_qty <= 0 or nrcvb_amt <= 0:
+            return {"rt_cd": "9",
+                    "msg1": (f"최종 nrcvb 0(nrcvb_buy_qty={nrcvb_qty}, "
+                             f"nrcvb_buy_amt={nrcvb_amt:,.0f}) → 미제출"),
+                    "_cash_guard": True}
+        if qty > nrcvb_qty:
+            logger.error("🚫 [BUY 최종검증] %s 요청 %d주 > nrcvb_buy_qty %d주 → 차단",
+                         stock_code, qty, nrcvb_qty)
+            return {"rt_cd": "9",
+                    "msg1": f"수량초과 차단(요청 {qty}주 > nrcvb_buy_qty {nrcvb_qty}주)",
+                    "_cash_guard": True}
+        try:
+            _op = float(order_price)
+        except (TypeError, ValueError):
+            _op = 0.0
+        if _op > 0 and (qty * _op) > nrcvb_amt:
+            logger.error(
+                f"🚫 [BUY 최종검증] {stock_code} 요청금액 {qty * _op:,.0f}원 > "
+                f"nrcvb_buy_amt {nrcvb_amt:,.0f}원 → 차단")
+            return {"rt_cd": "9",
+                    "msg1": (f"금액초과 차단(요청 {qty * _op:,.0f}원 > "
+                             f"nrcvb_buy_amt {nrcvb_amt:,.0f}원)"),
+                    "_cash_guard": True}
+        logger.info(
+            f"[BUY 최종검증 통과] {stock_code} qty={qty} ≤ nrcvb_buy_qty={nrcvb_qty}, "
+            f"금액={qty * _op:,.0f} ≤ nrcvb_buy_amt={nrcvb_amt:,.0f} "
+            f"(주문가={order_price})")
         return None
 
     def get_kr_available_amounts(self, stock_code: str, ord_unpr,
@@ -706,12 +740,8 @@ class KISApi:
         if _guard is not None:
             return _guard
 
-        # ── 현금초과(미수) 사전 차단 — BUY 지정가에서만 검증 가능 ──
-        # 신용·미수 미사용: 총 주문금액이 실제 주문가능현금을 초과하면 제출 차단.
-        if order_type == "BUY" and price and price > 0 and qty and qty > 0:
-            _blocked = self._reject_if_cash_exceeded(stock_code, qty, price)
-            if _blocked is not None:
-                return _blocked
+        # ★ [제거] ord_psbl_cash/get_orderable_cash 기반 [현금초과 차단] 삭제.
+        #   대신 실제 제출가격 기준 nrcvb 최종검증을 제출 직전에 수행한다(아래).
 
         # ── 중복 주문 쿨다운 체크 ────────────────────────────────
         last_order_ts = self._order_cooldown.get(stock_code, 0)
@@ -815,6 +845,28 @@ class KISApi:
         if _pre_err is not None:
             return _pre_err
 
+        # ── BUY: 최종 nrcvb 검증 + 제출을 '동일계좌 BUY 직렬화 락'으로 보호(item10).
+        #   최종조회~제출 구간을 직렬화 → 두 매수가 같은 nrcvb 금액을 동시에 소진하지
+        #   못한다. 두 번째 주문은 락 획득 후 새로 nrcvb 재조회한다.
+        #   SELL 은 락/현금검증 없이 즉시 제출(item5).
+        if order_type == "BUY":
+            with self._kr_buy_lock:
+                _blk = self._reject_if_nrcvb_insufficient(
+                    stock_code, qty, order_price, ord_dvsn)
+                if _blk is not None:
+                    return _blk
+                return self._submit_kr_order_cash(
+                    stock_code, order_type, qty, order_price, ord_dvsn,
+                    tr_id, acc_no, acc_prod, price)
+        return self._submit_kr_order_cash(
+            stock_code, order_type, qty, order_price, ord_dvsn,
+            tr_id, acc_no, acc_prod, price)
+
+    def _submit_kr_order_cash(self, stock_code, order_type, qty, order_price,
+                              ord_dvsn, tr_id, acc_no, acc_prod, price) -> dict:
+        """order-cash 실제 제출(재시도 포함). _order 에서 검증·직렬화 후 호출된다.
+        SELL 은 검증 없이, BUY 는 nrcvb 최종검증·직렬화 락 안에서 호출된다."""
+        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-cash"
         body = {
             "CANO":         acc_no,
             "ACNT_PRDT_CD": acc_prod,
