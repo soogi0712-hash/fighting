@@ -32,39 +32,50 @@ def make_kr(avail_returns):
 
 class TestKRFinalizeBuyQty(unittest.TestCase):
 
-    def test_deposit_large_but_qty_small(self):
-        """예수금(교차검증)은 크지만 KIS 현금 주문가능수량 3 → 3주."""
-        mgr = make_kr({"ok": True, "amount": 1_000_000_000, "qty": 3,
-                       "cash": 1_000_000_000})
+    def test_tiny_deposit_but_kis_cash_sufficient_orders(self):
+        """예수금 6,098원이지만 KIS 종목별 현금 주문가능액이 충분하면 주문 성립.
+        (예수금 선차단 제거 — deposit_cash 는 교차검증/로그용)."""
+        mgr = make_kr({"ok": True, "amount": 1_000_000, "qty": 100,
+                       "cash": 1_000_000})
         qty, reason = mgr._kr_finalize_buy_qty(
-            "005930", 100, 70000, deposit_cash=5_000_000_000)
-        self.assertEqual(qty, 3)
+            "005930", 10000, 1.0, deposit_cash=6098)
+        # min(floor(1e6/1e4)=100, nrcvb 100, floor(1e6*0.98/1e4)=98)=98
+        self.assertEqual(qty, 98)
         self.assertEqual(reason, "OK")
         mgr.api.buy.assert_not_called()   # 확정 단계는 주문을 내지 않는다
 
-    def test_amount_present_but_qty_zero_blocks(self):
-        """현금가능금액은 있으나 미수없는 수량 0 → 0(BUY_BLOCKED)."""
-        mgr = make_kr({"ok": True, "amount": 1_000_000_000, "qty": 0,
-                       "cash": 1_000_000_000})
-        qty, reason = mgr._kr_finalize_buy_qty("005930", 100, 70000)
-        self.assertEqual(qty, 0)
-        self.assertIn("부족", reason)
-        mgr.api.buy.assert_not_called()
-
-    def test_lookup_failure_no_order(self):
-        """조회 실패(ok=False) → 0, buy 미호출."""
-        mgr = make_kr({"ok": False})
-        qty, reason = mgr._kr_finalize_buy_qty("005930", 100, 70000)
+    def test_kis_qty_zero_blocks(self):
+        """종목별 현금 주문가능수량 0 → 0(BUY_BLOCKED), buy 미호출."""
+        mgr = make_kr({"ok": True, "amount": 1_000_000, "qty": 0,
+                       "cash": 1_000_000})
+        qty, reason = mgr._kr_finalize_buy_qty("005930", 10000, 1.0)
         self.assertEqual(qty, 0)
         self.assertIn("미제출", reason)
         mgr.api.buy.assert_not_called()
 
-    def test_fee_buffer_applied(self):
-        """수수료 버퍼: 전략·수량이 커도 floor(현금가능금액*0.98/주문가)로 제한."""
-        # amount 500,000 / 10,000 → floor(490,000/10,000)=49
+    def test_ratio_30pct_applied_to_kis_cash(self):
+        """전략비중 30%는 예수금이 아니라 KIS 현금 주문가능금액에 적용."""
+        mgr = make_kr({"ok": True, "amount": 1_000_000, "qty": 999,
+                       "cash": 1_000_000})
+        qty, _ = mgr._kr_finalize_buy_qty("005930", 10000, 0.30)
+        # ratio_cash=300,000 → min(floor(30e4/1e4)=30, 999,
+        #                          floor(30e4*0.98/1e4)=29) = 29
+        self.assertEqual(qty, 29)
+
+    def test_lookup_failure_no_order(self):
+        """조회 실패(ok=False) → 0, buy 미호출."""
+        mgr = make_kr({"ok": False})
+        qty, reason = mgr._kr_finalize_buy_qty("005930", 10000, 1.0)
+        self.assertEqual(qty, 0)
+        self.assertIn("미제출", reason)
+        mgr.api.buy.assert_not_called()
+
+    def test_fee_buffer_applied_once(self):
+        """0.98 버퍼는 1회만 적용: floor(현금가능금액*ratio*0.98/주문가)."""
+        # amount 500,000, ratio 1.0 → floor(490,000/10,000)=49
         mgr = make_kr({"ok": True, "amount": 500_000, "qty": 999,
                        "cash": 500_000})
-        qty, _ = mgr._kr_finalize_buy_qty("005930", 100, 10000)
+        qty, _ = mgr._kr_finalize_buy_qty("005930", 10000, 1.0)
         self.assertEqual(qty, 49)
         self.assertEqual(qty, qty_from_cash(500_000, 10000))
 
@@ -74,19 +85,19 @@ class TestKRFinalizeBuyQty(unittest.TestCase):
             {"ok": True, "amount": 1_000_000, "qty": 100, "cash": 1_000_000},
             {"ok": True, "amount": 200_000, "qty": 20, "cash": 200_000},  # 소진 후
         ])
-        q1, _ = mgr._kr_finalize_buy_qty("005930", 50, 10000)
-        q2, _ = mgr._kr_finalize_buy_qty("005930", 50, 10000)
-        # 1차: min(50,100,floor(980000/10000)=98)=50
-        self.assertEqual(q1, 50)
-        # 2차(미체결 소진 반영): min(50,20,floor(196000/10000)=19)=19
+        q1, _ = mgr._kr_finalize_buy_qty("005930", 10000, 1.0)
+        q2, _ = mgr._kr_finalize_buy_qty("005930", 10000, 1.0)
+        # 1차: min(100, 100, floor(980000/10000)=98)=98
+        self.assertEqual(q1, 98)
+        # 2차(미체결 소진 반영): min(20, 20, floor(196000/10000)=19)=19
         self.assertEqual(q2, 19)
         self.assertLess(q2, q1)
 
-    def test_query_uses_actual_symbol_and_price(self):
-        """계좌·종목·실제주문가격 기준 조회(예수금 나눗셈 아님) — 인자 전달 검증."""
+    def test_query_uses_actual_symbol_price_dvsn(self):
+        """계좌·종목·실제주문가격·주문구분 기준 조회(예수금 나눗셈 아님)."""
         mgr = make_kr({"ok": True, "amount": 1_000_000, "qty": 100,
                        "cash": 1_000_000})
-        mgr._kr_finalize_buy_qty("035720", 30, 55000, ord_dvsn="00")
+        mgr._kr_finalize_buy_qty("035720", 55000, 0.30, ord_dvsn="00")
         mgr.api.get_kr_available_amounts.assert_called_once_with(
             "035720", 55000, "00")
 

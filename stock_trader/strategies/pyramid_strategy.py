@@ -673,28 +673,21 @@ class PyramidStrategyManager:
 
         cfg = PYRAMID_LEVELS[1]
 
+        # ★ 예수금(cash)은 스냅샷(교차검증/로그)일 뿐, 여기서 선차단하지 않는다.
+        #   최종수량은 매수 직전 종목별 KIS 현금 주문가능조회로 확정한다(run()).
+        #   (예수금 6,098원 × 30% 식 선차단 제거)
         if cash <= 0:
-            logger.warning(f"⚠️ {name}({code}) cash=0 감지 → 잔고 조회 실패 SKIP")
-            return {"action": "SKIP", "reason": f"현금 0원 (잔고조회 실패 추정)",
-                    "code": code, "name": name}
+            logger.info(f"{name}({code}) 예수금 스냅샷 0/실패 — 선차단 안 함, "
+                        f"주문 직전 KIS 주문가능조회로 확정")
 
-        # 종목당/전체 투자한도 제거 — 실제 주문가능현금 범위만 제한
-        # (compound_pool 미가산, 신용·미수 금지)
-        investable = max(0.0, cash) * CASH_SAFETY_BUFFER
-        invest_amt = investable * cfg["invest_ratio"]   # 30%
-
-        # ★ 최소 1주 보장
+        # 제안(advisory) 수량: 예수금 스냅샷 기반이며 최종수량이 아니다.
+        # (종목당/전체 투자한도 제거, compound_pool 미가산, 신용·미수 금지)
+        investable  = max(0.0, cash) * CASH_SAFETY_BUFFER
+        invest_amt  = investable * cfg["invest_ratio"]   # 30%
         min_for_one = price * 1.002
         if invest_amt < min_for_one and cash >= min_for_one:
             invest_amt = min_for_one
-            logger.info(f"★ {name} 고가주 최소 1주 보장 ({price:,.0f}원)")
-
-        qty = calc_buy_qty(invest_amt, price, invest_ratio=1.0)
-
-        if qty < 1:
-            return {"action": "SKIP",
-                    "reason": f"투자가능금액 부족 (현금={cash:,.0f}원 × 30%={invest_amt:,.0f}원, 종목가={price:,.0f}원)",
-                    "code": code, "name": name}
+        qty = max(1, calc_buy_qty(invest_amt, price, invest_ratio=1.0))
 
         bc = calc_buy_cost(price, qty)
 
@@ -703,28 +696,28 @@ class PyramidStrategyManager:
         entry_type   = "본진입(100%)" if buy_score_norm >= BUY_SCORE_FULL else "Early Entry(30%)"
 
         # BUY SCORE ≥ 0.75이면 전체 투자금(100%) 한번에 진입
+        # (최종수량은 매수 직전 KIS 현금 주문가능조회로 확정 — 여기선 비중만 전달)
         if buy_score_norm >= BUY_SCORE_FULL:
             # Full Entry: 100% 투자
-            invest_full = investable
-            qty_full = calc_buy_qty(invest_full, price, invest_ratio=1.0)
-            if qty_full >= 1:
-                bc_full = calc_buy_cost(price, qty_full)
-                return {
-                    "action":          "BUY_LEVEL1_FULL",
-                    "level":           1,
-                    "qty":             qty_full,
-                    "price":           price,
-                    "amount":          bc_full.buy_amount,
-                    "total_cost":      bc_full.total_cost,
-                    "buy_commission":  round(bc_full.commission, 0),
-                    "code":            code,
-                    "name":            name,
-                    "buy_score_norm":  buy_score_norm,
-                    "reason":          (f"피라미딩 1단계 {entry_type} "
-                                        f"(BUY SCORE {buy_score_norm:.2f}≥{BUY_SCORE_FULL}, "
-                                        f"투자금={bc_full.total_cost:,.0f}원)"),
-                    "using_compound":  0,  # 복리풀 매수여력 미가산(원칙 6)
-                }
+            qty_full = max(1, calc_buy_qty(investable, price, invest_ratio=1.0))
+            bc_full  = calc_buy_cost(price, qty_full)
+            return {
+                "action":          "BUY_LEVEL1_FULL",
+                "level":           1,
+                "qty":             qty_full,
+                "price":           price,
+                "amount":          bc_full.buy_amount,
+                "total_cost":      bc_full.total_cost,
+                "buy_commission":  round(bc_full.commission, 0),
+                "code":            code,
+                "name":            name,
+                "buy_score_norm":  buy_score_norm,
+                "invest_ratio":    1.0,   # ★ KIS 현금 주문가능금액에 적용할 비중
+                "reason":          (f"피라미딩 1단계 {entry_type} "
+                                    f"(BUY SCORE {buy_score_norm:.2f}≥{BUY_SCORE_FULL}, "
+                                    f"비중100%, 최종수량=주문직전 KIS 확정)"),
+                "using_compound":  0,  # 복리풀 매수여력 미가산(원칙 6)
+            }
 
         # Early Entry: 30% 진입
         return {
@@ -738,9 +731,10 @@ class PyramidStrategyManager:
             "code":            code,
             "name":            name,
             "buy_score_norm":  buy_score_norm,
+            "invest_ratio":    cfg["invest_ratio"],   # ★ 30% → KIS 현금가능금액에 적용
             "reason":          (f"피라미딩 1단계 {entry_type} "
                                 f"(BUY SCORE {buy_score_norm:.2f}≥{BUY_SCORE_EARLY}, "
-                                f"투자금={bc.total_cost:,.0f}원, 현금기준)"),
+                                f"비중{cfg['invest_ratio']:.0%}, 최종수량=주문직전 KIS 확정)"),
             "using_compound":  0,  # 복리풀 매수여력 미가산(원칙 6)
         }
 
@@ -757,12 +751,8 @@ class PyramidStrategyManager:
         # (compound_pool 미가산 — 원칙 6 / 신용·미수 금지)
         full_invest_amt = max(0.0, cash) * CASH_SAFETY_BUFFER
 
-        qty = calc_buy_qty(full_invest_amt, price, invest_ratio=1.0)
-
-        if qty < 1:
-            return {"action": "HOLD", "code": code, "name": name,
-                    "level": pos.current_level,
-                    "reason": f"Full Entry 투자금 부족 ({full_invest_amt:,.0f}원 < {price:,.0f}원)"}
+        # 제안 수량(advisory) — 최종수량은 매수 직전 KIS 현금 주문가능조회로 확정.
+        qty = max(1, calc_buy_qty(full_invest_amt, price, invest_ratio=1.0))
 
         bc = calc_buy_cost(price, qty)
         net_pct = net_profit_pct_from_cost(pos.avg_price, price)
@@ -778,8 +768,9 @@ class PyramidStrategyManager:
             "code":           code,
             "name":           name,
             "net_pct":        round(net_pct, 2),
+            "invest_ratio":   1.0,   # ★ 남은 현금 100% → KIS 현금가능금액에 적용
             "reason":         (f"Full Entry 남은현금 추가 진입 "
-                               f"(BUY SCORE 달성, 투자금={bc.total_cost:,.0f}원)"),
+                               f"(BUY SCORE 달성, 비중100%, 최종수량=주문직전 KIS 확정)"),
             "using_compound": 0,  # 복리풀 매수여력 미가산(원칙 6)
         }
 
@@ -796,11 +787,8 @@ class PyramidStrategyManager:
         cash_budget   = max(0.0, cash) * CASH_SAFETY_BUFFER
         invest_amt    = cash_budget * cfg["invest_ratio"]
 
-        qty = calc_buy_qty(invest_amt, price, invest_ratio=1.0)
-
-        if qty < 1:
-            return {"action": "HOLD", "code": code, "name": name,
-                    "level": pos.current_level, "reason": "추가 투자금 부족"}
+        # 제안 수량(advisory) — 최종수량은 매수 직전 KIS 현금 주문가능조회로 확정.
+        qty = max(1, calc_buy_qty(invest_amt, price, invest_ratio=1.0))
 
         bc      = calc_buy_cost(price, qty)
         net_pct = net_profit_pct_from_cost(pos.avg_price, price)
@@ -816,8 +804,10 @@ class PyramidStrategyManager:
             "code":           code,
             "name":           name,
             "net_pct":        round(net_pct, 2),
+            "invest_ratio":   cfg["invest_ratio"],   # ★ 단계비율 → KIS 현금가능금액에 적용
             "reason":         (f"피라미딩 {level}단계 추가 "
-                               f"(실질{net_pct:+.2f}%, 지표{indicator_score}개)"),
+                               f"(실질{net_pct:+.2f}%, 비중{cfg['invest_ratio']:.0%}, "
+                               f"최종수량=주문직전 KIS 확정)"),
             "using_compound": 0,  # 복리풀 매수여력 미가산(원칙 6)
         }
 
