@@ -2598,22 +2598,31 @@ class USStrategyManager:
         ratio_label = f"EARLY{entry_ratio:.0%}" if entry_ratio < 1.0 else "FULL100%"
         logger.info(f"[{symbol}] 예산${budget_usd:.2f}({ratio_label}) / ${cur_price:.2f} = {qty}주")
 
-        # ── ★ KIS 현금 주문가능수량·금액으로 최종수량 확정 ─────────────
-        #   예수금 나눗셈이 아니라 KIS 확정값을 권위로:
-        #     최종 = min(전략수량, KIS주문가능수량(ovrs_max_ord_psbl_qty),
-        #               floor(현금가능금액 * 0.98 / 실제주문가))
-        #   해외주식은 미수/신용이 없어 KIS 주문가능수량 자체가 현금 기준이다.
-        _kis_qty = int(avail.get("qty", 0) or 0)
-        _final_qty = finalize_order_qty(qty, _kis_qty, effective_usd, cur_price)
+        # ── ★ KIS 주문가능금액으로 최종수량 확정 (해외) ─────────────────
+        #   해외주식은 미수/신용이 없어 '주문가능금액'(frcr_ord_psbl_amt1/원화환산)이
+        #   권위값이다. ovrs_max_ord_psbl_qty 는 장 시작 직후·환율/시세 미확정 시
+        #   0 또는 미제공으로 오는 경우가 있어, 그대로 min 상한에 넣으면 금액이
+        #   충분해도 전 종목 BUY 가 0주로 차단된다(=미국 거래 전면 중단).
+        #   → ovrs_max_ord_psbl_qty 는 '양수일 때만' 안전 상한으로 쓰고, 0/미제공
+        #     이면 무시하고 금액기준으로만 확정한다. 차단은 '금액 부족'일 때만.
+        _kis_qty = int(avail.get("qty", 0) or 0)          # ovrs_max_ord_psbl_qty
+        _amt_qty = qty_from_cash(effective_usd, cur_price)  # floor(가능금액*0.98/가)
+        if _kis_qty > 0:
+            _final_qty = min(qty, _kis_qty, _amt_qty)
+        else:
+            _final_qty = min(qty, _amt_qty)   # KIS 수량 미제공/0 → 금액기준만
+            logger.info(
+                "[%s] ovrs_max_ord_psbl_qty=0/미제공 → 금액기준 사이징 사용", symbol)
         logger.info(
-            "[%s] 수량확정 = min(전략%d, KIS가능%d, 금액환산%d) → %d주",
-            symbol, qty, _kis_qty,
-            qty_from_cash(effective_usd, cur_price), _final_qty)
+            "[%s] 수량확정 = min(전략%d, KIS가능%s, 금액환산%d) → %d주",
+            symbol, qty, (_kis_qty if _kis_qty > 0 else "무시"),
+            _amt_qty, _final_qty)
         if _final_qty <= 0:
             logger.warning(
-                "[%s] KIS 현금 주문가능수량/금액 0 → 주문 미제출(BUY_BLOCKED)", symbol)
+                "[%s] 주문가능금액 부족(금액환산 %d주, usd=%.2f) → 주문 미제출"
+                "(BUY_BLOCKED)", symbol, _amt_qty, effective_usd)
             return {"action": "BUY_BLOCKED", "symbol": symbol, "name": name,
-                    "reason": "KIS 현금 주문가능수량/금액 0 — 주문 미제출",
+                    "reason": "주문가능금액 부족 — 주문 미제출",
                     "session": sess.get("session", "")}
         qty = _final_qty
 
