@@ -237,6 +237,11 @@ class StrategyManager:
             using_compound=using_cmpd,
             is_full_add=is_full_add,
         )
+        # (req13) 체결 반영 → 잔고 캐시 무효화(다음 조회는 최신 예수금/평가금액)
+        try:
+            self.api.invalidate_balance_cache()
+        except Exception:
+            pass
 
         # trade_id → 포지션에 저장
         _trade_id = meta.get("trade_id", "")
@@ -304,6 +309,11 @@ class StrategyManager:
         profit = self.pyramid.apply_sell(
             code, qty, price, level=level, is_full=is_full
         )
+        # (req13) 매도 체결 반영 → 잔고 캐시 무효화
+        try:
+            self.api.invalidate_balance_cache()
+        except Exception:
+            pass
         net_pct_actual = profit.get("net_profit_pct", 0.0)
         net_profit_amt = profit.get("net_profit", 0.0)
 
@@ -542,7 +552,8 @@ class StrategyManager:
 
     def _kr_finalize_buy_qty(self, code: str, query_price, ratio: float,
                              ord_dvsn: str = "00",
-                             deposit_cash=None) -> tuple[int, str]:
+                             deposit_cash=None,
+                             strategy_qty=None) -> tuple[int, str]:
         """국내 매수수량을 KIS 현금 주문가능금액·수량으로 최종 확정한다.
 
         ★ 전략비중(ratio, 예: 0.30/1.00)은 예수금이 아니라 KIS 현금 주문가능금액
@@ -580,9 +591,19 @@ class StrategyManager:
         # ★ 전략비중을 KIS 현금 주문가능금액에 적용
         ratio_cash = kis_cash * _ratio
         try:
-            strat_qty = int(ratio_cash / float(query_price)) if float(query_price) > 0 else 0
+            _cash_qty = int(ratio_cash / float(query_price)) if float(query_price) > 0 else 0
         except (TypeError, ValueError, ZeroDivisionError):
-            strat_qty = 0
+            _cash_qty = 0
+        # 전략 산출수량(req6 첫째 항): 호출자가 명시하면(예: ETF 목표비중 수량)
+        # 그 값을, 없으면 KIS 현금×비중 기준 수량을 사용. 어느 경우든 나머지 두
+        # 항(nrcvb, floor(ratio_cash*0.98/가))이 함께 min 되어 상한을 이룬다.
+        if strategy_qty is None:
+            strat_qty = _cash_qty
+        else:
+            try:
+                strat_qty = max(0, int(strategy_qty))
+            except (TypeError, ValueError):
+                strat_qty = _cash_qty
         # min(전략비중수량, nrcvb_buy_qty, floor(ratio_cash*0.98/가)) — 0.98 1회 적용
         final_qty = finalize_order_qty(strat_qty, kis_qty, ratio_cash, query_price)
         _dep = ""
