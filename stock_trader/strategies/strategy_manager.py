@@ -2132,6 +2132,27 @@ class StrategyManager:
             result = self.api.buy(code, qty, use_price, ord_dvsn=ord_dvsn)
             order_ok = result.get("rt_cd") == "0"
 
+            # ── ★ UNKNOWN(접수 불명확)·UNKNOWN차단 → 실패/거래완료로 집계 금지 ──
+            #   거래횟수·포지션·PnL 로 기록하지 않고, 잔고 재확인 자동등록도 하지 않는다
+            #   (영속 UNKNOWN 원장이 정합화까지 신규 BUY 를 차단). 대시보드엔 계좌·
+            #   응답원문 없이 상태·종목·수량·가격만 노출한다.
+            _u_status = result.get("_status", "")
+            if result.get("rt_cd") == "U" or _u_status in (
+                    "ORDER_PENDING_CONFIRMATION", "BUY_BLOCKED_UNKNOWN"):
+                _st = _u_status or "ORDER_PENDING_CONFIRMATION"
+                logger.warning(
+                    "🟠 [%s] %s(%s) %d주 @%s원 — 거래완료·포지션·PnL 미집계 "
+                    "(신규 BUY 차단 유지)", _st, name, code, qty, use_price)
+                return {
+                    "action":  _st,
+                    "code":    code, "name": name,
+                    "qty":     qty, "price": use_price,
+                    "reason":  ("접수 불명확 — 체결/미체결 조회로 확인 필요"
+                                if _st == "ORDER_PENDING_CONFIRMATION"
+                                else "미해소 UNKNOWN 주문 존재 — 신규 BUY 차단"),
+                    "session": sess["session"],
+                }
+
             if not order_ok:
                 # ── [훅 4] ORDER_REJECTED ────────────────────────
                 if _JOURNAL_ENABLED and _trade_id:
