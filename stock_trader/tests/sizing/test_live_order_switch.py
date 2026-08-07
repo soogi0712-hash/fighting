@@ -68,21 +68,22 @@ class LiveOrderSwitchTest(unittest.TestCase):
         self.assertTrue(r2.get("_dry_run"))
         self.assertEqual(self.post_calls, [])
 
-    # ── 현금초과 사전 차단 ───────────────────────────────────────
-    def test_cash_guard_blocks_over_cash_buy_before_submit(self):
-        Config.LIVE_ORDER_ENABLED = True   # 킬스위치는 통과시키고 현금가드만 검증
-        self.api._get_cash_from_psbl_api = lambda: 100_000   # 주문가능현금 10만
-        # 주문금액 = 10주 × 50,000 × (1+수수료) ≈ 500,075원 > 100,000
-        r = self.api._order("005930", "BUY", 10, 50000)
+    # ── BUY 최종검증(nrcvb 기반, ord_psbl_cash [현금초과 차단] 대체) ────────
+    def test_nrcvb_guard_blocks_over_qty(self):
+        """요청수량 > nrcvb_buy_qty → 차단(_cash_guard). ord_psbl_cash 미사용."""
+        self.api.get_kr_available_amounts = lambda *a, **k: {
+            "ok": True, "amount": 9_999_999.0, "qty": 1, "ord_psbl_cash": 6098.0}
+        r = self.api._reject_if_nrcvb_insufficient("005930", 10, 50000, "00")
+        self.assertIsNotNone(r)
         self.assertEqual(r.get("rt_cd"), "9")
         self.assertTrue(r.get("_cash_guard"))
-        self.assertEqual(self.post_calls, [], "현금초과인데 주문 제출됨")
 
-    def test_cash_guard_allows_within_cash(self):
-        self.api._get_cash_from_psbl_api = lambda: 10_000_000  # 충분
-        # 현금 충분 → 차단 없음(None)
+    def test_nrcvb_guard_allows_within(self):
+        """qty<=nrcvb_buy_qty 이고 금액<=nrcvb_buy_amt → 통과(None)."""
+        self.api.get_kr_available_amounts = lambda *a, **k: {
+            "ok": True, "amount": 10_000_000.0, "qty": 100, "ord_psbl_cash": 6098.0}
         self.assertIsNone(
-            self.api._reject_if_cash_exceeded("005930", 10, 50000))
+            self.api._reject_if_nrcvb_insufficient("005930", 10, 50000, "00"))
 
     def test_get_orderable_cash_uses_ord_psbl_cash(self):
         self.api._get_cash_from_psbl_api = lambda: 777_777
