@@ -312,6 +312,14 @@ def _sync_positions_from_balance():
     if not isinstance(balance, dict) or balance.get("holdings") is None:
         logger.warning("[포지션동기화] 잔고 응답 비정상 — 기존 포지션 보존")
         return
+    # ★ req14: 캐시/폴백/조회실패(_source!="api") 응답으로는 대사하지 않는다.
+    #   빈 holdings 를 '전 종목 청산'으로 오인해 보유수량을 0으로 만들지 않도록,
+    #   실제 조회 성공("api") 응답일 때만 포지션 동기화를 수행한다.
+    if balance.get("_source") != "api":
+        logger.warning(
+            "[포지션동기화] 잔고 출처=%s (실조회 아님) — 기존 포지션 보존"
+            "(캐시오류로 보유수량 0 오인 방지)", balance.get("_source"))
+        return
 
     # 2) 브로커 보유맵 구성
     broker = {}
@@ -1491,6 +1499,28 @@ def _us_trading_loop():
         pass
 
 
+def _kr_orderable_gate(code: str, price, ratio: float, strategy_qty: int):
+    """국내 매수 주문 직전 KIS 현금 주문가능 게이트(개별주·ETF 공용).
+
+    최종수량 = min(
+        strategy_qty(전략 산출수량),
+        nrcvb_buy_qty(미수 없는 현금 주문가능수량),
+        floor(ord_psbl_cash * ratio * 0.98 / price)   # 0.98 버퍼 1회
+    )
+    - 예수금(get_orderable_cash)이 아니라 KIS 현금 주문가능금액·수량이 권위값.
+    - 미수 포함 수량(max_buy_qty)은 사용하지 않는다.
+    - 조회 실패 / rt_cd 오류 / 금액·수량 0 → (0, 사유) → 주문 함수 미호출.
+    반환: (최종수량:int, 사유:str)
+    """
+    # StrategyManager 게이트 재사용(동일 규칙·동일 코드경로)
+    if _strategy_mgr is not None and hasattr(_strategy_mgr, "_kr_finalize_buy_qty"):
+        return _strategy_mgr._kr_finalize_buy_qty(
+            code, price, ratio, strategy_qty=strategy_qty)
+    # 폴백: _api 직접 (StrategyManager 미구성 시) — 동일 순수 로직 재사용
+    from utils.order_sizing import kr_gate_from_api
+    return kr_gate_from_api(_api, code, price, ratio, strategy_qty)
+
+
 def _handle_etf_trade(stock: dict, asset_type: str, regime: str, sess: dict,
                       cached_cash: float = None, cached_balance: dict = None):
     """
@@ -1649,12 +1679,32 @@ def _handle_etf_trade(stock: dict, asset_type: str, regime: str, sess: dict,
             }
             return
 
-        # 포지션 크기 계산
+        # 포지션 크기 계산 (전략 산출수량) — total_eval 기반
         ratio       = _get_etf_position_ratio(asset_type, regime)
         invest_amt  = int(total_eval * ratio)
         invest_amt  = max(invest_amt, 100_000)   # 최소 10만원
         invest_amt  = min(invest_amt, Config.MAX_INVESTMENT_PER_STOCK)
         qty         = max(1, invest_amt // cur)
+
+        # ── ★ 주문 직전 KIS 현금 주문가능금액·수량 게이트 (개별주와 동일 규칙) ──
+        #   예수금·total_eval 기반 수량을 그대로 주문하지 않고, 실제 종목·현재가로
+        #   get_kr_available_amounts 를 조회해 최종수량을 확정한다.
+        #   최종 = min(ETF 전략수량, nrcvb_buy_qty, floor(ord_psbl_cash*ratio*0.98/현재가))
+        #   조회실패/금액·수량 0 → BUY_BLOCKED(주문 미제출).
+        _final_qty, _gate_reason = _kr_orderable_gate(code, cur, ratio, qty)
+        if _final_qty <= 0:
+            _log(f"🚫 [ETF 매수 미제출] {name}({code}) 비중{ratio:.0%} "
+                 f"→ {_gate_reason}", "warning")
+            _last_signals[code] = {
+                "action": "HOLD", "price": cur, "asset_type": asset_type,
+                "regime": regime, "buy_score": 0, "sell_score": 0,
+                "reason": _gate_reason,
+            }
+            return
+        if _final_qty != qty:
+            _log(f"[ETF 수량확정] {name}({code}) 전략 {qty}주 → "
+                 f"KIS 현금기준 {_final_qty}주", "info")
+            qty = _final_qty
 
         # 레이블
         type_label  = {"ETF_LEVERAGE": "🔶 레버리지", "ETF_INVERSE": "🔴 인버스",

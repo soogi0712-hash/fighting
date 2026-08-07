@@ -90,6 +90,28 @@ class TestBalanceCacheAndBackoff(unittest.TestCase):
         self.assertEqual(len(calls), 2)                # 추가 조회 없음(반복 호출 금지)
         self.assertEqual(r3["cash"], 1000000)
 
+    def test_cache_separated_by_account(self):
+        """캐시는 계좌·모드별 분리 — 계좌가 바뀌면 캐시를 재사용하지 않는다."""
+        api = _mk_api()
+        calls = []
+        kmod.requests.get = lambda *a, **k: (calls.append(1), _Resp(_OK))[1]
+        api.get_balance()                 # 계좌 A → 조회 1회
+        self.assertEqual(len(calls), 1)
+        api.account_no = "99999999-01"     # 계좌 전환
+        api.get_balance()                 # 캐시 서명 불일치 → 재조회
+        self.assertEqual(len(calls), 2)
+
+    def test_egw00215_no_cache_is_failure_not_empty_normal(self):
+        """EGW00215 & 유효 캐시 없음 → 빈 잔고를 정상처럼 쓰지 않고 조회 실패 표시.
+        cash=0 & _source!='api' 로 신규매수는 안전 차단된다."""
+        api = _mk_api()          # 캐시 전혀 없음
+        kmod.requests.get = lambda *a, **k: _Resp(_EGW)
+        r = api.get_balance()
+        self.assertEqual(r["_source"], "error")
+        self.assertTrue(r.get("_rate_limited"))
+        self.assertEqual(r["cash"], 0)
+        self.assertNotEqual(r["_source"], "api")   # 대사/신규매수 차단 신호
+
     def test_backoff_is_exponential(self):
         """연속 EGW00215 → 백오프가 지수적으로 증가."""
         api = _mk_api()

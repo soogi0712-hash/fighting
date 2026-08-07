@@ -868,6 +868,8 @@ class KISApi:
                         f"| rt_cd={rt_cd} msg_cd={msg_cd}"
                     )
                     self._order_cooldown[stock_code] = time.time()
+                    # (req13) 주문 접수 → 잔고 캐시 무효화(다음 조회는 최신)
+                    self.invalidate_balance_cache()
                     self._on_api_success()
                     return result
                 else:
@@ -1071,6 +1073,8 @@ class KISApi:
                     f"✅ 주문취소 성공 | 종목={stock_code} 주문번호={order_no} "
                     f"{unexec_qty}주 | msg_cd={msg_cd}"
                 )
+                # (req13) 주문 취소 → 잔고 캐시 무효화
+                self.invalidate_balance_cache()
                 self._on_api_success()
             else:
                 logger.warning(
@@ -1085,6 +1089,15 @@ class KISApi:
     # ──────────────────────────────────────────────────────────
     # 4. 잔고 조회
     # ──────────────────────────────────────────────────────────
+    def invalidate_balance_cache(self) -> None:
+        """(req13) 잔고 짧은 TTL 캐시를 무효화한다.
+
+        주문 접수·체결·취소 후 호출 → 다음 get_balance 는 실제 최신값을 조회한다.
+        비상용 300초 캐시(_balance_cache)와 EGW00215 백오프 타이머는 건드리지
+        않는다(백오프 중이면 여전히 반복 호출을 억제하되, 다음 정상시점 재조회)."""
+        self._balance_short_cache = None
+        self._balance_short_ts    = 0.0
+
     def _get_cash_from_psbl_api(self) -> int:
         """
         ★ 예수금 조회 전용 API (TTTC8908R) — inquire-balance 500에러 우회용
@@ -1125,19 +1138,25 @@ class KISApi:
           사이클의 반복 호출을 1회로 흡수하고, EGW00215(초당 조회건수 초과)
           발생 시 즉시 반복 호출을 멈추고 지수 백오프한다.
         """
-        # ── 짧은 TTL 캐시 + EGW00215 백오프 ─────────────────────────
-        _bnow  = time.time()
-        _short = getattr(self, "_balance_short_cache", None)
-        if _short is not None:
-            if _bnow < getattr(self, "_balance_backoff_until", 0.0):
-                return _short   # 백오프 중 → 캐시 반환(즉시 반복 호출 금지)
-            if (_bnow - getattr(self, "_balance_short_ts", 0.0)) \
-                    < getattr(self, "_BALANCE_SHORT_TTL", 7.0):
-                return _short   # 정상 TTL 캐시(스캔당 1회만 실제 조회)
-
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
         from config import Config as _cfg
         tr_id = "TTTC8434R" if _cfg.KIS_IS_REAL else "VTTC8434R"
+
+        # ── 짧은 TTL 캐시 + EGW00215 백오프 (계좌·모드별로 분리) ────────
+        #   캐시 키 = (계좌번호, 실전/모의). 계좌·모드가 다르면 캐시를 섞지 않는다.
+        _bnow = time.time()
+        _sig  = (self.account_no, bool(_cfg.KIS_IS_REAL))
+        _short = getattr(self, "_balance_short_cache", None)
+        if _short is not None and getattr(self, "_balance_short_sig", None) == _sig:
+            if _bnow < getattr(self, "_balance_backoff_until", 0.0):
+                return _short   # 백오프 중 → 캐시 반환(즉시 반복 호출 금지·무sleep)
+            if (_bnow - getattr(self, "_balance_short_ts", 0.0)) \
+                    < getattr(self, "_BALANCE_SHORT_TTL", 7.0):
+                return _short   # 정상 TTL 캐시(스캔당 1회만 실제 조회)
+        else:
+            # 계좌·모드 전환 → 이전 캐시/백오프 무효화
+            self._balance_short_cache   = None
+            self._balance_backoff_until = 0.0
         acc_no, acc_prod = self.account_no.split("-") \
             if "-" in self.account_no else (self.account_no, "01")
         params = {
@@ -1181,12 +1200,22 @@ class KISApi:
                         self._balance_backoff_until = time.time() + _bo
                         self._on_api_error(200, msg_cd, msg1)
                         logger.warning(
-                            "잔고조회 EGW00215(초당 조회건수 초과) → %.0f초 백오프"
-                            "%s", _bo,
-                            " · 캐시 반환" if _short is not None else "")
+                            "잔고조회 EGW00215(초당 조회건수 초과) → %.0f초 백오프", _bo)
                         if _short is not None:
-                            return _short   # 즉시 반복 호출 대신 캐시
-                        break               # 캐시 없으면 하단 폴백으로
+                            return _short   # 유효 캐시 → 즉시 반복 호출 대신 캐시
+                        # 300초 비상 캐시가 있으면 사용
+                        if self._balance_cache and \
+                                (time.time() - self._balance_cache_ts) < 300:
+                            return {**self._balance_cache, "_source": "cache"}
+                        # ★ req11: 유효 캐시 없음 → 빈 잔고를 정상처럼 쓰지 않는다.
+                        #   조회 실패(_source="error")로 표시 → 신규매수는 cash=0 및
+                        #   _source!="api" 로 안전 차단, 매도/대사는 실패로 인지.
+                        logger.warning(
+                            "잔고조회 EGW00215 & 유효 캐시 없음 → 조회 실패 처리"
+                            "(신규매수 안전 차단)")
+                        return {"_source": "error", "_rate_limited": True,
+                                "holdings": [], "total_eval": 0, "cash": 0,
+                                "total_profit": 0, "total_profit_pct": 0}
                     if msg_cd == "EGW00201":
                         self._on_api_error(200, msg_cd, msg1)
                         if attempt < 2:
@@ -1252,8 +1281,9 @@ class KISApi:
                 if result["cash"] > 0:
                     self._balance_cache    = result
                     self._balance_cache_ts = time.time()
-                # (req10) 짧은 TTL 캐시 저장 + EGW00215 스트라이크/백오프 리셋
+                # (req10) 짧은 TTL 캐시 저장(계좌·모드 서명 포함) + 백오프 리셋
                 self._balance_short_cache   = result
+                self._balance_short_sig     = _sig
                 self._balance_short_ts      = time.time()
                 self._balance_egw_strikes   = 0
                 self._balance_backoff_until = 0.0

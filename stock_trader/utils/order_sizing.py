@@ -32,6 +32,37 @@ def qty_from_cash(cash_amount, order_price, buffer: float = CASH_BUFFER) -> int:
     return int(math.floor((amt * buffer) / price))
 
 
+def kr_gate_from_api(api, code, price, ratio, strategy_qty):
+    """국내 매수 주문 직전 KIS 현금 주문가능 게이트(개별주·ETF 공용, 순수 로직).
+
+    최종 = min(strategy_qty, nrcvb_buy_qty, floor(ord_psbl_cash*ratio*0.98/price)).
+    - api.get_kr_available_amounts(code, price, "00") 로 현금 주문가능 조회.
+      amount=ord_psbl_cash, qty=nrcvb_buy_qty(미수 없는 현금). max_buy_qty 미사용.
+    - 조회 실패 / rt_cd 오류 / 금액·수량 0 → (0, 사유) → 주문 함수 미호출.
+    반환: (최종수량:int, 사유:str)
+    """
+    if api is None:
+        return 0, "API 없음 → 미제출"
+    try:
+        avail = api.get_kr_available_amounts(code, price, "00")
+    except Exception as e:
+        return 0, f"주문가능 조회 예외 → 미제출: {e}"
+    if not avail.get("ok", False):
+        return 0, "주문가능 사전검증 실패 → 미제출"
+    cash  = float(avail.get("amount", 0) or 0)
+    nrcvb = int(avail.get("qty", 0) or 0)
+    if cash <= 0 or nrcvb <= 0:
+        return 0, f"KIS 현금 주문가능 0(현금={cash:,.0f}원, 수량={nrcvb}) → 미제출"
+    try:
+        _ratio = max(0.0, min(1.0, float(ratio)))
+    except (TypeError, ValueError):
+        _ratio = 1.0
+    final = finalize_order_qty(int(strategy_qty), nrcvb, cash * _ratio, price)
+    if final <= 0:
+        return 0, f"KIS 현금 주문가능 부족(nrcvb={nrcvb}, 현금={cash:,.0f}원) → 미제출"
+    return final, "OK"
+
+
 def finalize_order_qty(strategy_qty, kis_orderable_qty, kis_cash_amount,
                        order_price, buffer: float = CASH_BUFFER) -> int:
     """전략수량·KIS현금주문가능수량·현금가능금액환산수량의 최솟값(≥0).
