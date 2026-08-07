@@ -94,37 +94,43 @@ class TestGetKRAvailableUsesNrcvb(unittest.TestCase):
 
 
 class TestSamsungBioFinalQty(unittest.TestCase):
-    """실증값 기준 전략비중별 최종수량(임의 1주 강제 없음)."""
+    """확정 정책: 국내 0.98 버퍼 미적용.
+    ratio_qty=floor(nrcvb_buy_amt*비중/가), final=min(strategy_qty, ratio_qty, nrcvb_qty).
+    EARLY 최소 1주 강제 없음."""
 
-    def _final(self, ratio, nrcvb_amt, nrcvb_qty=1, price=1_509_000):
+    def _final(self, ratio, nrcvb_amt, nrcvb_qty=1, price=1_509_000, strategy_qty=None):
         mgr = _mgr({"ok": True, "amount": float(nrcvb_amt), "qty": int(nrcvb_qty),
                     "ord_psbl_cash": 6_098.0})
-        return mgr._kr_finalize_buy_qty("207940", price, ratio)[0]
-
-    def test_full_exact_one_share_blocked_by_buffer(self):
-        """FULL 100%, nrcvb_amt=정확히 1주가격 → 0.98 버퍼로 0주(정책 판단 필요)."""
-        self.assertEqual(self._final(1.0, 1_509_000), 0)
-        self.assertEqual(self._final(1.0, 1_509_226), 0)   # 수수료 포함 실제도 0
-
-    def test_full_with_margin_buys_one(self):
-        """FULL 100%, nrcvb_amt≥약 1.021×가격 → 1주."""
-        self.assertEqual(self._final(1.0, 1_540_000), 1)
+        return mgr._kr_finalize_buy_qty("207940", price, ratio,
+                                        strategy_qty=strategy_qty)[0]
 
     def test_early_30pct_blocked(self):
-        """EARLY 30%, 1.5M 종목 → 비중예산(≈452,700)<1주 → 0주(정책상 정상)."""
-        self.assertEqual(self._final(0.30, 1_509_000), 0)
-        self.assertEqual(self._final(0.30, 5_000_000), 0)   # 30%≈1.5M, 여전히 1주 미만
+        """EARLY 30%, nrcvb_amt=1,509,000, qty=1 → 비중예산<1주 → 0주(강제 안 함)."""
+        self.assertEqual(self._final(0.30, 1_509_000, 1), 0)
+        self.assertEqual(self._final(0.30, 5_000_000, 3), 0)   # 30%≈1.5M<1주
 
-    def test_ord_psbl_cash_not_a_cap(self):
-        """ord_psbl_cash=6,098원이 상한이 아님을 확인: 여유 nrcvb 면 1주 체결."""
-        self.assertEqual(self._final(1.0, 1_540_000, nrcvb_qty=1), 1)
+    def test_full_100_buys_one_no_buffer(self):
+        """FULL 100%, nrcvb_amt=1,509,000, qty=1 → 1주(0.98 버퍼로 0 만들지 않음)."""
+        self.assertEqual(self._final(1.0, 1_509_000, 1), 1)
+        self.assertEqual(self._final(1.0, 1_509_226, 1), 1)   # 수수료 포함 실제도 1
 
-    def test_nrcvb_qty_caps_below_amount(self):
-        """nrcvb_buy_qty 가 금액환산보다 작으면 그 수량으로 상한."""
-        # amount 5,000,000 / price 1,000,000 → 버퍼 floor(4.9)=4, but nrcvb_qty=2
-        mgr = _mgr({"ok": True, "amount": 5_000_000.0, "qty": 2,
-                    "ord_psbl_cash": 6_098.0})
-        self.assertEqual(mgr._kr_finalize_buy_qty("069500", 1_000_000, 1.0)[0], 2)
+    def test_full_two_shares_amount(self):
+        """nrcvb_amt=2주 금액, qty=2, FULL → 최대 2주."""
+        self.assertEqual(self._final(1.0, 3_018_000, 2), 2)
+
+    def test_strategy_qty_caps(self):
+        """strategy_qty 가 더 작으면 그 값이 상한."""
+        self.assertEqual(self._final(1.0, 3_018_000, 2, strategy_qty=1), 1)
+
+    def test_nrcvb_qty_caps(self):
+        """nrcvb_buy_qty 가 더 작으면 그 수량으로 상한(금액환산보다 작을 때)."""
+        # amount 5,000,000 / price 1,000,000 → ratio_qty=5, but nrcvb_qty=2 → 2
+        self.assertEqual(self._final(1.0, 5_000_000, 2, price=1_000_000), 2)
+
+    def test_nrcvb_zero_blocks(self):
+        """nrcvb 필드 오류·0이면 BUY_BLOCKED."""
+        mgr = _mgr({"ok": False})
+        self.assertEqual(mgr._kr_finalize_buy_qty("207940", 1_509_000, 1.0)[0], 0)
 
 
 if __name__ == "__main__":

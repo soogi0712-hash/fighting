@@ -26,37 +26,47 @@ def _mgr(avail):
     return mgr
 
 
-class TestBufferAndRatioAppliedOnce(unittest.TestCase):
-    """비중·0.98 이중적용 없음(수치)."""
+class TestRatioAppliedOnceNoBuffer(unittest.TestCase):
+    """국내: 비중 1회 적용, 0.98 버퍼 미적용(수치)."""
 
-    def test_pyramid_ratio_and_buffer_single(self):
-        # ord_psbl_cash=1,000,000, 비중 0.30, 가격 10,000
+    def test_pyramid_ratio_single_no_buffer(self):
+        # nrcvb_buy_amt=1,000,000, 비중 0.30, 가격 10,000
         mgr = _mgr({"ok": True, "amount": 1_000_000, "qty": 999, "cash": 1_000_000})
         qty, _ = mgr._kr_finalize_buy_qty("005930", 10000, 0.30)
-        # 비중 1회·0.98 1회 → floor(1e6*0.30*0.98/1e4)=floor(29.4)=29
-        self.assertEqual(qty, 29)
-        self.assertEqual(qty, qty_from_cash(1_000_000 * 0.30, 10000))
-        # 이중적용이면 값이 달라진다(방어 검증)
-        self.assertNotEqual(qty, 28)   # 0.98 이중 → floor(1e6*0.3*0.9604/1e4)=28
-        self.assertNotEqual(qty, 8)    # 비중 이중 → floor(1e6*0.09*0.98/1e4)=8
+        # 비중 1회, 버퍼 미적용 → floor(1e6*0.30/1e4)=30
+        self.assertEqual(qty, 30)
+        self.assertNotEqual(qty, 29)   # 0.98 적용값(29)이 아님
+        self.assertNotEqual(qty, 9)    # 비중 이중(0.09)도 아님
 
     def test_etf_strategy_qty_cap(self):
         """ETF: 전략수량(strategy_qty)이 더 작으면 그 값이 최종."""
         mgr = _mgr({"ok": True, "amount": 1_000_000, "qty": 999, "cash": 1_000_000})
         qty, _ = mgr._kr_finalize_buy_qty("069500", 10000, 0.30, strategy_qty=5)
-        self.assertEqual(qty, 5)       # min(5, 999, 29)
+        self.assertEqual(qty, 5)       # min(5, ratio 30, nrcvb 999)
 
-    def test_etf_buffer_cap_when_strategy_large(self):
-        """ETF: 전략수량이 크면 floor(cash*비중*0.98/가)로 제한(버퍼 1회)."""
+    def test_ratio_qty_cap_when_strategy_large(self):
+        """ETF: 전략수량이 크면 floor(nrcvb_buy_amt*비중/가)로 제한(버퍼 없음)."""
         mgr = _mgr({"ok": True, "amount": 1_000_000, "qty": 999, "cash": 1_000_000})
         qty, _ = mgr._kr_finalize_buy_qty("069500", 10000, 0.30, strategy_qty=100)
-        self.assertEqual(qty, 29)
+        self.assertEqual(qty, 30)      # min(100, 30, 999)
 
     def test_nrcvb_caps(self):
         """미수 없는 수량(nrcvb)이 가장 작으면 그 값이 최종(미수수량 미사용)."""
         mgr = _mgr({"ok": True, "amount": 1_000_000, "qty": 3, "cash": 1_000_000})
         qty, _ = mgr._kr_finalize_buy_qty("069500", 10000, 1.0, strategy_qty=100)
         self.assertEqual(qty, 3)
+
+    def test_us_keeps_098_but_kr_does_not(self):
+        """동일 입력에서 미국은 0.98 유지(49), 국내는 미적용(50)."""
+        from utils.order_sizing import finalize_order_qty
+        # 미국 경로(finalize_order_qty 기본 buffer=0.98): floor(5e5*0.98/1e4)=49
+        us_qty = finalize_order_qty(999, 999, 500_000, 10000)
+        self.assertEqual(us_qty, 49)
+        # 국내 경로(_kr_finalize_buy_qty, 버퍼 미적용): floor(5e5/1e4)=50
+        mgr = _mgr({"ok": True, "amount": 500_000, "qty": 999, "cash": 500_000})
+        kr_qty = mgr._kr_finalize_buy_qty("005930", 10000, 1.0)[0]
+        self.assertEqual(kr_qty, 50)
+        self.assertNotEqual(kr_qty, us_qty)
 
 
 class TestETFOrderableGate(unittest.TestCase):
@@ -83,13 +93,13 @@ class TestETFOrderableGate(unittest.TestCase):
     def test_gate_returns_capped_qty(self):
         api = self._api({"ok": True, "amount": 1_000_000, "qty": 999, "cash": 1_000_000})
         final, reason = kr_gate_from_api(api, "069500", 10000, 0.30, 100)
-        self.assertEqual(final, 29)     # floor(1e6*0.3*0.98/1e4)
+        self.assertEqual(final, 30)     # floor(1e6*0.3/1e4)=30 (국내 버퍼 없음)
         self.assertEqual(reason, "OK")
 
     def test_gate_uses_actual_symbol_price(self):
         api = self._api({"ok": True, "amount": 500_000, "qty": 999, "cash": 500_000})
         final, reason = kr_gate_from_api(api, "069500", 10000, 1.0, 100)
-        self.assertEqual(final, 49)     # floor(5e5*0.98/1e4)
+        self.assertEqual(final, 50)     # floor(5e5/1e4)=50 (국내 버퍼 없음)
         api.get_kr_available_amounts.assert_called_once_with("069500", 10000, "00")
 
     def test_gate_no_order_call_when_blocked(self):
