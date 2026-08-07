@@ -52,6 +52,8 @@ _strategy_mgr = None
 _us_strategy  = None      # ★ 해외주식 전략 매니저
 _scheduler    = None
 _bot_running  = False
+# ★ 국내 매매 루프 중복 실행 방지 락(프로세스당 1개 본체만 실행) — item10/11/17
+_trading_loop_lock = threading.Lock()
 
 # ── 루프 공용 잔고 캐시 ──────────────────────────────────────
 # 루프 시작 시 1회 조회 → 주문 직후 갱신 → 60초마다 자동 갱신
@@ -604,6 +606,22 @@ def _cancel_pending_buy_orders():
 
 # ── 세션 인식 매매 루프 ───────────────────────────────────
 def _trading_loop():
+    """중복 실행 방지 래퍼(item10/11/17).
+
+    여러 트리거(APScheduler interval 잡, run_now 소켓 핸들러, 지연시작 스레드)가
+    동시에 호출해도 본체 `_trading_loop_impl` 은 프로세스당 '동시에 하나만' 실행한다.
+    이미 실행 중이면 이번 호출은 즉시 스킵 → 동일 종목이 같은 시각에 중복 처리·중복
+    주문되는 것을 원천 차단(in-flight guard 와 이중 방어)."""
+    if not _trading_loop_lock.acquire(blocking=False):
+        logger.warning("[중복루프 차단] _trading_loop 이미 실행 중 — 이번 호출 스킵")
+        return
+    try:
+        _trading_loop_impl()
+    finally:
+        _trading_loop_lock.release()
+
+
+def _trading_loop_impl():
     if not _bot_running or _strategy_mgr is None:
         return
 

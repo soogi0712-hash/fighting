@@ -9,6 +9,7 @@
 """
 import json
 import time
+import threading
 import hashlib
 import requests
 import pytz
@@ -53,14 +54,19 @@ class KISApi:
         self._ohlcv_cache: dict = {}
         self._OHLCV_CACHE_TTL: float = 30.0  # 30초
 
-        # ── TPS 제어 ─────────────────────────────────────────────
-        # KIS 실전: 초당 20건 제한 → 최소 0.35초 간격 (여유 포함)
+        # ── TPS 제어 (전체 공용·스레드 안전) ─────────────────────
+        # KIS 실전: 초당 20건 제한 → 보수적으로 초당 최대 15건 + 최소 0.35초 간격.
         self._last_api_call_ts: float = 0.0
-        self._API_MIN_INTERVAL: float = 0.35  # 350ms → 초당 최대 ~2.8건
+        self._API_MIN_INTERVAL: float = 0.35  # 350ms
+        self._RATE_MAX_PER_SEC: int = 15      # 실전(20)보다 보수적 상한
+        self._call_times: list = []           # 최근 1초 호출 타임스탬프(슬라이딩)
+        self._rate_lock = threading.Lock()    # 여러 스레드 동시 호출 직렬화
 
         # ── adaptive backoff 상태 ────────────────────────────────
-        # EGW00201(TPS초과) / 500 연속 발생 시 동적으로 간격 늘림
-        self._backoff_until: float = 0.0     # 이 시각까지 추가 대기
+        # EGW00201(TPS초과) / 500 연속 발생 시 동적으로 간격 늘림.
+        # ★ backoff 는 시세·조회 등 '비critical' 호출만 대기시킨다. 주문·매도·
+        #   취소 등 critical 호출은 backoff 를 건너뛴다(매도·체결감시 지속).
+        self._backoff_until: float = 0.0     # 이 시각까지 추가 대기(비critical)
         self._consecutive_errors: int = 0    # 연속 에러 횟수
 
         # ── 주문 쿨다운 (종목별, 중복 주문 방지) ─────────────────
@@ -119,27 +125,41 @@ class KISApi:
             h["hashkey"] = self._hashkey(body)
         return h
 
-    def _rate_limit(self):
+    def _rate_limit(self, critical: bool = False):
         """
-        ★ KIS TPS 공통 rate-limit + adaptive backoff
-        - 기본 간격: 350ms (초당 최대 ~2.8건, KIS 20건 제한 대비 7배 여유)
-        - EGW00201 / 500 연속 에러 시: 3s → 5s → 10s 단계 backoff
-        - 쿨다운 중에는 추가 대기 후 진행
+        ★ KIS TPS 전체 공용 rate-limit(스레드 안전) + 선택적 adaptive backoff
+        - 초당 최대 self._RATE_MAX_PER_SEC(=15)건(슬라이딩 윈도우) + 최소 0.35초 간격.
+        - backoff(EGW00201/500)는 '비critical' 호출만 대기 → 매도·주문·취소·체결감시
+          등 critical=True 호출은 backoff 를 건너뛰어 계속 동작(item15).
+        - 여러 스레드(중복 루프·US 스레드 등)가 동시에 불러도 _rate_lock 으로 직렬화
+          되어 순간 버스트(EGW00215/00201)를 막는다.
         """
-        now = time.time()
+        # ① backoff 대기(비critical만) — 긴 대기는 락 밖에서
+        if not critical:
+            _bo = self._backoff_until - time.time()
+            if _bo > 0:
+                logger.debug(f"[RateLimit] backoff 대기 {_bo:.1f}s")
+                time.sleep(min(_bo, 10.0))
 
-        # ① adaptive backoff 중이면 대기
-        if now < self._backoff_until:
-            wait = self._backoff_until - now
-            logger.debug(f"[RateLimit] backoff 대기 {wait:.1f}s")
-            time.sleep(wait)
-
-        # ② 최소 간격 보장
-        elapsed = time.time() - self._last_api_call_ts
-        if elapsed < self._API_MIN_INTERVAL:
-            time.sleep(self._API_MIN_INTERVAL - elapsed)
-
-        self._last_api_call_ts = time.time()
+        with self._rate_lock:
+            now = time.time()
+            # ② 초당 상한(슬라이딩 윈도우)
+            self._call_times = [t for t in self._call_times if now - t < 1.0]
+            _need = 0.0
+            if len(self._call_times) >= self._RATE_MAX_PER_SEC:
+                # +2ms 여유: sleep 후 가장 오래된 호출이 확실히 1초를 넘겨 만료되도록
+                # (경계 부동소수 오차로 1초 창에 15건을 초과하지 않게)
+                _need = max(_need, 1.0 - (now - self._call_times[0]) + 0.002)
+            # ③ 최소 간격
+            _elapsed = now - self._last_api_call_ts
+            if _elapsed < self._API_MIN_INTERVAL:
+                _need = max(_need, self._API_MIN_INTERVAL - _elapsed)
+            if _need > 0:
+                time.sleep(_need)
+                now = time.time()
+                self._call_times = [t for t in self._call_times if now - t < 1.0]
+            self._last_api_call_ts = now
+            self._call_times.append(now)
 
     def _on_api_success(self):
         """API 성공 시 에러 카운터 리셋"""
@@ -574,17 +594,25 @@ class KISApi:
         """국내주식 현금 주문가능금액·수량 조회 (inquire-psbl-order, 주문별 검증용).
 
         ★ 실제 주문과 동일 계좌(CANO/ACNT_PRDT_CD)·종목(PDNO)·주문가격(ORD_UNPR)·
-          주문구분(ORD_DVSN) 기준으로 조회한다. 예수금 단독이 아니라 이 값들을
-          권위값으로 쓴다. 신용·미수 제외(현금)만 사용:
-            - amount = ord_psbl_cash  (주문가능현금 = 현금, 미수·신용 미포함)
-            - qty    = nrcvb_buy_qty  (미수 없는 매수 가능 수량 = 현금 최대수량)
-          max_buy_amt / max_buy_qty (미수 포함)는 사용하지 않는다.
-        반환: {"amount": float, "qty": int, "cash": float, "ok": bool}
-          - ok=False: 종목없음 / rt_cd!=0 / 타임아웃 / 네트워크 / 파싱 실패 → 미제출 신호
-        개인정보·계좌번호는 로그에 남기지 않는다(숫자 필드만 기록).
+          주문구분(ORD_DVSN) 기준으로 조회한다.
+
+        ★ 현금(미수 없는) 전용 권위값:
+            - amount = nrcvb_buy_amt  (미수 없는 매수가능금액 = 현금으로 살 수 있는 금액)
+            - qty    = nrcvb_buy_qty  (미수 없는 매수가능수량)
+          → D+2 정산예정금·대용 등을 반영해 ord_psbl_cash(당장 현금잔고)보다 클 수
+            있다. 실증: ord_psbl_cash=6,098원인데 nrcvb_buy_amt≥1,509,000원,
+            nrcvb_buy_qty=1주. ord_psbl_cash 를 상한으로 쓰면 잘못 미제출된다.
+          max_buy_amt / max_buy_qty (미수 포함)는 절대 수량산정에 쓰지 않는다.
+          ord_psbl_cash 는 참고 로그용으로만 반환한다(상한 미사용).
+        반환: {"amount": float(nrcvb_buy_amt), "qty": int(nrcvb_buy_qty),
+               "ord_psbl_cash": float(참고), "ok": bool}
+          - ok=False: 종목없음 / rt_cd!=0 / 타임아웃 / 네트워크 / 파싱 실패 /
+            nrcvb_buy_amt 누락·0 / nrcvb_buy_qty 0 → 미제출 신호(BUY_BLOCKED)
+        개인정보·계좌번호는 로그에 남기지 않는다(필드명·숫자만 기록).
         """
+        _fail = {"amount": 0.0, "qty": 0, "ord_psbl_cash": 0.0, "ok": False}
         if not stock_code:
-            return {"amount": 0.0, "qty": 0, "cash": 0.0, "ok": False}
+            return dict(_fail)
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-psbl-order"
         from config import Config as _cfg
         tr_id = "TTTC8908R" if _cfg.KIS_IS_REAL else "VTTC8908R"
@@ -613,24 +641,50 @@ class KISApi:
             if str(data.get("rt_cd", "1")) != "0":
                 logger.warning("[국내주문가능] 조회 실패 rt_cd=%s msg=%s",
                                data.get("rt_cd"), data.get("msg1", ""))
-                return {"amount": 0.0, "qty": 0, "cash": 0.0, "ok": False}
+                return dict(_fail)
             output = data.get("output", {})
             if isinstance(output, list):
                 output = output[0] if output else {}
-            try:
-                # 현금(미수 없는) 기준만 권위값으로 사용
-                amount = float(output.get("ord_psbl_cash", 0) or 0)   # 주문가능현금
-                qty    = int(float(output.get("nrcvb_buy_qty", 0) or 0))  # 미수없는 수량
-            except (TypeError, ValueError):
-                logger.warning("[국내주문가능] 금액/수량 파싱 실패")
-                return {"amount": 0.0, "qty": 0, "cash": 0.0, "ok": False}
-            logger.info("[국내주문가능] %s 현금가능=%.0f원 미수없는수량=%d주",
-                        stock_code, amount, qty)
-            return {"amount": amount, "qty": qty, "cash": amount, "ok": True}
+
+            def _num(key):
+                try:
+                    return float(output.get(key, 0) or 0)
+                except (TypeError, ValueError):
+                    return None
+            # ── 진단 로그: 필드명 + 숫자만(개인정보 없음) ──────────────
+            ord_psbl_cash = _num("ord_psbl_cash")   # 참고: 당장 현금잔고
+            nrcvb_amt     = _num("nrcvb_buy_amt")    # ★ 권위: 미수 없는 매수가능금액
+            nrcvb_qty_raw = _num("nrcvb_buy_qty")    # ★ 권위: 미수 없는 매수가능수량
+            max_amt       = _num("max_buy_amt")      # 미수 포함(미사용, 진단만)
+            max_qty       = _num("max_buy_qty")      # 미수 포함(미사용, 진단만)
+            logger.info(
+                "[국내주문가능:진단] %s ord_unpr=%s | ord_psbl_cash=%s "
+                "nrcvb_buy_amt=%s nrcvb_buy_qty=%s | (미사용)max_buy_amt=%s "
+                "max_buy_qty=%s",
+                stock_code, _unpr,
+                None if ord_psbl_cash is None else int(ord_psbl_cash),
+                None if nrcvb_amt is None else int(nrcvb_amt),
+                None if nrcvb_qty_raw is None else int(nrcvb_qty_raw),
+                None if max_amt is None else int(max_amt),
+                None if max_qty is None else int(max_qty))
+
+            # ★ 현금 권위값: nrcvb_buy_amt + nrcvb_buy_qty 만 사용.
+            #   누락/파싱실패/0 → 미제출(BUY_BLOCKED).
+            if nrcvb_amt is None or nrcvb_qty_raw is None:
+                logger.warning("[국내주문가능] nrcvb_* 파싱 실패 → 미제출")
+                return dict(_fail)
+            nrcvb_qty = int(nrcvb_qty_raw)
+            if nrcvb_amt <= 0 or nrcvb_qty <= 0:
+                logger.warning(
+                    "[국내주문가능] 현금 주문가능 부족(nrcvb_buy_amt=%d, "
+                    "nrcvb_buy_qty=%d) → 미제출", int(nrcvb_amt), nrcvb_qty)
+                return dict(_fail)
+            return {"amount": float(nrcvb_amt), "qty": nrcvb_qty,
+                    "ord_psbl_cash": (ord_psbl_cash or 0.0), "ok": True}
         except Exception as e:
             # 타임아웃/네트워크/HTTP 오류 → ok=False (주문 미제출 신호)
             logger.error(f"국내주식 주문가능 조회 오류: {e}")
-            return {"amount": 0.0, "qty": 0, "cash": 0.0, "ok": False}
+            return dict(_fail)
 
     def _order(self, stock_code: str, order_type: str,
                qty: int, price: int = 0,
@@ -793,7 +847,7 @@ class KISApi:
         # ── retry (최대 2회 재시도, 총 3회 시도) ────────────────
         for attempt in range(3):
             try:
-                self._rate_limit()
+                self._rate_limit(critical=True)
                 resp = requests.post(
                     url,
                     headers=self._headers(tr_id, use_hash=True, body=body),
@@ -985,7 +1039,7 @@ class KISApi:
             "INQR_DVSN_2":    buy_sell_dvsn,
         }
         try:
-            self._rate_limit()
+            self._rate_limit(critical=True)
             resp = requests.get(url, headers=self._headers(tr_id),
                                 params=params, timeout=10)
             resp.raise_for_status()
@@ -1057,7 +1111,7 @@ class KISApi:
             f"미체결수량={unexec_qty}주 | ORD_DVSN={ord_dvsn} | KST={kst_str}"
         )
         try:
-            self._rate_limit()
+            self._rate_limit(critical=True)
             resp = requests.post(
                 url,
                 headers=self._headers(tr_id, use_hash=True, body=body),
@@ -2300,7 +2354,7 @@ class KISApi:
             "CTX_AREA_NK100":   "",
         }
         try:
-            self._rate_limit()
+            self._rate_limit(critical=True)
             resp = requests.get(url, headers=self._headers(tr_id),
                                 params=params, timeout=10)
             resp.raise_for_status()
@@ -2404,7 +2458,7 @@ class KISApi:
             "CTX_AREA_NK200":   "",
         }
         try:
-            self._rate_limit()
+            self._rate_limit(critical=True)
             resp = requests.get(url, headers=self._headers(tr_id),
                                 params=params, timeout=10)
             resp.raise_for_status()

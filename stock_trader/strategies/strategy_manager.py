@@ -583,12 +583,13 @@ class StrategyManager:
             return 0, f"주문가능 조회 예외 → 미제출: {e}"
         if not avail.get("ok", False):
             return 0, "주문가능 사전검증 실패(rt_cd/파싱/네트워크) → 미제출"
-        kis_qty  = int(avail.get("qty", 0) or 0)          # nrcvb_buy_qty(현금)
-        kis_cash = float(avail.get("amount", 0.0) or 0.0)  # ord_psbl_cash(현금)
+        kis_qty  = int(avail.get("qty", 0) or 0)           # nrcvb_buy_qty(미수없는 수량)
+        kis_cash = float(avail.get("amount", 0.0) or 0.0)  # nrcvb_buy_amt(미수없는 금액)
+        _ref_cash = float(avail.get("ord_psbl_cash", 0.0) or 0.0)  # 참고용(상한 미사용)
         if kis_cash <= 0 or kis_qty <= 0:
-            return 0, (f"KIS 현금 주문가능 0(현금={kis_cash:,.0f}원, "
-                       f"수량={kis_qty}) → 미제출")
-        # ★ 전략비중을 KIS 현금 주문가능금액에 적용
+            return 0, (f"KIS 현금 주문가능 0(nrcvb_buy_amt={kis_cash:,.0f}원, "
+                       f"nrcvb_buy_qty={kis_qty}) → 미제출")
+        # ★ 전략비중을 KIS 미수없는 매수가능금액(nrcvb_buy_amt)에 적용
         ratio_cash = kis_cash * _ratio
         try:
             _cash_qty = int(ratio_cash / float(query_price)) if float(query_price) > 0 else 0
@@ -613,13 +614,16 @@ class StrategyManager:
             except (TypeError, ValueError):
                 _dep = ""
         logger.info(
-            "[국내 수량확정] %s = min(비중수량%d, nrcvb%d, 버퍼수량%d) → %d주 "
-            "(현금가능=%.0f원 × 비중%.0f%% = %.0f원, 주문가=%s)%s",
+            "[국내 수량확정] %s = min(전략수량%d, nrcvb_buy_qty%d, 버퍼수량%d) → %d주 "
+            "(nrcvb_buy_amt=%.0f원 × 비중%.0f%% = %.0f원, 주문가=%s | "
+            "참고 ord_psbl_cash=%.0f원)%s",
             code, strat_qty, kis_qty, qty_from_cash(ratio_cash, query_price),
-            final_qty, kis_cash, _ratio * 100, ratio_cash, str(query_price), _dep)
+            final_qty, kis_cash, _ratio * 100, ratio_cash, str(query_price),
+            _ref_cash, _dep)
         if final_qty <= 0:
             return 0, (f"KIS 현금 주문가능수량/금액 부족(비중{_ratio:.0%}, "
-                       f"nrcvb={kis_qty}, 현금={kis_cash:,.0f}원) → 미제출")
+                       f"nrcvb_buy_qty={kis_qty}, nrcvb_buy_amt={kis_cash:,.0f}원) "
+                       f"→ 미제출")
         return final_qty, "OK"
 
     def active_order_codes(self, market: str = "KR") -> set:
