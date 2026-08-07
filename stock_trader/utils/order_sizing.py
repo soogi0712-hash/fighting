@@ -35,9 +35,11 @@ def qty_from_cash(cash_amount, order_price, buffer: float = CASH_BUFFER) -> int:
 def kr_gate_from_api(api, code, price, ratio, strategy_qty):
     """국내 매수 주문 직전 KIS 현금 주문가능 게이트(개별주·ETF 공용, 순수 로직).
 
-    최종 = min(strategy_qty, nrcvb_buy_qty, floor(ord_psbl_cash*ratio*0.98/price)).
+    ★ 국내 정책: 0.98 버퍼 미적용.
+        ratio_qty = floor(nrcvb_buy_amt * ratio / price)
+        최종      = min(strategy_qty, ratio_qty, nrcvb_buy_qty)
     - api.get_kr_available_amounts(code, price, "00") 로 현금 주문가능 조회.
-      amount=ord_psbl_cash, qty=nrcvb_buy_qty(미수 없는 현금). max_buy_qty 미사용.
+      amount=nrcvb_buy_amt, qty=nrcvb_buy_qty(미수 없는 현금). max_buy_qty 미사용.
     - 조회 실패 / rt_cd 오류 / 금액·수량 0 → (0, 사유) → 주문 함수 미호출.
     반환: (최종수량:int, 사유:str)
     """
@@ -49,17 +51,27 @@ def kr_gate_from_api(api, code, price, ratio, strategy_qty):
         return 0, f"주문가능 조회 예외 → 미제출: {e}"
     if not avail.get("ok", False):
         return 0, "주문가능 사전검증 실패 → 미제출"
-    cash  = float(avail.get("amount", 0) or 0)
-    nrcvb = int(avail.get("qty", 0) or 0)
-    if cash <= 0 or nrcvb <= 0:
-        return 0, f"KIS 현금 주문가능 0(현금={cash:,.0f}원, 수량={nrcvb}) → 미제출"
+    nrcvb_amt = float(avail.get("amount", 0) or 0)   # nrcvb_buy_amt
+    nrcvb     = int(avail.get("qty", 0) or 0)         # nrcvb_buy_qty
+    if nrcvb_amt <= 0 or nrcvb <= 0:
+        return 0, (f"KIS 현금 주문가능 0(nrcvb_buy_amt={nrcvb_amt:,.0f}원, "
+                   f"nrcvb_buy_qty={nrcvb}) → 미제출")
     try:
         _ratio = max(0.0, min(1.0, float(ratio)))
     except (TypeError, ValueError):
         _ratio = 1.0
-    final = finalize_order_qty(int(strategy_qty), nrcvb, cash * _ratio, price)
+    try:
+        ratio_qty = int(nrcvb_amt * _ratio / float(price)) if float(price) > 0 else 0
+    except (TypeError, ValueError, ZeroDivisionError):
+        ratio_qty = 0
+    try:
+        _strat = max(0, int(strategy_qty))
+    except (TypeError, ValueError):
+        _strat = ratio_qty
+    final = max(0, min(_strat, ratio_qty, nrcvb))   # ★ 0.98 미적용(국내)
     if final <= 0:
-        return 0, f"KIS 현금 주문가능 부족(nrcvb={nrcvb}, 현금={cash:,.0f}원) → 미제출"
+        return 0, (f"KIS 현금 주문가능 부족(nrcvb_buy_qty={nrcvb}, "
+                   f"nrcvb_buy_amt={nrcvb_amt:,.0f}원, 비중{_ratio:.0%}) → 미제출")
     return final, "OK"
 
 

@@ -39,8 +39,8 @@ class TestKRFinalizeBuyQty(unittest.TestCase):
                        "cash": 1_000_000})
         qty, reason = mgr._kr_finalize_buy_qty(
             "005930", 10000, 1.0, deposit_cash=6098)
-        # min(floor(1e6/1e4)=100, nrcvb 100, floor(1e6*0.98/1e4)=98)=98
-        self.assertEqual(qty, 98)
+        # 국내 0.98 미적용: min(floor(1e6/1e4)=100, ratio 100, nrcvb 100)=100
+        self.assertEqual(qty, 100)
         self.assertEqual(reason, "OK")
         mgr.api.buy.assert_not_called()   # 확정 단계는 주문을 내지 않는다
 
@@ -58,9 +58,8 @@ class TestKRFinalizeBuyQty(unittest.TestCase):
         mgr = make_kr({"ok": True, "amount": 1_000_000, "qty": 999,
                        "cash": 1_000_000})
         qty, _ = mgr._kr_finalize_buy_qty("005930", 10000, 0.30)
-        # ratio_cash=300,000 → min(floor(30e4/1e4)=30, 999,
-        #                          floor(30e4*0.98/1e4)=29) = 29
-        self.assertEqual(qty, 29)
+        # ratio_cash=300,000 → min(floor(30e4/1e4)=30, 30, nrcvb 999)=30 (버퍼 미적용)
+        self.assertEqual(qty, 30)
 
     def test_lookup_failure_no_order(self):
         """조회 실패(ok=False) → 0, buy 미호출."""
@@ -70,14 +69,15 @@ class TestKRFinalizeBuyQty(unittest.TestCase):
         self.assertIn("미제출", reason)
         mgr.api.buy.assert_not_called()
 
-    def test_fee_buffer_applied_once(self):
-        """0.98 버퍼는 1회만 적용: floor(현금가능금액*ratio*0.98/주문가)."""
-        # amount 500,000, ratio 1.0 → floor(490,000/10,000)=49
+    def test_no_098_buffer_domestic(self):
+        """국내는 0.98 버퍼 미적용: floor(nrcvb_buy_amt*ratio/주문가)."""
+        # amount 500,000, ratio 1.0 → floor(500,000/10,000)=50 (49 아님)
         mgr = make_kr({"ok": True, "amount": 500_000, "qty": 999,
                        "cash": 500_000})
         qty, _ = mgr._kr_finalize_buy_qty("005930", 10000, 1.0)
-        self.assertEqual(qty, 49)
-        self.assertEqual(qty, qty_from_cash(500_000, 10000))
+        self.assertEqual(qty, 50)
+        self.assertNotEqual(qty, 49)                 # 0.98 적용값(49)이 아님
+        self.assertNotEqual(qty, qty_from_cash(500_000, 10000))  # qty_from_cash=0.98
 
     def test_inflight_reduces_available(self):
         """미체결 주문으로 KIS 현금 가능금액·수량 감소 → 재조회 시 축소 반영."""
@@ -87,10 +87,10 @@ class TestKRFinalizeBuyQty(unittest.TestCase):
         ])
         q1, _ = mgr._kr_finalize_buy_qty("005930", 10000, 1.0)
         q2, _ = mgr._kr_finalize_buy_qty("005930", 10000, 1.0)
-        # 1차: min(100, 100, floor(980000/10000)=98)=98
-        self.assertEqual(q1, 98)
-        # 2차(미체결 소진 반영): min(20, 20, floor(196000/10000)=19)=19
-        self.assertEqual(q2, 19)
+        # 1차: min(100, 100, nrcvb 100)=100 (버퍼 미적용)
+        self.assertEqual(q1, 100)
+        # 2차(미체결 소진 반영): min(20, 20, nrcvb 20)=20
+        self.assertEqual(q2, 20)
         self.assertLess(q2, q1)
 
     def test_query_uses_actual_symbol_price_dvsn(self):

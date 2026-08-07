@@ -589,24 +589,28 @@ class StrategyManager:
         if kis_cash <= 0 or kis_qty <= 0:
             return 0, (f"KIS 현금 주문가능 0(nrcvb_buy_amt={kis_cash:,.0f}원, "
                        f"nrcvb_buy_qty={kis_qty}) → 미제출")
-        # ★ 전략비중을 KIS 미수없는 매수가능금액(nrcvb_buy_amt)에 적용
+        # ★ 전략비중을 KIS 미수없는 매수가능금액(nrcvb_buy_amt)에 적용.
+        #   ★ 국내는 0.98 버퍼를 추가 적용하지 않는다(정책): nrcvb_buy_amt/qty 는
+        #     이미 실제 종목·주문가격 기준 KIS 현금 주문가능조회 결과이므로,
+        #     KIS 가 nrcvb_buy_qty>=1 로 명시한 수량을 버퍼로 0 만들지 않는다.
+        #       ratio_qty = floor(nrcvb_buy_amt * 비중 / 실제주문가)   ← 버퍼 없음
+        #       final     = min(strategy_qty, ratio_qty, nrcvb_buy_qty)
         ratio_cash = kis_cash * _ratio
         try:
-            _cash_qty = int(ratio_cash / float(query_price)) if float(query_price) > 0 else 0
+            ratio_qty = int(ratio_cash / float(query_price)) if float(query_price) > 0 else 0
         except (TypeError, ValueError, ZeroDivisionError):
-            _cash_qty = 0
-        # 전략 산출수량(req6 첫째 항): 호출자가 명시하면(예: ETF 목표비중 수량)
-        # 그 값을, 없으면 KIS 현금×비중 기준 수량을 사용. 어느 경우든 나머지 두
-        # 항(nrcvb, floor(ratio_cash*0.98/가))이 함께 min 되어 상한을 이룬다.
+            ratio_qty = 0
+        # 전략 산출수량: 호출자가 명시하면(예: ETF 목표비중 수량) 그 값을,
+        # 없으면 비중수량(ratio_qty)을 전략수량으로 사용.
         if strategy_qty is None:
-            strat_qty = _cash_qty
+            strat_qty = ratio_qty
         else:
             try:
                 strat_qty = max(0, int(strategy_qty))
             except (TypeError, ValueError):
-                strat_qty = _cash_qty
-        # min(전략비중수량, nrcvb_buy_qty, floor(ratio_cash*0.98/가)) — 0.98 1회 적용
-        final_qty = finalize_order_qty(strat_qty, kis_qty, ratio_cash, query_price)
+                strat_qty = ratio_qty
+        # ★ 국내 최종수량 = min(전략수량, 비중수량, nrcvb_buy_qty) — 0.98 미적용
+        final_qty = max(0, min(strat_qty, ratio_qty, kis_qty))
         _dep = ""
         if deposit_cash is not None:
             try:
@@ -614,10 +618,10 @@ class StrategyManager:
             except (TypeError, ValueError):
                 _dep = ""
         logger.info(
-            "[국내 수량확정] %s = min(전략수량%d, nrcvb_buy_qty%d, 버퍼수량%d) → %d주 "
-            "(nrcvb_buy_amt=%.0f원 × 비중%.0f%% = %.0f원, 주문가=%s | "
+            "[국내 수량확정] %s = min(전략수량%d, 비중수량%d, nrcvb_buy_qty%d) → %d주 "
+            "(nrcvb_buy_amt=%.0f원 × 비중%.0f%% = %.0f원, 주문가=%s | 0.98버퍼 미적용 | "
             "참고 ord_psbl_cash=%.0f원)%s",
-            code, strat_qty, kis_qty, qty_from_cash(ratio_cash, query_price),
+            code, strat_qty, ratio_qty, kis_qty,
             final_qty, kis_cash, _ratio * 100, ratio_cash, str(query_price),
             _ref_cash, _dep)
         if final_qty <= 0:
