@@ -922,6 +922,21 @@ class KISApi:
         #   SELL·취소·체결조회는 이 락을 기다리지 않는다(락 미사용).
         if order_type == "BUY":
             with _account_buy_lock(self.account_no):
+                # ★ 락 안에서 UNKNOWN 차단을 재확인(TOCTOU 방지) — 직전 동시 BUY 가
+                #   ambiguous 로 UNKNOWN 을 기록했을 수 있으므로 제출 직전 원자적 확인.
+                _uled2 = getattr(self, "_unknown_ledger", None)
+                if _uled2 is not None:
+                    try:
+                        if _uled2.has_active(self.account_no, "KR", stock_code, "BUY"):
+                            logger.warning(
+                                "🚫 [BUY_BLOCKED_UNKNOWN] %s 락 내 재확인 — 미해소 "
+                                "UNKNOWN 존재 → 제출 취소", stock_code)
+                            return {"rt_cd": "9", "_status": "BUY_BLOCKED_UNKNOWN",
+                                    "msg1": "미해소 UNKNOWN 주문 — 정합화까지 신규 BUY 차단",
+                                    "code": stock_code}
+                    except Exception as _le2:
+                        logger.error("[UNKNOWN원장] 락내 조회 실패(%s): %s",
+                                     stock_code, _le2)
                 _blk = self._reject_if_nrcvb_insufficient(
                     stock_code, qty, order_price, ord_dvsn)
                 if _blk is not None:

@@ -133,6 +133,22 @@ class TestUnknownBlocking(unittest.TestCase):
         self.assertEqual(r["rt_cd"], "0")
         self.assertEqual(len(self.posts), 1)
 
+    def test_toctou_recheck_inside_lock(self):
+        """외부 검사 통과 후 락 획득 시점에 UNKNOWN 이 생겼으면 락 내 재확인이 차단."""
+        api = _mk_api(self.db)
+        self._set_post(_Resp({"rt_cd": "0", "output": {"ODNO": "1"}}))
+        calls = {"n": 0}
+
+        class _FlipLedger:
+            def has_active(self, *a):
+                calls["n"] += 1
+                return calls["n"] >= 2   # 1차(외부) False, 2차(락내) True
+        api._unknown_ledger = _FlipLedger()
+        r = api._order("005930", "BUY", 1, 70000, ord_dvsn="00")
+        self.assertEqual(r["_status"], "BUY_BLOCKED_UNKNOWN")
+        self.assertEqual(len(self.posts), 0)          # 제출되지 않음
+        self.assertGreaterEqual(calls["n"], 2)        # 락 내 재확인 수행됨
+
     def test_resolved_not_accepted_unblocks(self):
         """RESOLVED_NOT_ACCEPTED 로 해소되면 차단 해제(재주문 가능)."""
         api = _mk_api(self.db)
