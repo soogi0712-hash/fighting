@@ -6,13 +6,23 @@
 
 상태(status):
   PENDING              : 접수 불명확 → 조사 대기(BUY 차단)
+  UNKNOWN_NOT_FOUND    : 당일주문 조회 성공했으나 동일조건 후보 0건 → 계속 차단.
+                          단순 시간경과·조회횟수·장마감·날짜변경으로 자동해제하지 않는다.
+                          이후 후보가 늦게 나타나면(조회지연/일자경계) 승격·부킹으로 해소.
   RESOLVED_ACCEPTED    : KIS 당일주문에서 주문 발견(ODNO 연결) → 정상 pending 승격(차단 해제)
   RESOLVED_FILLED      : 체결 발견 → 체결기반 부킹으로 넘김(차단 해제)
-  RESOLVED_NOT_ACCEPTED: 명확한 미접수 증거 확인(연속 조회 0건) → 차단 해제
+  RESOLVED_MANUAL      : 운영자 명시적 사유로 수동 해제(차단 해제). 자동경로 금지.
   AMBIGUOUS_MATCH      : 동일조건 후보 2건 이상 → 자동해제·자동재주문 금지, 계속 차단
   MANUAL_REVIEW        : 승격·부킹 미확인 등 → 계속 차단, 수동확인 필요
 
-차단 상태 = PENDING, AMBIGUOUS_MATCH, MANUAL_REVIEW.
+자동해제 정책(P0): 후보 0건 반복은 명확한 미접수 증거가 아니다(조회지연·조회범위·
+일자경계로 실제 접수 주문이 늦게 나타날 수 있음). 따라서 not_found_streak 가 아무리
+증가해도 자동으로 해제하지 않는다. 자동해제는 (1)고유 후보 발견 승격/부킹, 또는
+(2)KIS 가 명시적 주문거절/미접수를 식별 가능한 증거로 반환하는 경우에만 허용한다.
+그 외에는 release_unknown(사유 필수) 로만 수동 해제한다.
+
+차단 상태 = PENDING, UNKNOWN_NOT_FOUND, AMBIGUOUS_MATCH, MANUAL_REVIEW.
+재점검(자동 상태변경 가능) 상태 = PENDING, UNKNOWN_NOT_FOUND.
 """
 from __future__ import annotations
 
@@ -23,8 +33,12 @@ import threading
 
 _DEFAULT_DB = os.path.join(os.path.dirname(__file__), "..", "data", "trading_journal.db")
 
-# 차단을 유지하는 상태
-BLOCKING_STATUSES = ("PENDING", "AMBIGUOUS_MATCH", "MANUAL_REVIEW")
+# 차단을 유지하는 상태(신규 BUY 차단)
+BLOCKING_STATUSES = ("PENDING", "UNKNOWN_NOT_FOUND", "AMBIGUOUS_MATCH",
+                     "MANUAL_REVIEW")
+# 정합화 잡이 자동으로 재점검·상태변경할 수 있는 상태
+# (AMBIGUOUS_MATCH/MANUAL_REVIEW 는 수동확인 전용 → 자동 변경 안 함)
+RECHECK_STATUSES = ("PENDING", "UNKNOWN_NOT_FOUND")
 
 
 class UnknownOrderLedger:
@@ -141,12 +155,16 @@ class UnknownOrderLedger:
             c.execute("UPDATE unknown_orders SET last_checked_at=?, history=? "
                       "WHERE id=?", (ts, hist, rid))
 
-    def bump_not_found(self, rid, streak, note="", ts="") -> None:
-        """동일조건 주문 0건(조회지연 가능) → not_found_streak 증가(상태 PENDING 유지)."""
+    def mark_not_found(self, rid, streak, note="", ts="") -> None:
+        """동일조건 주문 0건(조회지연 가능) → 상태 UNKNOWN_NOT_FOUND 로 두고 계속 차단.
+
+        자동해제하지 않는다. not_found_streak 는 진단·이력용으로만 증가시키며,
+        이후 후보가 나타나면 승격·부킹 경로로 해소된다(RECHECK_STATUSES 에 포함).
+        """
         with self._lock, self._conn() as c:
             hist = self._append_history(c, rid, "NOT_FOUND", note, ts)
-            c.execute("UPDATE unknown_orders SET not_found_streak=?, "
-                      "last_checked_at=?, history=? WHERE id=?",
+            c.execute("UPDATE unknown_orders SET status='UNKNOWN_NOT_FOUND', "
+                      "not_found_streak=?, last_checked_at=?, history=? WHERE id=?",
                       (int(streak), ts, hist, rid))
 
     def reset_not_found(self, rid, ts="") -> None:
@@ -156,7 +174,12 @@ class UnknownOrderLedger:
                       "last_checked_at=? WHERE id=?", (ts, rid))
 
     def resolve(self, rid, status, odno="", note="", ts="") -> None:
-        """상태 확정(RESOLVED_* / MANUAL_REVIEW) + 이력·해소시각 기록."""
+        """상태 확정(RESOLVED_ACCEPTED/RESOLVED_FILLED/AMBIGUOUS_MATCH/MANUAL_REVIEW)
+        + 이력·해소시각 기록. 후보 발견 기반 승격·부킹 등 '증거 기반' 경로에서만 호출.
+
+        주의: 시간경과·조회횟수 기반 자동 미접수 해제는 제공하지 않는다.
+        운영자 수동 해제는 release_unknown() 를 사용한다.
+        """
         _resolved_at = ts if status.startswith("RESOLVED_") else ""
         with self._lock, self._conn() as c:
             hist = self._append_history(c, rid, status, note, ts)
@@ -164,6 +187,34 @@ class UnknownOrderLedger:
                 "UPDATE unknown_orders SET status=?, odno=?, last_checked_at=?, "
                 "resolved_at=?, history=? WHERE id=?",
                 (status, odno or "", ts, _resolved_at, hist, rid))
+
+    def release_unknown(self, rid, operator_reason, operator="", ts="") -> bool:
+        """운영자 수동 해제(RESOLVED_MANUAL). 명시적 사유가 있어야만 해제한다.
+
+        - 사유(operator_reason)가 비어 있으면 ValueError → 해제 금지.
+        - 이력에 '이전 상태·해제시각·사유·운영자'를 기록한다.
+        - 일반 매매 루프·시간 스케줄러에서는 절대 호출하지 않는다(수동 관리 전용).
+        반환: True(해제됨). 대상이 없거나 이미 차단상태가 아니면 False.
+        """
+        reason = (operator_reason or "").strip()
+        if not reason:
+            raise ValueError("수동 해제에는 명시적 사유가 필요합니다(빈 사유 금지).")
+        with self._lock, self._conn() as c:
+            row = c.execute("SELECT status FROM unknown_orders WHERE id=?",
+                            (rid,)).fetchone()
+            if row is None:
+                return False
+            prev = row["status"]
+            if prev not in BLOCKING_STATUSES:
+                return False   # 이미 해소됨 → 중복 해제 방지
+            note = (f"수동해제 prev={prev} operator={operator or '-'} "
+                    f"reason={reason}")
+            hist = self._append_history(c, rid, "RESOLVED_MANUAL", note, ts)
+            c.execute(
+                "UPDATE unknown_orders SET status='RESOLVED_MANUAL', "
+                "last_checked_at=?, resolved_at=?, history=? WHERE id=?",
+                (ts, ts, hist, rid))
+            return True
 
 
 # ── 프로세스 공용 기본 원장(싱글턴) ──────────────────────────────

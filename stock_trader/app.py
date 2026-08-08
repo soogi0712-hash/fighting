@@ -68,8 +68,9 @@ def _kr_unknown_reconcile_job():
     try:
         res = _strategy_mgr.reconcile_unknowns_once()
         if res:
+            # 계속 차단(자동해제 아님) 결과는 소음이라 상태변경 로그에서 제외
             _acted = [r for r in res if r[1] not in
-                      ("KEEP_PENDING_QUERY_FAIL", "KEEP_PENDING_ZERO_STREAK")]
+                      ("KEEP_PENDING_QUERY_FAIL", "UNKNOWN_NOT_FOUND")]
             if _acted:
                 _log(f"🔎 [UNKNOWN정합화] {len(res)}건 점검, 상태변경 {len(_acted)}건: "
                      f"{_acted}", "info")
@@ -77,6 +78,18 @@ def _kr_unknown_reconcile_job():
         _log(f"⚠️ [UNKNOWN정합화] 잡 오류(격리, 스캔·매도 영향 없음): {_re}", "warning")
     finally:
         _kr_reconcile_lock.release()
+
+
+def _register_kr_reconcile_job(scheduler):
+    """UNKNOWN 저빈도 정합화 잡을 스케줄러에 '한 곳'에서만 등록(중복 방지).
+
+    _auto_start_bot()/bot_start() 두 진입점 모두 이 함수를 호출한다. 두 블록은
+    동일한 모듈 전역 _scheduler 를 공유하고 'not _scheduler.running' 가드로 인해
+    프로세스당 실제 add_job 은 1회만 수행된다. 그래도 id+replace_existing 로
+    idempotent 하게 만들어, 어떤 경로로도 잡은 정확히 1개만 등록되도록 한다.
+    """
+    scheduler.add_job(_kr_unknown_reconcile_job, "interval", seconds=25,
+                      id="kr_unknown_reconcile", replace_existing=True)
 
 # ── 루프 공용 잔고 캐시 ──────────────────────────────────────
 # 루프 시작 시 1회 조회 → 주문 직후 갱신 → 60초마다 자동 갱신
@@ -421,9 +434,8 @@ def _auto_start_bot():
                            hour=15, minute=20, second=30,
                            timezone="Asia/Seoul",
                            id="cancel_pending_buys", replace_existing=True)
-        # ★ UNKNOWN(접수 불명확) 주문 저빈도 정합화 — 25초 주기(장애 격리·비재진입)
-        _scheduler.add_job(_kr_unknown_reconcile_job, "interval", seconds=25,
-                           id="kr_unknown_reconcile", replace_existing=True)
+        # ★ UNKNOWN(접수 불명확) 주문 저빈도 정합화 — 공용 등록 함수(중복 방지)
+        _register_kr_reconcile_job(_scheduler)
         _scheduler.start()
         # ★ 자동 재개 시 토큰 안정화 후 1회 신호 점검 (15초 딜레이)
         def _delayed_loop():
@@ -3470,9 +3482,8 @@ def bot_start():
                            hour=15, minute=20, second=30,
                            timezone="Asia/Seoul",
                            id="cancel_pending_buys", replace_existing=True)
-        # ★ UNKNOWN(접수 불명확) 주문 저빈도 정합화 — 25초 주기(장애 격리·비재진입)
-        _scheduler.add_job(_kr_unknown_reconcile_job, "interval", seconds=25,
-                           id="kr_unknown_reconcile", replace_existing=True)
+        # ★ UNKNOWN(접수 불명확) 주문 저빈도 정합화 — 공용 등록 함수(중복 방지)
+        _register_kr_reconcile_job(_scheduler)
         _scheduler.start()
         # ★ 봇 시작 시 토큰 안정화 후 1회 신호 점검 (15초 딜레이)
         def _delayed_loop_start():

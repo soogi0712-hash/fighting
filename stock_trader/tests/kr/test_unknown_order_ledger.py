@@ -149,14 +149,20 @@ class TestUnknownBlocking(unittest.TestCase):
         self.assertEqual(len(self.posts), 0)          # 제출되지 않음
         self.assertGreaterEqual(calls["n"], 2)        # 락 내 재확인 수행됨
 
-    def test_resolved_not_accepted_unblocks(self):
-        """RESOLVED_NOT_ACCEPTED 로 해소되면 차단 해제(재주문 가능)."""
+    def test_manual_release_unblocks_but_empty_reason_rejected(self):
+        """자동 미접수 해제는 없다. 명시적 사유 수동해제(release_unknown)로만 차단 해제."""
         api = _mk_api(self.db)
         rid = api._unknown_ledger.record("12345678-01", "KR", "005930", "BUY",
                                          1, 70000, "00", created_at="t")
         self.assertTrue(api._unknown_ledger.has_active("12345678-01", "KR", "005930", "BUY"))
-        api._unknown_ledger.resolve(rid, "RESOLVED_NOT_ACCEPTED", note="미접수 확인", ts="t2")
+        # 빈 사유 → 거부(차단 유지)
+        with self.assertRaises(ValueError):
+            api._unknown_ledger.release_unknown(rid, "", operator="op")
+        self.assertTrue(api._unknown_ledger.has_active("12345678-01", "KR", "005930", "BUY"))
+        # 명시적 사유 → 해제(RESOLVED_MANUAL)
+        api._unknown_ledger.release_unknown(rid, "브로커 확인 미접수", operator="op", ts="t2")
         self.assertFalse(api._unknown_ledger.has_active("12345678-01", "KR", "005930", "BUY"))
+        self.assertEqual(api._unknown_ledger.get(rid)["status"], "RESOLVED_MANUAL")
 
 
 if __name__ == "__main__":
