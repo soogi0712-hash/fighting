@@ -519,6 +519,69 @@ class StrategyManager:
             return ""
 
     # ══════════════════════════════════════════════════════════
+    # UNKNOWN 주문 정합화 배선 (저빈도 스케줄러/시작시 호출)
+    # ══════════════════════════════════════════════════════════
+    def _promote_unknown_to_pending(self, row: dict, cand: dict) -> bool:
+        """UNKNOWN 정합화: 발견된 ODNO 를 lifecycle+PendingRegistry 에 등록(승격).
+
+        승격 후 체결 부킹은 기존 FillObserver → dispatch_fill → ExecutionDriven
+        경로가 '정확히 1회' 수행한다(부분체결=delta 1회, 전량=1회, lifecycle 멱등).
+        미체결이면 등록만 하고 포지션·손익 부킹은 하지 않는다(체결 시 FillObserver 반영).
+        성공 시 True → 원장이 RESOLVED_ACCEPTED/RESOLVED_FILLED 로 차단 해제.
+        실패 시 False → 원장이 MANUAL_REVIEW 로 남겨 계속 차단(무단 해제 없음).
+        """
+        if self._lifecycle_mgr is None or self._pending_registry is None:
+            logger.warning("[UNKNOWN정합화] lifecycle/pending 미구성 → 승격 보류(차단 유지)")
+            return False
+        try:
+            code = row["code"]
+            qty  = int(row["qty"])
+            odno = str(cand.get("odno", "") or "").strip()
+            if not odno:
+                return False
+            # 이미 동일 ODNO 가 pending 에 있으면 중복 등록 방지(멱등)
+            try:
+                if self._pending_registry.has_active_order("KR", code, "BUY"):
+                    logger.info("[UNKNOWN정합화] %s 이미 pending 존재 → 재등록 생략(해제)",
+                                code)
+                    return True
+            except Exception:
+                pass
+            _lc_id = make_order_lifecycle_id("KR", "BUY", code)
+            _lc = self._lifecycle_mgr.create(
+                trade_id=_lc_id, market="KR", code=code, side="BUY",
+                strategy_name="UnknownReconcile", order_qty=qty)
+            self._lifecycle_mgr.confirm_signal(_lc)
+            self._lifecycle_mgr.submit(_lc)
+            # ODNO 를 KR 응답 형식(KNO_ORD_NO)으로 넘겨 accept+pending 등록 재사용
+            self._register_pending_order(
+                market="KR", trade_id=_lc_id, code=code, side="BUY",
+                order_qty=qty,
+                order_response={"output": {"KNO_ORD_NO": odno}},
+                lifecycle_id=_lc.order_lifecycle_id, currency="KRW")
+            logger.info(
+                "[UNKNOWN정합화] 승격 완료 code=%s odno=%s qty=%d → FillObserver 부킹 대기",
+                code, odno, qty)
+            return True
+        except Exception as e:
+            logger.error("[UNKNOWN정합화] 승격 실패 code=%s: %s", row.get("code"), e)
+            return False
+
+    def reconcile_unknowns_once(self) -> list:
+        """UNKNOWN 정합화 1회 실행(장애 격리). 정합화 오류는 매도·스캔을 막지 않는다.
+        승격/부킹은 _promote_unknown_to_pending 로 위임(FillObserver 가 정확히 1회 부킹)."""
+        api = getattr(self, "api", None)
+        if api is None or not hasattr(api, "reconcile_kr_unknowns"):
+            return []
+        try:
+            return api.reconcile_kr_unknowns(
+                on_promote=self._promote_unknown_to_pending,
+                on_fill=self._promote_unknown_to_pending)
+        except Exception as e:
+            logger.error("[UNKNOWN정합화] 실행 오류(격리): %s", e)
+            return []
+
+    # ══════════════════════════════════════════════════════════
     # Phase 4: run_fill_poll() — FillObserver → dispatch_fill() 자동 연결
     # ══════════════════════════════════════════════════════════
 

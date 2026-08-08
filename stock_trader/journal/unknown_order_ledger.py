@@ -8,10 +8,11 @@
   PENDING              : 접수 불명확 → 조사 대기(BUY 차단)
   RESOLVED_ACCEPTED    : KIS 당일주문에서 주문 발견(ODNO 연결) → 정상 pending 승격(차단 해제)
   RESOLVED_FILLED      : 체결 발견 → 체결기반 부킹으로 넘김(차단 해제)
-  RESOLVED_NOT_ACCEPTED: 명확한 미접수 증거 확인 → 차단 해제
-  MANUAL_REVIEW        : 후보 다수·식별 불가 → 계속 차단, 수동확인 필요
+  RESOLVED_NOT_ACCEPTED: 명확한 미접수 증거 확인(연속 조회 0건) → 차단 해제
+  AMBIGUOUS_MATCH      : 동일조건 후보 2건 이상 → 자동해제·자동재주문 금지, 계속 차단
+  MANUAL_REVIEW        : 승격·부킹 미확인 등 → 계속 차단, 수동확인 필요
 
-차단 상태 = PENDING, MANUAL_REVIEW.
+차단 상태 = PENDING, AMBIGUOUS_MATCH, MANUAL_REVIEW.
 """
 from __future__ import annotations
 
@@ -23,7 +24,7 @@ import threading
 _DEFAULT_DB = os.path.join(os.path.dirname(__file__), "..", "data", "trading_journal.db")
 
 # 차단을 유지하는 상태
-BLOCKING_STATUSES = ("PENDING", "MANUAL_REVIEW")
+BLOCKING_STATUSES = ("PENDING", "AMBIGUOUS_MATCH", "MANUAL_REVIEW")
 
 
 class UnknownOrderLedger:
@@ -56,11 +57,18 @@ class UnknownOrderLedger:
                     odno            TEXT,
                     last_checked_at TEXT,
                     resolved_at     TEXT,
-                    history         TEXT
+                    history         TEXT,
+                    not_found_streak INTEGER DEFAULT 0
                 )
             """)
             c.execute("CREATE INDEX IF NOT EXISTS ix_unknown_active "
                       "ON unknown_orders(account, market, code, side, status)")
+            # ── 마이그레이션: 기존 DB 에 없는 컬럼 안전 추가 ──────────────
+            _cols = {r["name"] for r in c.execute(
+                "PRAGMA table_info(unknown_orders)").fetchall()}
+            if "not_found_streak" not in _cols:
+                c.execute("ALTER TABLE unknown_orders "
+                          "ADD COLUMN not_found_streak INTEGER DEFAULT 0")
 
     # ── 기록 ────────────────────────────────────────────────────
     def record(self, account, market, code, side, qty, price, ord_dvsn,
@@ -132,6 +140,20 @@ class UnknownOrderLedger:
             hist = self._append_history(c, rid, "CHECKED", note, ts)
             c.execute("UPDATE unknown_orders SET last_checked_at=?, history=? "
                       "WHERE id=?", (ts, hist, rid))
+
+    def bump_not_found(self, rid, streak, note="", ts="") -> None:
+        """동일조건 주문 0건(조회지연 가능) → not_found_streak 증가(상태 PENDING 유지)."""
+        with self._lock, self._conn() as c:
+            hist = self._append_history(c, rid, "NOT_FOUND", note, ts)
+            c.execute("UPDATE unknown_orders SET not_found_streak=?, "
+                      "last_checked_at=?, history=? WHERE id=?",
+                      (int(streak), ts, hist, rid))
+
+    def reset_not_found(self, rid, ts="") -> None:
+        """후보 발견 등으로 0건 스트릭 리셋."""
+        with self._lock, self._conn() as c:
+            c.execute("UPDATE unknown_orders SET not_found_streak=0, "
+                      "last_checked_at=? WHERE id=?", (ts, rid))
 
     def resolve(self, rid, status, odno="", note="", ts="") -> None:
         """상태 확정(RESOLVED_* / MANUAL_REVIEW) + 이력·해소시각 기록."""
