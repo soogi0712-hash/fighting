@@ -54,6 +54,29 @@ _scheduler    = None
 _bot_running  = False
 # ★ 국내 매매 루프 중복 실행 방지 락(프로세스당 1개 본체만 실행) — item10/11/17
 _trading_loop_lock = threading.Lock()
+# ★ UNKNOWN 정합화 저빈도 잡 중복 실행 방지(비재진입)
+_kr_reconcile_lock = threading.Lock()
+
+
+def _kr_unknown_reconcile_job():
+    """저빈도 UNKNOWN 정합화 잡. 장애 격리: 오류가 스캔·매도·체결감시를 막지 않는다.
+    비재진입 락으로 중복 실행 방지. SELL/취소/체결조회는 이 잡과 무관하게 동작한다."""
+    if _strategy_mgr is None:
+        return
+    if not _kr_reconcile_lock.acquire(blocking=False):
+        return   # 이미 실행 중 → 스킵
+    try:
+        res = _strategy_mgr.reconcile_unknowns_once()
+        if res:
+            _acted = [r for r in res if r[1] not in
+                      ("KEEP_PENDING_QUERY_FAIL", "KEEP_PENDING_ZERO_STREAK")]
+            if _acted:
+                _log(f"🔎 [UNKNOWN정합화] {len(res)}건 점검, 상태변경 {len(_acted)}건: "
+                     f"{_acted}", "info")
+    except Exception as _re:
+        _log(f"⚠️ [UNKNOWN정합화] 잡 오류(격리, 스캔·매도 영향 없음): {_re}", "warning")
+    finally:
+        _kr_reconcile_lock.release()
 
 # ── 루프 공용 잔고 캐시 ──────────────────────────────────────
 # 루프 시작 시 1회 조회 → 주문 직후 갱신 → 60초마다 자동 갱신
@@ -283,6 +306,12 @@ def _init_api() -> bool:
                 _strategy_mgr.recover_expired_fills()         # (5)
             except Exception as _e4:
                 logger.warning(f"[restart reconcile] expired-fill 복구 스킵: {_e4}")
+            # (7) UNKNOWN(접수 불명확) 주문 복원·정합화 1회 — 재시작 후 남은 UNKNOWN 을
+            #     당일 주문조회로 즉시 점검(승격/부킹/미접수). 실패해도 스캔·매도 무영향.
+            try:
+                _kr_unknown_reconcile_job()                   # (7)
+            except Exception as _e5:
+                logger.warning(f"[restart reconcile] UNKNOWN 정합화 스킵: {_e5}")
         _sync_positions_from_balance()                       # (6)
         return True
     except Exception as e:
@@ -392,6 +421,9 @@ def _auto_start_bot():
                            hour=15, minute=20, second=30,
                            timezone="Asia/Seoul",
                            id="cancel_pending_buys", replace_existing=True)
+        # ★ UNKNOWN(접수 불명확) 주문 저빈도 정합화 — 25초 주기(장애 격리·비재진입)
+        _scheduler.add_job(_kr_unknown_reconcile_job, "interval", seconds=25,
+                           id="kr_unknown_reconcile", replace_existing=True)
         _scheduler.start()
         # ★ 자동 재개 시 토큰 안정화 후 1회 신호 점검 (15초 딜레이)
         def _delayed_loop():
@@ -3438,6 +3470,9 @@ def bot_start():
                            hour=15, minute=20, second=30,
                            timezone="Asia/Seoul",
                            id="cancel_pending_buys", replace_existing=True)
+        # ★ UNKNOWN(접수 불명확) 주문 저빈도 정합화 — 25초 주기(장애 격리·비재진입)
+        _scheduler.add_job(_kr_unknown_reconcile_job, "interval", seconds=25,
+                           id="kr_unknown_reconcile", replace_existing=True)
         _scheduler.start()
         # ★ 봇 시작 시 토큰 안정화 후 1회 신호 점검 (15초 딜레이)
         def _delayed_loop_start():

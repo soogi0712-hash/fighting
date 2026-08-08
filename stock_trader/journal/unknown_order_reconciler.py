@@ -27,12 +27,17 @@ def _match(cand, row):
 
 
 def reconcile_unknown_orders(ledger, candidate_provider,
-                             on_promote=None, on_fill=None, now_iso=""):
-    """PENDING UNKNOWN 을 정합화한다. 처리결과 [(id, outcome), ...] 반환."""
+                             on_promote=None, on_fill=None, now_iso="",
+                             release_after_zero_streak=3):
+    """PENDING UNKNOWN 을 정합화한다. 처리결과 [(id, outcome), ...] 반환.
+
+    release_after_zero_streak: 동일조건 주문 0건이 '연속 N회' 확인돼야 미접수로
+      확정(RESOLVED_NOT_ACCEPTED)한다. 1회 0건은 조회지연일 수 있어 유지한다.
+    """
     results = []
     for row in ledger.list_active():
         if row.get("status") != "PENDING":
-            continue    # MANUAL_REVIEW 는 자동 변경하지 않음(수동확인 대상)
+            continue    # AMBIGUOUS_MATCH·MANUAL_REVIEW 는 자동 변경 안 함(수동확인)
         rid = row["id"]
         try:
             q = candidate_provider(row) or {}
@@ -48,19 +53,33 @@ def reconcile_unknown_orders(ledger, candidate_provider,
         cands = [c for c in (q.get("candidates") or []) if _match(c, row)]
 
         if len(cands) == 0:
-            # 성공 조회인데 동일조건 주문이 하나도 없음 → 명확한 미접수 증거
-            ledger.resolve(rid, "RESOLVED_NOT_ACCEPTED",
-                           note="당일주문에 동일조건 주문 없음(미접수 확인)", ts=now_iso)
-            results.append((rid, "RESOLVED_NOT_ACCEPTED"))
+            # 성공 조회지만 동일조건 주문 0건. 단발 0건은 조회지연일 수 있어
+            # 즉시 해제하지 않고, 연속 N회 0건일 때만 미접수로 확정한다.
+            streak = int(row.get("not_found_streak", 0) or 0) + 1
+            if streak >= int(release_after_zero_streak):
+                ledger.resolve(rid, "RESOLVED_NOT_ACCEPTED",
+                               note=f"동일조건 주문 연속 {streak}회 0건 → 미접수 확정",
+                               ts=now_iso)
+                results.append((rid, "RESOLVED_NOT_ACCEPTED"))
+            else:
+                ledger.bump_not_found(
+                    rid, streak,
+                    note=f"동일조건 0건(연속 {streak}회, 조회지연 가능 → 유지)",
+                    ts=now_iso)
+                results.append((rid, "KEEP_PENDING_ZERO_STREAK"))
             continue
 
         if len(cands) > 1:
-            ledger.resolve(rid, "MANUAL_REVIEW",
-                           note=f"동일조건 후보 {len(cands)}건 → 식별 불가(수동확인)",
+            # 동일조건 후보 다수 → 특정 불가 → 자동해제·자동재주문 금지, 계속 차단
+            ledger.resolve(rid, "AMBIGUOUS_MATCH",
+                           note=f"동일조건 후보 {len(cands)}건 → 특정 불가(수동확인)",
                            ts=now_iso)
-            results.append((rid, "MANUAL_REVIEW"))
+            results.append((rid, "AMBIGUOUS_MATCH"))
             continue
 
+        # 후보 1건 발견 → 0건 스트릭 리셋
+        if int(row.get("not_found_streak", 0) or 0) > 0:
+            ledger.reset_not_found(rid, ts=now_iso)
         c = cands[0]
         odno = str(c.get("odno", "") or "").strip()
 
