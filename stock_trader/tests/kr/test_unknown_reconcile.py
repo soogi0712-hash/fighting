@@ -56,44 +56,40 @@ class TestReconcile(unittest.TestCase):
         self.assertEqual(res2, [])
         self.assertEqual(len(booked), 1)
 
-    def test_single_zero_candidate_keeps_pending(self):
-        """단발 0건은 조회지연 가능 → 즉시 미접수 확정 금지, PENDING 유지(계속 차단)."""
+    def test_single_zero_candidate_keeps_blocked(self):
+        """단발 0건 → UNKNOWN_NOT_FOUND 로 계속 차단(자동 미접수 확정 금지)."""
         rid = self._seed()
         prov = lambda row: {"query_ok": True, "candidates": []}
         res = reconcile_unknown_orders(self.led, prov, now_iso="t2")
-        self.assertEqual(res, [(rid, "KEEP_PENDING_ZERO_STREAK")])
+        self.assertEqual(res, [(rid, "UNKNOWN_NOT_FOUND")])
         self.assertTrue(self.led.has_active("ACC-01", "KR", "005930", "BUY"))
+        self.assertEqual(self.led.get(rid)["status"], "UNKNOWN_NOT_FOUND")
         self.assertEqual(self.led.get(rid)["not_found_streak"], 1)
 
-    def test_zero_candidate_streak_resolves_not_accepted(self):
-        """동일조건 0건이 연속 N회 확인되면 미접수 확정(RESOLVED_NOT_ACCEPTED, 차단 해제)."""
+    def test_zero_candidate_100x_never_auto_resolves(self):
+        """동일조건 0건을 100회 조회해도 자동해제 없음 — UNKNOWN 유지·BUY 차단."""
         rid = self._seed()
         prov = lambda row: {"query_ok": True, "candidates": []}
-        # 연속 3회(기본 임계) 0건 → 마지막 회차에 확정
-        r1 = reconcile_unknown_orders(self.led, prov, now_iso="t1")
-        r2 = reconcile_unknown_orders(self.led, prov, now_iso="t2")
-        r3 = reconcile_unknown_orders(self.led, prov, now_iso="t3")
-        self.assertEqual(r1, [(rid, "KEEP_PENDING_ZERO_STREAK")])
-        self.assertEqual(r2, [(rid, "KEEP_PENDING_ZERO_STREAK")])
-        self.assertEqual(r3, [(rid, "RESOLVED_NOT_ACCEPTED")])
-        self.assertFalse(self.led.has_active("ACC-01", "KR", "005930", "BUY"))
+        for i in range(100):
+            res = reconcile_unknown_orders(self.led, prov, now_iso=f"t{i}")
+            self.assertEqual(res, [(rid, "UNKNOWN_NOT_FOUND")])
+        # 100회 후에도 여전히 차단, RESOLVED_* 로 전이되지 않음
+        self.assertTrue(self.led.has_active("ACC-01", "KR", "005930", "BUY"))
+        row = self.led.get(rid)
+        self.assertEqual(row["status"], "UNKNOWN_NOT_FOUND")
+        self.assertFalse(row["status"].startswith("RESOLVED_"))
+        self.assertEqual(row["resolved_at"], "")
+        self.assertEqual(row["not_found_streak"], 100)
 
-    def test_zero_candidate_immediate_when_threshold_one(self):
-        """release_after_zero_streak=1 이면 단발 0건에 즉시 미접수 확정."""
-        rid = self._seed()
-        prov = lambda row: {"query_ok": True, "candidates": []}
-        res = reconcile_unknown_orders(self.led, prov, now_iso="t2",
-                                       release_after_zero_streak=1)
-        self.assertEqual(res, [(rid, "RESOLVED_NOT_ACCEPTED")])
-        self.assertFalse(self.led.has_active("ACC-01", "KR", "005930", "BUY"))
-
-    def test_candidate_after_zero_streak_resets(self):
-        """0건 스트릭 도중 후보가 발견되면 스트릭 리셋 후 정상 승격."""
+    def test_candidate_after_zero_streak_promotes(self):
+        """0건 누적 도중 후보가 늦게 나타나면(조회지연) 승격으로 해소."""
         rid = self._seed()
         zero = lambda row: {"query_ok": True, "candidates": []}
         reconcile_unknown_orders(self.led, zero, now_iso="t1")
         reconcile_unknown_orders(self.led, zero, now_iso="t2")
+        self.assertEqual(self.led.get(rid)["status"], "UNKNOWN_NOT_FOUND")
         self.assertEqual(self.led.get(rid)["not_found_streak"], 2)
+        # 이후 후보 발견 → 승격(재점검 대상이므로 UNKNOWN_NOT_FOUND 도 처리됨)
         found = lambda row: {"query_ok": True, "candidates": [
             {"odno": "0007", "qty": 1, "price": 70000, "cum_filled_qty": 0}]}
         res = reconcile_unknown_orders(
@@ -134,17 +130,52 @@ class TestReconcile(unittest.TestCase):
         self.assertTrue(self.led.has_active("ACC-01", "KR", "005930", "BUY"))
 
     def test_qty_price_mismatch_not_matched(self):
-        """수량·가격이 다르면 후보로 매칭하지 않음(다른 주문) → 매칭 0건 취급."""
+        """수량·가격이 다르면 후보로 매칭하지 않음(다른 주문) → 매칭 0건 = UNKNOWN 유지."""
         rid = self._seed(qty=1, price=70000)
         prov = lambda row: {"query_ok": True, "candidates": [
             {"odno": "5", "qty": 2, "price": 70000, "cum_filled_qty": 0},  # 수량 다름
             {"odno": "6", "qty": 1, "price": 71000, "cum_filled_qty": 0}]}  # 가격 다름
-        # 매칭 0건 → 단발은 유지, 임계=1 로 즉시 미접수 확정됨을 확인
+        # 매칭 0건 → 자동해제 금지, UNKNOWN_NOT_FOUND 로 계속 차단
         res = reconcile_unknown_orders(self.led, prov, now_iso="t2")
-        self.assertEqual(res, [(rid, "KEEP_PENDING_ZERO_STREAK")])
-        res2 = reconcile_unknown_orders(self.led, prov, now_iso="t3",
-                                        release_after_zero_streak=1)
-        self.assertEqual(res2, [(rid, "RESOLVED_NOT_ACCEPTED")])
+        self.assertEqual(res, [(rid, "UNKNOWN_NOT_FOUND")])
+        self.assertTrue(self.led.has_active("ACC-01", "KR", "005930", "BUY"))
+
+    def test_manual_release_requires_reason(self):
+        """수동 해제: 빈 사유는 거부(ValueError), 명시적 사유가 있어야만 해제."""
+        rid = self._seed()
+        with self.assertRaises(ValueError):
+            self.led.release_unknown(rid, "", operator="op1")
+        with self.assertRaises(ValueError):
+            self.led.release_unknown(rid, "   ", operator="op1")
+        self.assertTrue(self.led.has_active("ACC-01", "KR", "005930", "BUY"))
+        # 명시적 사유 → 해제
+        ok = self.led.release_unknown(rid, "브로커 확인: 미접수 확정", operator="op1",
+                                      ts="t9")
+        self.assertTrue(ok)
+        self.assertFalse(self.led.has_active("ACC-01", "KR", "005930", "BUY"))
+        row = self.led.get(rid)
+        self.assertEqual(row["status"], "RESOLVED_MANUAL")
+        self.assertEqual(row["resolved_at"], "t9")
+        # 이력에 이전 상태·사유 기록
+        import json as _j
+        hist = _j.loads(row["history"])
+        last = hist[-1]
+        self.assertEqual(last["event"], "RESOLVED_MANUAL")
+        self.assertIn("prev=PENDING", last["note"])
+        self.assertIn("브로커 확인", last["note"])
+
+    def test_manual_release_after_not_found_unblocks_buy(self):
+        """UNKNOWN_NOT_FOUND 도 명시적 사유 수동해제 후에만 BUY 허용."""
+        rid = self._seed()
+        zero = lambda row: {"query_ok": True, "candidates": []}
+        reconcile_unknown_orders(self.led, zero, now_iso="t1")
+        self.assertTrue(self.led.has_active("ACC-01", "KR", "005930", "BUY"))
+        ok = self.led.release_unknown(rid, "수기 확인: 접수 안 됨", operator="op2",
+                                      ts="t2")
+        self.assertTrue(ok)
+        self.assertFalse(self.led.has_active("ACC-01", "KR", "005930", "BUY"))
+        # 중복 해제 방지: 이미 해소 → False
+        self.assertFalse(self.led.release_unknown(rid, "재시도", operator="op2"))
 
 
 class TestKisCandidateProviderAndReconcile(unittest.TestCase):

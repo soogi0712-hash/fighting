@@ -70,6 +70,42 @@ class _GetResp:
         return self._p
 
 
+class _PostResp:
+    def __init__(self, payload, status=200):
+        self._p = payload
+        self.status_code = status
+        self.text = str(payload)
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._p
+
+
+def _mk_order_api(db_path):
+    """_order(SELL) 경로를 구동할 수 있는 최소 KISApi(요청은 목킹)."""
+    api = object.__new__(KISApi)
+    api.base_url = "https://mock"
+    api.account_no = "12345678-01"
+    api._live_order_guard = lambda *a, **k: None
+    api._pre_validate_kr_order = lambda *a, **k: None
+    api._order_cooldown = {}
+    api._ORDER_COOLDOWN_SEC = 0.0
+    api.tick_size = lambda p: 1
+    api.round_to_tick = lambda p, direction=1: int(p)
+    api.invalidate_balance_cache = lambda: None
+    api._on_api_success = lambda: None
+    api._on_api_error = lambda *a, **k: None
+    api._diagnose_500 = lambda *a, **k: ""
+    api._headers = lambda *a, **k: {}
+    api._rate_limit = lambda *a, **k: None
+    api.get_kr_available_amounts = MagicMock(return_value={
+        "ok": True, "amount": 10_000_000.0, "qty": 100, "ord_psbl_cash": 6098.0})
+    api._unknown_ledger = UnknownOrderLedger(db_path)
+    return api
+
+
 class WiringTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="recon-wire-")
@@ -216,20 +252,78 @@ class WiringTest(unittest.TestCase):
         self._set_orders([])   # 성공 조회지만 후보 0건
         sm = ReconSM(api, self.reg, self.lc)
         res = sm.reconcile_unknowns_once()
-        self.assertEqual(res[0][1], "KEEP_PENDING_ZERO_STREAK")
+        self.assertEqual(res[0][1], "UNKNOWN_NOT_FOUND")
         self.assertTrue(api._unknown_ledger.has_active(
             "12345678-01", "KR", "005930", "BUY"))    # 단발 0건 → 계속 차단
 
-    # ── 정합화 중에도 SELL 즉시 제출(정합화 예외가 매도 미차단) ──────
-    def test_sell_not_blocked_during_reconcile(self):
+    def test_zero_candidate_100x_and_restart_keeps_blocked(self):
+        """후보 0건 100회 + 재시작 모사(동일 DB, 새 인스턴스) 후에도 UNKNOWN 유지."""
+        api = _mk_kis(self.db)
+        rid = self._seed_unknown(api)
+        self._set_orders([])
+        sm = ReconSM(api, self.reg, self.lc)
+        for _ in range(100):
+            sm.reconcile_unknowns_once()
+        self.assertTrue(api._unknown_ledger.has_active(
+            "12345678-01", "KR", "005930", "BUY"))
+        self.assertEqual(api._unknown_ledger.get(rid)["status"], "UNKNOWN_NOT_FOUND")
+        # 재시작 모사: 새 원장 인스턴스(동일 DB) 로도 여전히 차단
+        api2 = _mk_kis(self.db)
+        self.assertTrue(api2._unknown_ledger.has_active(
+            "12345678-01", "KR", "005930", "BUY"))
+        # 날짜변경 모사: created_hhmmss 는 그대로, 새 조회일에도 0건이면 계속 UNKNOWN
+        sm2 = ReconSM(api2, self.reg, self.lc)
+        r = sm2.reconcile_unknowns_once()
+        self.assertEqual(r[0][1], "UNKNOWN_NOT_FOUND")
+        self.assertTrue(api2._unknown_ledger.has_active(
+            "12345678-01", "KR", "005930", "BUY"))
+
+    def test_manual_release_only_unblocks(self):
+        """빈 사유 수동해제 거부 / 명시적 사유 후에만 BUY 허용 — 자동경로 아님."""
+        api = _mk_kis(self.db)
+        rid = self._seed_unknown(api)
+        led = api._unknown_ledger
+        with self.assertRaises(ValueError):
+            led.release_unknown(rid, "")
+        self.assertTrue(led.has_active("12345678-01", "KR", "005930", "BUY"))
+        self.assertTrue(led.release_unknown(rid, "운영자 확인 미접수", operator="ops"))
+        self.assertFalse(led.has_active("12345678-01", "KR", "005930", "BUY"))
+
+    # ── 정합화 중에도 SELL 즉시 제출(정합화 잡 락과 무관) ──────────────
+    def test_sell_submits_while_reconcile_lock_held(self):
+        """정합화 잡이 실행 중(락 점유)이고 동일 종목 UNKNOWN(BUY)이 있어도
+        SELL 은 즉시 제출된다(_order 경로는 정합화 락을 건드리지 않음)."""
+        posts = []
+
+        def _post(*a, **k):
+            posts.append(1)
+            return _PostResp({"rt_cd": "0", "output": {"KNO_ORD_NO": "S1"},
+                              "msg1": "매도접수"})
+        self._orig_post = kmod.requests.post
+        kmod.requests.post = _post
+        try:
+            api = _mk_order_api(self.db)
+            # 동일 종목 UNKNOWN(BUY) 미해소 + 정합화 락 점유 상태 모사
+            api._unknown_ledger.record(
+                "12345678-01", "KR", "005930", "BUY", 1, 70000, "00",
+                created_at="2026-08-07T10:00:00")
+            recon_lock = threading.Lock()
+            recon_lock.acquire()          # '정합화 진행 중'
+            try:
+                r = api._order("005930", "SELL", 10, 80000, ord_dvsn="00")
+            finally:
+                recon_lock.release()
+            self.assertEqual(r["rt_cd"], "0")     # SELL 즉시 제출됨
+            self.assertEqual(len(posts), 1)
+        finally:
+            kmod.requests.post = self._orig_post
+
+    def test_reconcile_exception_does_not_propagate(self):
+        """정합화 API 예외가 전파되지 않아 후속 매도·스캔을 막지 않는다."""
         api = _mk_kis(self.db)
         api.reconcile_kr_unknowns = MagicMock(side_effect=RuntimeError("recon busy"))
         sm = ReconSM(api, self.reg, self.lc)
-        # 정합화가 실패해도 예외 전파 없음 → 매도 경로 진행 가능
         self.assertEqual(sm.reconcile_unknowns_once(), [])
-        # SELL 은 UNKNOWN 원장과 무관하게 _order 에서 즉시 제출됨(별도 검증됨)
-        # 여기서는 정합화 예외가 후속 흐름을 막지 않음을 확인
-        self.assertTrue(True)
 
     # ── UNKNOWN 은 거래/포지션/손익으로 집계되지 않음 ────────────────
     def test_unknown_record_is_not_a_trade(self):
@@ -264,25 +358,28 @@ class AppJobTest(unittest.TestCase):
         with open(self._APP, encoding="utf-8") as f:
             return f.read()
 
-    def _build_job(self):
-        """app.py 의 _kr_unknown_reconcile_job 본문을 그대로 추출·실행 가능하게 만든다."""
+    def _build_ns(self, names):
+        """app.py 의 지정 함수 본문을 '그대로' 추출·실행 가능한 네임스페이스로 만든다.
+
+        운영 코드의 실제 함수 객체를 구동하므로(재구현 아님) 런타임 동작을 검증한다.
+        """
         import ast
-        import textwrap
         src = self._app_src()
         mod = ast.parse(src)
-        fn = next((n for n in mod.body
-                   if isinstance(n, ast.FunctionDef)
-                   and n.name == "_kr_unknown_reconcile_job"), None)
-        self.assertIsNotNone(fn, "app.py 에 _kr_unknown_reconcile_job 없음")
+        fns = [n for n in mod.body
+               if isinstance(n, ast.FunctionDef) and n.name in names]
+        got = {n.name for n in fns}
+        for want in names:
+            self.assertIn(want, got, f"app.py 에 {want} 없음")
         ns = {"threading": threading}
-        # 잡이 참조하는 전역을 테스트 네임스페이스에 주입
         ns["_kr_reconcile_lock"] = threading.Lock()
         ns["_log"] = lambda *a, **k: None
-        exec(compile(ast.Module([fn], []), "<appjob>", "exec"), ns)
+        ns["_strategy_mgr"] = None
+        exec(compile(ast.Module(fns, []), "<appfns>", "exec"), ns)
         return ns
 
     def test_job_nonreentrant_and_isolated(self):
-        ns = self._build_job()
+        ns = self._build_ns(["_kr_unknown_reconcile_job"])
         job = ns["_kr_unknown_reconcile_job"]
         calls = {"n": 0}
 
@@ -325,6 +422,80 @@ class AppJobTest(unittest.TestCase):
         self.assertIn("replace_existing=True", src)
         # 잡 본문이 reconcile_unknowns_once 를 실제 호출
         self.assertIn("reconcile_unknowns_once()", src)
+        # 등록은 공용 함수 한 곳으로 통합(양쪽 진입점이 동일 함수 호출)
+        self.assertIn("_register_kr_reconcile_job(_scheduler)", src)
+        self.assertEqual(src.count("_register_kr_reconcile_job(_scheduler)"), 2)
+
+    def test_registration_is_single_per_process_runtime(self):
+        """런타임: 두 진입점이 같은 _scheduler 에 등록해도 잡은 정확히 1개.
+
+        _auto_start_bot()/bot_start() 는 동일 모듈전역 _scheduler 를 공유하고
+        'not _scheduler.running' 가드로 실제 add_job 은 1회만 수행된다. 여기서는
+        더 강하게, 실제 _register_kr_reconcile_job 을 2회 호출(양쪽 경로 모사)해도
+        id+replace_existing 로 잡이 1개만 남음을 APScheduler add_job 시맨틱을 그대로
+        구현한 스케줄러 대역으로 증명한다(apscheduler 미설치 환경).
+        """
+        class _FakeScheduler:
+            """APScheduler add_job 의 id+replace_existing 시맨틱만 충실히 구현."""
+            def __init__(self):
+                self.jobs = {}   # id → job spec
+                self.running = False
+
+            def add_job(self, func, trigger=None, id=None, replace_existing=False,
+                        **kw):
+                if id in self.jobs and not replace_existing:
+                    raise RuntimeError(f"conflicting id {id!r}")
+                self.jobs[id] = {"func": func, "trigger": trigger, **kw}
+
+            def get_jobs(self):
+                class _J:
+                    def __init__(self, jid):
+                        self.id = jid
+                return [_J(k) for k in self.jobs]
+
+        ns = self._build_ns(["_kr_unknown_reconcile_job",
+                             "_register_kr_reconcile_job"])
+        reg = ns["_register_kr_reconcile_job"]
+        sched = _FakeScheduler()
+        reg(sched)      # _auto_start_bot 경로
+        reg(sched)      # bot_start 경로(중복 시도) — 예외 없이 대체
+        jobs = [j for j in sched.get_jobs() if j.id == "kr_unknown_reconcile"]
+        self.assertEqual(len(jobs), 1, "정합화 잡이 1개가 아님(중복 등록)")
+        # interval 25초로 등록됐는지 확인(실제 함수가 전달한 인자)
+        self.assertEqual(sched.jobs["kr_unknown_reconcile"]["trigger"], "interval")
+        self.assertEqual(sched.jobs["kr_unknown_reconcile"]["seconds"], 25)
+        self.assertIs(sched.jobs["kr_unknown_reconcile"]["func"],
+                      ns["_kr_unknown_reconcile_job"])
+
+    def test_concurrent_invocations_run_at_most_one_body(self):
+        """런타임: 잡을 다중 스레드로 동시에 호출해도 본문 동시 실행은 최대 1개.
+
+        비재진입 _kr_reconcile_lock 이 실제로 동시 실행을 직렬화함을 증명한다."""
+        import time
+        ns = self._build_ns(["_kr_unknown_reconcile_job"])
+        job = ns["_kr_unknown_reconcile_job"]
+        state = {"inside": 0, "max": 0, "runs": 0}
+        guard = threading.Lock()
+
+        class _SM:
+            def reconcile_unknowns_once(self_inner):
+                with guard:
+                    state["inside"] += 1
+                    state["runs"] += 1
+                    state["max"] = max(state["max"], state["inside"])
+                time.sleep(0.02)             # 겹침 창 확대
+                with guard:
+                    state["inside"] -= 1
+                return []
+        ns["_strategy_mgr"] = _SM()
+        threads = [threading.Thread(target=job) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # 동시 실행 본문은 최대 1개(비재진입). 나머지는 즉시 스킵.
+        self.assertEqual(state["max"], 1, "본문 동시 실행이 1을 초과(직렬화 실패)")
+        self.assertGreaterEqual(state["runs"], 1)   # 최소 1회는 실제 실행
 
 
 if __name__ == "__main__":

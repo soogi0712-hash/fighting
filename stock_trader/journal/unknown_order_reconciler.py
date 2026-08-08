@@ -1,12 +1,16 @@
 """UNKNOWN 주문 정합화(reconciliation).
 
-PENDING UNKNOWN 을 KIS 당일 주문/체결 조회 후보와 대조해 해소한다.
-단순 시간경과로 자동해제하지 않는다. 안전 원칙:
-  - 주문 발견(ODNO) → pending 승격 성공 시에만 RESOLVED_ACCEPTED(차단 해제)
+UNKNOWN(PENDING/UNKNOWN_NOT_FOUND) 을 KIS 당일 주문/체결 조회 후보와 대조한다.
+단순 시간경과·조회횟수·장마감·날짜변경으로 자동해제하지 않는다. 안전 원칙:
+  - 주문 발견(ODNO, 고유) → pending 승격 성공 시에만 RESOLVED_ACCEPTED(차단 해제)
   - 체결 발견 → 체결 부킹 성공 시에만 RESOLVED_FILLED(차단 해제)
-  - 명확한 미접수(성공 조회 & 동일조건 주문 0건) → RESOLVED_NOT_ACCEPTED
-  - 동일조건 후보 다수 → 식별 불가 → MANUAL_REVIEW(계속 차단)
-  - 조회 실패/승격·부킹 실패 → 계속 차단(PENDING/MANUAL_REVIEW)
+  - 동일조건 후보 0건 → UNKNOWN_NOT_FOUND 로 '계속 차단'(자동 미접수 확정 금지).
+      후보 0건 반복은 명확한 미접수 증거가 아니다(조회지연·조회범위·일자경계로
+      실제 접수 주문이 늦게 나타날 수 있음). 이후 후보가 나타나면 승격·부킹으로 해소.
+  - 동일조건 후보 다수 → 식별 불가 → AMBIGUOUS_MATCH(계속 차단)
+  - 조회 실패/승격·부킹 실패 → 계속 차단(유지/MANUAL_REVIEW)
+자동 미접수 해제 경로는 제공하지 않는다. 미접수 확정 해제는 운영자 수동
+(ledger.release_unknown, 사유 필수) 또는 KIS 명시적 거절증거 경로에서만 허용한다.
 
 candidate_provider(row) 반환:
   {"query_ok": bool,
@@ -16,6 +20,11 @@ on_promote(row, cand) / on_fill(row, cand): True 반환 시에만 해소(차단 
 없으면(None) 승격·부킹 미확인으로 보고 MANUAL_REVIEW 로 남겨 계속 차단한다.
 """
 from __future__ import annotations
+
+try:
+    from journal.unknown_order_ledger import RECHECK_STATUSES
+except Exception:   # pragma: no cover - 임포트 폴백
+    RECHECK_STATUSES = ("PENDING", "UNKNOWN_NOT_FOUND")
 
 
 def _match(cand, row):
@@ -27,17 +36,17 @@ def _match(cand, row):
 
 
 def reconcile_unknown_orders(ledger, candidate_provider,
-                             on_promote=None, on_fill=None, now_iso="",
-                             release_after_zero_streak=3):
-    """PENDING UNKNOWN 을 정합화한다. 처리결과 [(id, outcome), ...] 반환.
+                             on_promote=None, on_fill=None, now_iso=""):
+    """UNKNOWN(재점검 상태) 을 정합화한다. 처리결과 [(id, outcome), ...] 반환.
 
-    release_after_zero_streak: 동일조건 주문 0건이 '연속 N회' 확인돼야 미접수로
-      확정(RESOLVED_NOT_ACCEPTED)한다. 1회 0건은 조회지연일 수 있어 유지한다.
+    시간경과·조회횟수 기반 자동 미접수 해제는 하지 않는다. 후보 0건은
+    UNKNOWN_NOT_FOUND 로 계속 차단하며, 후보가 나타날 때만 승격·부킹으로 해소한다.
+    AMBIGUOUS_MATCH·MANUAL_REVIEW 는 수동확인 전용이라 자동 변경하지 않는다.
     """
     results = []
     for row in ledger.list_active():
-        if row.get("status") != "PENDING":
-            continue    # AMBIGUOUS_MATCH·MANUAL_REVIEW 는 자동 변경 안 함(수동확인)
+        if row.get("status") not in RECHECK_STATUSES:
+            continue    # AMBIGUOUS_MATCH·MANUAL_REVIEW·RESOLVED_* 는 자동 변경 안 함
         rid = row["id"]
         try:
             q = candidate_provider(row) or {}
@@ -53,20 +62,14 @@ def reconcile_unknown_orders(ledger, candidate_provider,
         cands = [c for c in (q.get("candidates") or []) if _match(c, row)]
 
         if len(cands) == 0:
-            # 성공 조회지만 동일조건 주문 0건. 단발 0건은 조회지연일 수 있어
-            # 즉시 해제하지 않고, 연속 N회 0건일 때만 미접수로 확정한다.
+            # 성공 조회지만 동일조건 주문 0건 → UNKNOWN_NOT_FOUND 로 '계속 차단'.
+            # 자동 미접수 확정 금지. streak 는 진단·이력용으로만 증가시킨다.
             streak = int(row.get("not_found_streak", 0) or 0) + 1
-            if streak >= int(release_after_zero_streak):
-                ledger.resolve(rid, "RESOLVED_NOT_ACCEPTED",
-                               note=f"동일조건 주문 연속 {streak}회 0건 → 미접수 확정",
-                               ts=now_iso)
-                results.append((rid, "RESOLVED_NOT_ACCEPTED"))
-            else:
-                ledger.bump_not_found(
-                    rid, streak,
-                    note=f"동일조건 0건(연속 {streak}회, 조회지연 가능 → 유지)",
-                    ts=now_iso)
-                results.append((rid, "KEEP_PENDING_ZERO_STREAK"))
+            ledger.mark_not_found(
+                rid, streak,
+                note=f"동일조건 0건(누적 {streak}회) → UNKNOWN 유지(자동해제 금지)",
+                ts=now_iso)
+            results.append((rid, "UNKNOWN_NOT_FOUND"))
             continue
 
         if len(cands) > 1:
