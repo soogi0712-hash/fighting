@@ -332,6 +332,27 @@ def _init_api() -> bool:
         return False
 
 
+def _build_kr_scan_list(watch_list, positions):
+    """관심목록 + (관심목록에 없는) 실제 보유 포지션을 합친 스캔 리스트를 만든다.
+
+    보유(피라미딩) 포지션은 관심목록 편입 여부와 무관하게 매 스캔 매도판정 대상에
+    반드시 포함된다(SELL 보호). BUY 후보 조건과 독립적으로 run() 경로에 진입한다.
+
+    반환: (scan_list, held_only_codes)
+      scan_list       : [{"code","name",...}, ...]  (watch_list 뒤에 held-only append)
+      held_only_codes : 관심목록에 없던 보유 종목코드 리스트
+    """
+    scan = list(watch_list or [])
+    wl_codes = {s.get("code") for s in scan}
+    held_only = []
+    for code, pos in list((positions or {}).items()):
+        if code and code not in wl_codes:
+            scan.append({"code": code, "name": getattr(pos, "name", code),
+                         "_held_sell_scan": True})
+            held_only.append(code)
+    return scan, held_only
+
+
 def _sync_positions_from_balance():
     """실제 KIS 잔고 ↔ 내부 피라미딩 포지션의 '존재/수량/평단'만 정합화 (P0-3).
 
@@ -366,6 +387,8 @@ def _sync_positions_from_balance():
         return
 
     # 2) 브로커 보유맵 구성
+    #   ★ cur_price(prpr)는 이미 get_balance 응답에 포함 → 종목별 추가 조회 없이
+    #     복원 시 초기 고가(max(평단,현재가)) 설정에 재사용(TPS 미증가).
     broker = {}
     for h in balance.get("holdings", []):
         code = h.get("code", "")
@@ -375,6 +398,7 @@ def _sync_positions_from_balance():
             "qty":       int(h.get("qty", 0) or 0),
             "avg_price": float(h.get("avg_price", 0) or 0),
             "name":      h.get("name", code),
+            "cur_price": float(h.get("cur_price", 0) or 0),
         }
 
     # 3) ACTIVE 주문 코드(보호 대상) 확보
@@ -721,7 +745,26 @@ def _trading_loop_impl():
     if _loop_cash == 0:
         _log("⚠️ 잔고 0원 확인됨 — 매수는 SKIP됩니다", "warning")
 
-    for stock in list(_watch_list):
+    # ══════════════════════════════════════════════════════════
+    # ★ [보유종목 매도 루프] 배선 — 관심목록에 없더라도 실제 보유(피라미딩)
+    #   포지션은 매 스캔마다 반드시 매도판정을 수행한다. (US 의 held→watchlist
+    #   강제편입과 동일 목적의 KR 판) SELL 은 신규매수 조건과 무관하게 실행된다.
+    #   → 복원된 보유종목이 run() 경로(현재가·고가 갱신 → pyramid.evaluate →
+    #     [익절판정] → decide_sell 오버레이 → 필요 시 api.sell)에 실제 진입.
+    _scan_list = list(_watch_list)
+    try:
+        if _strategy_mgr is not None:
+            _scan_list, _held_only = _build_kr_scan_list(
+                _watch_list, _strategy_mgr.pyramid.positions)
+            if _held_only:
+                _log(
+                    f"🛡️ [보유종목 매도 루프] 관심목록 외 보유 {len(_held_only)}종목 "
+                    f"매도판정 포함: {_held_only}", "info")
+    except Exception as _hle:
+        _scan_list = list(_watch_list)
+        _log(f"⚠️ [보유종목 매도 루프] 구성 오류(관심목록만 스캔): {_hle}", "warning")
+
+    for stock in _scan_list:
         try:
             code       = stock["code"]
             name       = stock["name"]
@@ -2275,13 +2318,15 @@ def _watchdog():
                          f"인데 HOLD 중 → 즉시 전량 매도 실행")
             viol_type = "W2_TRAILING"
 
-        # W3: 시간청산 미실행
-        elif elapsed_min >= TIME_EXIT_40_MIN and net_pct < TIME_EXIT_40_PCT:
+        # W3: 시간청산 미실행 (★ recovered 포지션은 실제 매수시각 불명 → 시간청산 제외)
+        elif (not getattr(pos, "recovered", False)
+              and elapsed_min >= TIME_EXIT_40_MIN and net_pct < TIME_EXIT_40_PCT):
             violation = (f"시간청산조건충족({elapsed_min:.0f}분≥{TIME_EXIT_40_MIN}분, "
                          f"실질{net_pct:+.2f}%<+{TIME_EXIT_40_PCT}%) 인데 HOLD 중 "
                          f"→ 즉시 전량 매도 실행")
             viol_type = "W3_TIME"
-        elif elapsed_min >= TIME_EXIT_20_MIN and net_pct < TIME_EXIT_20_PCT:
+        elif (not getattr(pos, "recovered", False)
+              and elapsed_min >= TIME_EXIT_20_MIN and net_pct < TIME_EXIT_20_PCT):
             violation = (f"시간청산조건충족({elapsed_min:.0f}분≥{TIME_EXIT_20_MIN}분, "
                          f"실질{net_pct:+.2f}%<+{TIME_EXIT_20_PCT}%) 인데 HOLD 중 "
                          f"→ 즉시 전량 매도 실행")

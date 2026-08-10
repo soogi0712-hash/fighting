@@ -144,25 +144,45 @@ class PyramidStrategyManager:
         logger.info(f"💰 복리풀 잔액: {self.compound_pool:,.0f}원")
 
     def _save(self):
-        json.dump({k: v.to_dict() for k, v in self.positions.items()},
-                  open(PYRAMID_FILE, "w"), ensure_ascii=False, indent=2)
-        json.dump({"pool": self.compound_pool,
-                   "updated": datetime.now().isoformat()},
-                  open(COMPOUND_FILE, "w"), ensure_ascii=False, indent=2)
+        # ★ 원자적 저장: 임시파일에 쓰고 os.replace 로 교체(부분쓰기·크래시 손상 방지).
+        self._atomic_write_json(
+            PYRAMID_FILE,
+            {k: v.to_dict() for k, v in self.positions.items()})
+        self._atomic_write_json(
+            COMPOUND_FILE,
+            {"pool": self.compound_pool,
+             "updated": datetime.now().isoformat()})
+
+    @staticmethod
+    def _atomic_write_json(path, obj):
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
 
     # ── P0-3: KIS 잔고 기준 구조적 정합화 (회계 무개입) ──────────
     def _build_reconciled_position(self, code: str, name: str,
-                                   qty: int, avg: float):
+                                   qty: int, avg: float, cur_price: float = 0.0):
         """apply_buy 를 거치지 않고 '누락 종목'을 구조적으로만 복원한다.
 
         ★ 회계 무개입: 손익/compound/쿨다운/재진입 미개입.
         ★ 이력이 없으므로 1단계(level=1)로만 복원한다(과거 apply_buy 복원과 동일).
           full_entry_done 마크는 넣지 않는다(존재하지 않던 정보를 조작하지 않음).
+        ★ recovered=True: 실제 매수시각·이력 불명 → 시간청산 미적용(evaluate 에서 처리).
+        ★ highest_price = max(평균매입가, 현재가). 현재가 조회 실패(0)면 평균매입가.
+          → 복원 직후 '고점 대비 -1%' 트레일링이 즉시 오작동해 잘못 매도되는 것을 방지.
         """
         pos = PyramidPosition(code, name, avg)
         pos.avg_price     = avg
         pos.total_qty     = qty
         pos.current_level = 1
+        pos.recovered     = True
+        # 초기 고가: 현재가가 평균가보다 높으면 현재가로(이미 상승분 반영), 아니면 평균가.
+        _cur = float(cur_price or 0)
+        pos.highest_price = max(avg, _cur) if _cur > 0 else avg
+        pos.lowest_price  = min(avg, _cur) if _cur > 0 else avg
         pos.level_entries = {
             1: {
                 "price":      avg,
@@ -231,8 +251,13 @@ class PyramidStrategyManager:
             except (TypeError, ValueError):
                 continue
             if q > 0 and a > 0:
+                try:
+                    _cp = float((h or {}).get("cur_price", 0) or 0)
+                except (TypeError, ValueError):
+                    _cp = 0.0
                 broker[code] = {"qty": q, "avg_price": a,
-                                "name": (h or {}).get("name", code)}
+                                "name": (h or {}).get("name", code),
+                                "cur_price": _cp}
 
         # (A) KIS 보유 종목 기준: 누락 생성 / 수량·평단 교정
         for code, h in broker.items():
@@ -240,12 +265,17 @@ class PyramidStrategyManager:
                 report["protected"].append(code)
                 continue
             q, a, nm = h["qty"], h["avg_price"], h["name"]
+            _cp = h.get("cur_price", 0.0)
             pos = self.positions.get(code)
             if pos is None:
-                self.positions[code] = self._build_reconciled_position(
-                    code, nm, q, a
-                )
+                _newpos = self._build_reconciled_position(code, nm, q, a, _cp)
+                self.positions[code] = _newpos
                 report["added"].append(f"{nm}({code}) {q}주 @{a:,.0f}원")
+                # ★ 복원 사실을 명시 로그로 남긴다(코드·수량·평단·초기고가).
+                logger.info(
+                    "[KR포지션복원] %s(%s) 수량=%d 평단=%.0f 현재가=%.0f "
+                    "초기고가=%.0f recovered=True(시간청산 미적용)",
+                    nm, code, q, a, _cp, _newpos.highest_price)
             else:
                 need_qty = pos.total_qty != q
                 need_avg = (pos.avg_price <= 0 or
@@ -522,8 +552,17 @@ class PyramidStrategyManager:
             )
 
         # ── ⑦ 시간 청산 (20분 / 40분) ──────────────────────
+        # ★ recovered(복원) 포지션은 실제 매수시각을 알 수 없으므로 시간청산을
+        #   적용하지 않는다(복원 시각을 매수시각으로 오인한 잘못된 청산 방지).
+        #   가격기반 익절·트레일링·손절(①~⑥,⑧)은 위에서 이미 정상 적용된다.
+        if getattr(pos, "recovered", False):
+            logger.info(
+                "[익절판정] 종목=%s(%s) | recovered 포지션 → 시간청산 미적용"
+                "(가격기반 익절·트레일링·손절만 적용) | net_pct=%+.3f%%",
+                name, code, net_pct)
         # 20분 경과 후 실질 수익률 +0.5% 미달이면 청산
-        if elapsed_min >= TIME_EXIT_20_MIN and net_pct < TIME_EXIT_20_PCT:
+        if (not getattr(pos, "recovered", False)
+                and elapsed_min >= TIME_EXIT_20_MIN and net_pct < TIME_EXIT_20_PCT):
             sp = calc_sell_proceeds(cur_price, pos.total_qty)
             cost_basis = pos.avg_price * pos.total_qty
             net_profit = sp.net_proceeds - cost_basis
@@ -534,7 +573,8 @@ class PyramidStrategyManager:
             )
 
         # 40분 경과 후 실질 수익률 +1.0% 미달이면 청산
-        if elapsed_min >= TIME_EXIT_40_MIN and net_pct < TIME_EXIT_40_PCT:
+        if (not getattr(pos, "recovered", False)
+                and elapsed_min >= TIME_EXIT_40_MIN and net_pct < TIME_EXIT_40_PCT):
             sp = calc_sell_proceeds(cur_price, pos.total_qty)
             cost_basis = pos.avg_price * pos.total_qty
             net_profit = sp.net_proceeds - cost_basis
@@ -920,6 +960,10 @@ class PyramidPosition:
         self.created_at    = datetime.now().isoformat()
         # ★ trade_id: 거래 저널 연결용 (재시작 후에도 매수·매도 연결 유지)
         self.trade_id: str = ""           # journal.make_trade_id()로 설정
+        # ★ recovered: KIS 잔고에서 구조 복원된 포지션(실제 매수시각·이력 불명).
+        #   created_at 을 실제 매수시각으로 신뢰할 수 없으므로 '시간청산'을 적용하지
+        #   않는다(가격기반 익절·트레일링·손절은 정상 적용). 체결 부킹과 무관(무개입).
+        self.recovered     = False
 
     def add_level(self, level: int, qty: int, price: float,
                   total_cost: float = None):
@@ -987,6 +1031,7 @@ class PyramidPosition:
             "levels":        self.level_entries,
             "created_at":    self.created_at,
             "trade_id":      self.trade_id,
+            "recovered":     self.recovered,
         }
 
     def to_dict(self) -> dict:
@@ -1002,6 +1047,7 @@ class PyramidPosition:
             "level_entries": self.level_entries,
             "created_at":    self.created_at,
             "trade_id":      self.trade_id,
+            "recovered":     self.recovered,
         }
 
     @classmethod
@@ -1017,4 +1063,6 @@ class PyramidPosition:
         obj.created_at    = d.get("created_at", datetime.now().isoformat())
         # ★ 하위 호환: 기존 저장 데이터에 trade_id 없어도 정상 로드
         obj.trade_id      = d.get("trade_id", "")
+        # ★ 하위 호환: recovered 없으면 False
+        obj.recovered     = bool(d.get("recovered", False))
         return obj
