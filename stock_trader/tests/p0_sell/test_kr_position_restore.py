@@ -164,13 +164,13 @@ class RestoreTest(unittest.TestCase):
         self.assertEqual(d["action"], "SELL_ALL")
         self.assertIn("트레일링", d["reason"])
 
-    def test_full_profit_immediate_regardless_of_buy_score(self):
-        """+2.0% → 즉시 전량익절(SELL_ALL). buy_score/indicator 조건과 무관."""
+    def test_no_fixed_take_profit_holds_at_peak(self):
+        """고정 익절 폐지: +2.2%라도 고점 유지 중이면 HOLD(전량 트레일링만)."""
         self._restore_one(avg=70000, cur=70000)
-        cur = price_for_net_pct_from_cost(70000, 2.2)   # 실질 +2.2%
+        cur = price_for_net_pct_from_cost(70000, 2.2)   # 실질 +2.2% (신고가)
         d = self.mgr.evaluate("005930", "삼성전자", cur, 0, 0.0,
                               today_high=cur, buy_score_norm=0.0, sell_score=0)
-        self.assertEqual(d["action"], "SELL_ALL")
+        self.assertNotIn(d["action"], ("SELL_ALL", "SELL_PARTIAL"))
         self.assertGreaterEqual(net_profit_pct_from_cost(70000, cur), 2.0)
 
     def test_recovered_skips_time_exit(self):

@@ -2184,13 +2184,14 @@ def _watchdog():
     매 루프 말미에서 호출되는 자율운영 감시자.
 
     감지 항목:
-      W1. 익절 조건 충족인데 HOLD 중인 포지션
-      W2. 손절 조건 충족인데 HOLD 중인 포지션
-      W3. 시간청산 조건 충족인데 HOLD 중인 포지션
-      W4. KIS 실제 잔고 ≠ 내부 포지션 (수량 불일치)
-      W5. SELL_FAIL 재시도 큐 항목이 3분 이상 미처리
+      W2.  손절(-5%) 조건 충족인데 HOLD 중인 포지션
+      W2b. 트레일링(고점대비 -1.0%) 조건 충족인데 HOLD 중인 포지션
+      W3.  시간청산 조건 충족인데 HOLD 중인 정상 포지션(recovered 제외)
+      W4.  KIS 실제 잔고 ≠ 내부 포지션 (수량 불일치)
+      W5.  SELL_FAIL 재시도 큐 항목이 3분 이상 미처리
 
-    W1~W3 감지 시: ERROR 로그 출력 + 즉시 강제 매도 실행
+    ★ [폐지] W1 고정익절(+2.0/+2.5%) 백스톱 제거 — 수익 매도는 전량 트레일링 단일화.
+    W2~W3 감지 시: ERROR 로그 출력 + 즉시 강제 매도 실행
     W4 감지 시   : ERROR 로그 출력 + 내부 포지션 자동 제거 (KIS 기준 우선)
     W5 감지 시   : CRITICAL 로그 출력 + 알림
     """
@@ -2200,7 +2201,6 @@ def _watchdog():
     from screener.transaction_cost import net_profit_pct_from_cost
     from strategies.pyramid_strategy import (
         STOP_LOSS_PCT, TRAILING_STOP_PCT, TRAILING_ACTIVATE_PCT,
-        PROFIT_FULL_PCT, PROFIT_SUPER_PCT,
         TIME_EXIT_20_MIN, TIME_EXIT_20_PCT,
         TIME_EXIT_40_MIN, TIME_EXIT_40_PCT,
         price_for_net_pct_from_cost,
@@ -2296,18 +2296,12 @@ def _watchdog():
         violation  = None
         viol_type  = None
 
-        # W1: 익절 미실행
-        if net_pct >= PROFIT_SUPER_PCT:
-            violation = (f"익절조건충족({net_pct:+.2f}%≥+{PROFIT_SUPER_PCT}%) 인데 HOLD 중 "
-                         f"→ 즉시 전량 매도 실행")
-            viol_type = "W1_PROFIT"
-        elif net_pct >= PROFIT_FULL_PCT:
-            violation = (f"익절조건충족({net_pct:+.2f}%≥+{PROFIT_FULL_PCT}%) 인데 HOLD 중 "
-                         f"→ 즉시 전량 매도 실행")
-            viol_type = "W1_PROFIT"
+        # ★ [폐지] W1 고정익절 백스톱 제거 — 국내 수익 매도는 '전량 트레일링' 단일화.
+        #   +2.0%/+2.5% 고정 익절 강제매도는 트레일링 정책을 우회하므로 삭제한다.
+        #   수익 구간 매도는 아래 W2b(트레일링) 백스톱만 담당한다.
 
         # W2: 손절 미실행
-        elif net_pct <= STOP_LOSS_PCT:
+        if net_pct <= STOP_LOSS_PCT:
             violation = (f"손절조건충족({net_pct:+.2f}%≤{STOP_LOSS_PCT}%) 인데 HOLD 중 "
                          f"→ 즉시 전량 매도 실행")
             viol_type = "W2_STOPLOSS"

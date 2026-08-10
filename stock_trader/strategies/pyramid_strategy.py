@@ -15,13 +15,14 @@
   - 쿨다운       : 매도 후 15분 이내 동일 종목 재진입 금지
   - 연속 손실    : 동일 종목 당일 2회 연속 손실 시 당일 재진입 금지
 
-★ 청산 규칙 ★
-  - 전량 익절    : 실질 수익률 ≥ +2.0% 즉시 전량 매도 (예외 없음)
-  - SELL SCORE   : sell_score ≥ 6 + net_pct ≥ 1.0% → 수익 반납 방지 즉시 매도
-  - 시간 청산    : 20분 내 +0.5% 미달 청산 / 40분 내 +1.0% 미달 청산
-  - KRW 금액익절 : 미실현이익 ≥ 3만원 전량익절 / ≥ 1만원 부분익절
-  - 트레일링     : +1.5% 달성 후 고점 대비 -1.0% 하락 시 청산
+★ 청산 규칙 ★ (수익 매도 = '전량 트레일링' 단일화)
+  - 전량 트레일링: 최고가가 +1.5% 활성가에 도달 후, 고점 대비 -1.0% 하락 시 전량매도.
+                   활성/도달만으로는 매도하지 않으며, 고점 유지 중에는 계속 HOLD.
+  - 시간 청산    : 20분 내 +0.5% 미달 청산 / 40분 내 +1.0% 미달 청산 (정상 포지션만;
+                   recovered 복원 포지션은 실제 매수시각 불명 → 면제)
   - 최종 안전장치: 실질 수익률 ≤ -5.0% (고정 손절)
+  - [폐지] +2.0%/+2.5% 무조건 전량익절, +1.5%+SELL_SCORE 익절, SELL_SCORE≥6
+           수익반납방지, KRW 1만/3만 금액익절, % 단계 부분익절 폴백 (전면 제거)
 
 ★ 비용 원칙 ★
   - 단일 비용 원천: screener/transaction_cost.py
@@ -69,18 +70,28 @@ PYRAMID_LEVELS = {
 # ★ 모든 % 기준은 실질수익률 기준 (수수료·세금 차감 후)
 STOP_LOSS_PCT            = -5.0   # ★ 최종 안전장치 -5% (손절은 청산 순서 마지막)
 TRAILING_STOP_PCT        = -1.0   # 트레일링 스탑 (고점 대비 -1.0%)
-TRAILING_ACTIVATE_PCT    =  1.5   # 트레일링 활성화 (+1.5% 달성 시)
-PROFIT_SUPER_PCT         =  2.5   # ★ +2.5% 무조건 전량 익절 (최우선)
-PROFIT_FULL_PCT          =  2.0   # ★ +2.0% 전량 익절 (SELL_SCORE 무관)
-PROFIT_TRAIL_PCT         =  1.5   # ★ +1.5% + SELL_SCORE≥4 → 전량 익절
-PARTIAL_PROFIT_PCT       =  2.0   # 단계별 부분 익절 기준 (% 폴백용)
-PARTIAL_SELL_RATIO       =  0.5   # 부분 익절 시 해당 단계 보유 비율
+TRAILING_ACTIVATE_PCT    =  1.5   # 트레일링 활성화 (최고가 +1.5% 도달 시)
 
-# ── KRW 금액 기준 익절 ─────────────────────────────────────────
-PROFIT_PARTIAL_KRW       = 10_000   # 미실현이익 1만원 → 50% 부분익절
-PROFIT_FULL_KRW          = 30_000   # 미실현이익 3만원 → 전량 익절
+# ── [폐지] 고정 익절 파라미터 ──────────────────────────────────
+#   국내 수익 매도정책을 '전량 트레일링' 단일화하면서 아래 고정 익절 분기를
+#   모두 제거했다. 상수는 하위호환(외부 참조·테스트 import)을 위해 남기되
+#   evaluate() 어디에서도 사용하지 않는다(수익 매도 트리거 아님).
+#     - PROFIT_SUPER_PCT / PROFIT_FULL_PCT : +2.5%/+2.0% 무조건 전량익절(폐지)
+#     - PROFIT_TRAIL_PCT + SELL_SCORE      : +1.5%+SCORE 조건부 전량익절(폐지)
+#     - SELL_SCORE_PROTECTION_PCT          : SELL_SCORE≥6 수익반납방지(폐지)
+#     - PROFIT_PARTIAL_KRW / PROFIT_FULL_KRW : KRW 금액 익절(폐지)
+#     - PARTIAL_PROFIT_PCT / PARTIAL_SELL_RATIO : % 단계 부분익절 폴백(폐지)
+_DEPRECATED_FIXED_PROFIT = True   # 문서용 마커(고정 익절 전면 폐지)
+PROFIT_SUPER_PCT         =  2.5   # [폐지] 미사용
+PROFIT_FULL_PCT          =  2.0   # [폐지] 미사용
+PROFIT_TRAIL_PCT         =  1.5   # [폐지] 미사용
+PARTIAL_PROFIT_PCT       =  2.0   # [폐지] 미사용
+PARTIAL_SELL_RATIO       =  0.5   # [폐지] 미사용
+PROFIT_PARTIAL_KRW       = 10_000 # [폐지] 미사용
+PROFIT_FULL_KRW          = 30_000 # [폐지] 미사용
+SELL_SCORE_PROTECTION_PCT = 1.0   # [폐지] 미사용
 
-# ── 시간 청산 파라미터 ─────────────────────────────────────────
+# ── 시간 청산 파라미터 (정상 포지션만; recovered 면제) ──────────
 TIME_EXIT_20_MIN         = 20       # 20분 후 미달 청산 체크
 TIME_EXIT_20_PCT         = 0.5     # 20분 내 +0.5% 미달이면 청산
 TIME_EXIT_40_MIN         = 40       # 40분 후 미달 청산 체크
@@ -89,9 +100,6 @@ TIME_EXIT_40_PCT         = 1.0     # 40분 내 +1.0% 미달이면 청산
 # ── 쿨다운 / 연속 손실 ────────────────────────────────────────
 COOLDOWN_MIN             = 15       # 매도 후 재진입 쿨다운 (분)
 MAX_DAILY_LOSSES         = 2        # 당일 연속 손실 허용 횟수 (이 이상이면 당일 금지)
-
-# ── SELL SCORE 수익 반납 방지 ─────────────────────────────────
-SELL_SCORE_PROTECTION_PCT = 1.0    # 이 이상 수익 시 SELL SCORE 즉시 매도 적용
 
 # ── Early / Full Entry BUY SCORE 임계 ─────────────────────────
 BUY_SCORE_EARLY          = 0.40   # 0.60 → 0.40 (빠른 선점 전략)
@@ -108,7 +116,7 @@ class PyramidStrategyManager:
     """
     피라미딩 포지션 완전 관리자 — 복리형 초회전 단타 모드
     - Early Entry(30%) / Full Entry(+70%) 분할 진입
-    - +2% 전량 익절 / 시간 청산(20분/40분) / SELL SCORE 수익반납방지
+    - 수익 매도 = 전량 트레일링(+1.5% 활성 / 고점대비 -1.0% 청산) / 시간청산 / -5% 손절
     - 쿨다운 15분 / 연속 손실 2회 → 당일 재진입 금지
     - ★ 모든 수익률·손절·익절 판단은 실질수익률 기준
     """
@@ -407,154 +415,68 @@ class PyramidStrategyManager:
         elapsed_min = (now - created_at).total_seconds() / 60
 
         # ══════════════════════════════════════════════════════
-        # [익절판정] 로그 — 포지션 보유 시 매 루프 항상 출력
+        # 국내 수익 매도정책 = '전량 트레일링' (고정 익절 전면 폐지)
+        #   • 최고가가 +1.5% 활성가에 도달하면 트레일링 활성화
+        #   • 활성화 후에도 최고가는 계속 갱신(위 update_high 반영)
+        #   • 현재가가 최고가 대비 -1.0% 하락하면 '전량매도'
+        #   ★ 제거됨: +2.5%/+2.0% 무조건 전량익절, +1.5%+SELL_SCORE 익절,
+        #     SELL_SCORE≥6 수익반납방지, KRW 1만/3만 금액익절, % 단계 부분익절.
+        #   → 수익 구간의 유일한 매도 트리거는 '최고가 대비 -1.0%'. 도달 즉시
+        #     매도하지 않으며, 고점 유지 중에는 +2%/+5%/+10%이라도 계속 HOLD.
+        #   (손절·하드손절·시간청산·안전망은 아래 ②③ 및 상위 오버레이에서 유지)
         # ══════════════════════════════════════════════════════
-        # 익절 기준 판별
-        if net_pct >= PROFIT_SUPER_PCT:
-            _profit_basis = f"+{PROFIT_SUPER_PCT}%무조건전량"
-        elif net_pct >= PROFIT_FULL_PCT:
-            _profit_basis = f"+{PROFIT_FULL_PCT}%전량"
-        elif net_pct >= PROFIT_TRAIL_PCT:
-            _profit_basis = f"+{PROFIT_TRAIL_PCT}%+SELL_SCORE≥4조건부전량(현재SELL_SCORE={sell_score})"
-        else:
-            _profit_basis = f"익절기준미달(최소+{PROFIT_TRAIL_PCT}%필요)"
+        activate_trigger = price_for_net_pct_from_cost(
+            pos.avg_price, TRAILING_ACTIVATE_PCT)
+        trailing_active = pos.highest_price >= activate_trigger
+        trail_pct = ((cur_price - pos.highest_price) / pos.highest_price * 100
+                     if pos.highest_price > 0 else 0.0)
 
+        # [익절판정] 로그 — 포지션 보유 시 매 루프 항상 출력(트레일링 상태 기준)
+        if not trailing_active:
+            _profit_basis = (f"트레일링비활성(최고 net<+{TRAILING_ACTIVATE_PCT}%, "
+                             f"활성가≥{activate_trigger:,.0f})")
+        elif trail_pct <= TRAILING_STOP_PCT:
+            _profit_basis = (f"트레일링청산(고점대비{trail_pct:+.2f}% ≤ "
+                             f"{TRAILING_STOP_PCT}%)")
+        else:
+            _profit_basis = (f"트레일링활성·유지(고점대비{trail_pct:+.2f}% > "
+                             f"{TRAILING_STOP_PCT}%)")
         logger.info(
             f"[익절판정] 종목={name}({code}) | "
             f"매수가={pos.avg_price:,.0f} | 현재가={cur_price:,.0f} | "
+            f"최고가={pos.highest_price:,.0f} | "
             f"gross_pct={gross_pct:+.3f}% | fee_pct={fee_pct:.3f}% | "
-            f"net_pct={net_pct:+.3f}% | 익절기준={_profit_basis} | "
+            f"net_pct={net_pct:+.3f}% | 트레일링={_profit_basis} | "
             f"SELL_SCORE={sell_score} | 경과={elapsed_min:.0f}분"
         )
 
         # ══════════════════════════════════════════════════════
-        # 청산 우선순위: ①+2.5% → ②+2.0% → ③+1.5%+SCORE≥4
-        #               → ④SCORE≥6 → ⑤KRW → ⑥트레일링
-        #               → ⑦시간청산 → ⑧손절(최후)
+        # 청산 우선순위: ①전량트레일링 → ②시간청산 → ③손절(최후)
         # ══════════════════════════════════════════════════════
 
-        # ── ① +2.5% 무조건 전량 익절 (최우선, 예외 없음) ─────
-        if net_pct >= PROFIT_SUPER_PCT:
+        # ── ① 전량 트레일링 청산 (수익 구간 유일 매도 경로) ────
+        #   최고가가 +1.5% 활성가 이상에 도달했고, 현재가가 최고가 대비
+        #   -1.0% 이하로 하락하면 전량매도. 활성/도달만으로는 매도 안 함.
+        if trailing_active and trail_pct <= TRAILING_STOP_PCT:
             sp = calc_sell_proceeds(cur_price, pos.total_qty)
             cost_basis = pos.avg_price * pos.total_qty
             net_profit = sp.net_proceeds - cost_basis
             logger.info(
                 f"[익절판정] 종목={name}({code}) | net_pct={net_pct:+.3f}% | "
-                f"익절기준=+{PROFIT_SUPER_PCT}%무조건전량 | 결과=SELL_ALL"
+                f"트레일링청산(고점대비{trail_pct:+.2f}% ≤ {TRAILING_STOP_PCT}%) | "
+                f"결과=SELL_ALL"
             )
             return self._sell_result(
                 "SELL_ALL", code, name, cur_price, pos, net_pct, sp, net_profit,
-                reason=f"✅+2.5%무조건전량익절(실질{net_pct:.2f}% ≥ {PROFIT_SUPER_PCT}%)"
+                reason=(f"🔔전량트레일링(고점대비{trail_pct:.2f}% ≤ "
+                        f"{TRAILING_STOP_PCT}%, 실질{net_pct:.2f}%, "
+                        f"활성+{TRAILING_ACTIVATE_PCT}%)")
             )
 
-        # ── ② +2.0% 전량 익절 (SELL_SCORE 무관, 예외 없음) ───
-        if net_pct >= PROFIT_FULL_PCT:
-            sp = calc_sell_proceeds(cur_price, pos.total_qty)
-            cost_basis = pos.avg_price * pos.total_qty
-            net_profit = sp.net_proceeds - cost_basis
-            logger.info(
-                f"[익절판정] 종목={name}({code}) | net_pct={net_pct:+.3f}% | "
-                f"익절기준=+{PROFIT_FULL_PCT}%전량 | 결과=SELL_ALL"
-            )
-            return self._sell_result(
-                "SELL_ALL", code, name, cur_price, pos, net_pct, sp, net_profit,
-                reason=f"✅+2.0%전량익절(실질{net_pct:.2f}% ≥ {PROFIT_FULL_PCT}%)"
-            )
-
-        # ── ③ +1.5% + SELL_SCORE≥4 → 전량 익절 ──────────────
-        if net_pct >= PROFIT_TRAIL_PCT and sell_score >= 4:
-            sp = calc_sell_proceeds(cur_price, pos.total_qty)
-            cost_basis = pos.avg_price * pos.total_qty
-            net_profit = sp.net_proceeds - cost_basis
-            logger.info(
-                f"[익절판정] 종목={name}({code}) | net_pct={net_pct:+.3f}% | "
-                f"익절기준=+{PROFIT_TRAIL_PCT}%+SELL_SCORE≥4 | 결과=SELL_ALL"
-            )
-            return self._sell_result(
-                "SELL_ALL", code, name, cur_price, pos, net_pct, sp, net_profit,
-                reason=(f"✅+1.5%익절+SELL_SCORE(실질{net_pct:.2f}%≥"
-                        f"{PROFIT_TRAIL_PCT}%, score={sell_score}≥4)")
-            )
-
-        # HOLD 사유 기록 (익절 미발생 시)
-        if net_pct >= PROFIT_TRAIL_PCT:
-            _hold_reason = f"+1.5%이상이나SELL_SCORE={sell_score}<4(SELL_SCORE≥4필요)"
-        elif net_pct > 0:
-            _hold_reason = f"수익중이나익절기준미달(net={net_pct:+.2f}%, 최소+{PROFIT_TRAIL_PCT}%필요)"
-        else:
-            _hold_reason = f"손실중(net={net_pct:+.2f}%)"
-
-        logger.info(
-            f"[익절판정] 종목={name}({code}) | net_pct={net_pct:+.3f}% | "
-            f"결과=HOLD | HOLD사유={_hold_reason}"
-        )
-
-        # ── ④ SELL SCORE 수익 반납 방지 (net_pct≥1.0% + score≥6) ─
-        if sell_score >= 6 and net_pct >= SELL_SCORE_PROTECTION_PCT:
-            sp = calc_sell_proceeds(cur_price, pos.total_qty)
-            cost_basis = pos.avg_price * pos.total_qty
-            net_profit = sp.net_proceeds - cost_basis
-            return self._sell_result(
-                "SELL_ALL", code, name, cur_price, pos, net_pct, sp, net_profit,
-                reason=(f"🚨SELL SCORE수익반납방지(score={sell_score}≥6, "
-                        f"실질{net_pct:.2f}%≥{SELL_SCORE_PROTECTION_PCT}%)")
-            )
-
-        # ── ⑤ KRW 금액 기준 익절 ─────────────────────────────
-        cur_profit_amt = (cur_price - pos.avg_price) * pos.total_qty  # 근사값
-
-        if cur_profit_amt >= PROFIT_FULL_KRW:
-            sp         = calc_sell_proceeds(cur_price, pos.total_qty)
-            cost_basis = pos.avg_price * pos.total_qty
-            net_profit = sp.net_proceeds - cost_basis
-            return self._sell_result(
-                "SELL_ALL", code, name, cur_price, pos, net_pct, sp, net_profit,
-                reason=(f"💰KRW전량익절 미실현이익"
-                        f"{cur_profit_amt:,.0f}원 ≥ {PROFIT_FULL_KRW:,}원")
-            )
-
-        if cur_profit_amt >= PROFIT_PARTIAL_KRW:
-            sell_qty = max(1, pos.total_qty // 2)
-            sp       = calc_sell_proceeds(cur_price, sell_qty)
-            cost_b   = pos.avg_price * sell_qty
-            net_p    = sp.net_proceeds - cost_b
-            return {
-                "action":   "SELL_PARTIAL",
-                "reason":   (f"💰KRW부분익절(50%) 미실현이익"
-                             f"{cur_profit_amt:,.0f}원 ≥ {PROFIT_PARTIAL_KRW:,}원"),
-                "qty":      sell_qty,
-                "price":    cur_price,
-                "code":     code,
-                "name":     name,
-                "level":    pos.current_level,
-                "net_pct":  round(net_pct, 2),
-                "profit":   round(net_p, 0),
-                "elapsed_min": round(elapsed_min, 1),
-                "sell_commission":  round(sp.commission, 0),
-                "transaction_tax":  round(sp.transaction_tax, 0),
-                "total_fee":        round(sp.commission + sp.transaction_tax, 0),
-            }
-
-        # ── ⑥ 트레일링 스탑 (+1.5% 활성화, -1.0% 하락 시 청산) ─
-        activate_trigger = price_for_net_pct_from_cost(
-            pos.avg_price, TRAILING_ACTIVATE_PCT
-        )
-        trail_pct = (cur_price - pos.highest_price) / pos.highest_price * 100
-        if (pos.highest_price >= activate_trigger and
-                trail_pct <= TRAILING_STOP_PCT):
-            sp = calc_sell_proceeds(cur_price, pos.total_qty)
-            cost_basis = pos.avg_price * pos.total_qty
-            net_profit = sp.net_proceeds - cost_basis
-            return self._sell_result(
-                "SELL_ALL", code, name, cur_price, pos, net_pct, sp, net_profit,
-                reason=(f"🔔트레일링(고점대비{trail_pct:.2f}% ≤ "
-                        f"{TRAILING_STOP_PCT}%, 실질{net_pct:.2f}%)")
-            )
-
-        # ── ⑦ 시간 청산 (20분 / 40분) ──────────────────────
+        # ── ② 시간 청산 (20분 / 40분) — 정상 포지션만 ──────────
         # ★ recovered(복원) 포지션은 실제 매수시각을 알 수 없으므로 시간청산을
         #   적용하지 않는다(복원 시각을 매수시각으로 오인한 잘못된 청산 방지).
-        #   가격기반 익절·트레일링·손절(①~⑥,⑧)은 위에서 이미 정상 적용된다.
+        #   가격기반 트레일링·손절(①,③)은 위/아래에서 정상 적용된다.
         if getattr(pos, "recovered", False):
             logger.info(
                 "[익절판정] 종목=%s(%s) | recovered 포지션 → 시간청산 미적용"
@@ -584,7 +506,7 @@ class PyramidStrategyManager:
                         f"실질{net_pct:.2f}% < +{TIME_EXIT_40_PCT}%)")
             )
 
-        # ── ⑧ 최종 안전장치 손절: -5.0% (우선순위 마지막) ───
+        # ── ③ 최종 안전장치 손절: -5.0% (우선순위 마지막) ───
         if net_pct <= STOP_LOSS_PCT:
             sp = calc_sell_proceeds(cur_price, pos.total_qty)
             cost_basis = pos.avg_price * pos.total_qty
@@ -594,36 +516,10 @@ class PyramidStrategyManager:
                 reason=f"🛑최종손절(실질{net_pct:.2f}% ≤ {STOP_LOSS_PCT}%)"
             )
 
-        # ── ⑨ % 기준 단계별 부분 익절 (폴백) ─────────────────
-        for lvl, entry in pos.level_entries.items():
-            entry_avg_price = entry.get("avg_price", entry["price"])
-            remaining       = entry["remaining"]
-            if remaining <= 0:
-                continue
-            level_net_pct = net_profit_pct_from_cost(entry_avg_price, cur_price)
-            if level_net_pct >= PARTIAL_PROFIT_PCT:
-                sell_qty = max(1, int(remaining * PARTIAL_SELL_RATIO))
-                sp       = calc_sell_proceeds(cur_price, sell_qty)
-                cost_b   = entry_avg_price * sell_qty
-                net_p    = sp.net_proceeds - cost_b
-                return {
-                    "action":        "SELL_PARTIAL",
-                    "reason":        (f"{lvl}단계 부분익절"
-                                      f"(실질{level_net_pct:.2f}% ≥ {PARTIAL_PROFIT_PCT}%)"),
-                    "qty":           sell_qty,
-                    "price":         cur_price,
-                    "code":          code,
-                    "name":          name,
-                    "level":         lvl,
-                    "net_pct":       round(level_net_pct, 2),
-                    "profit":        round(net_p, 0),
-                    "elapsed_min":   round(elapsed_min, 1),
-                    "sell_commission":  round(sp.commission, 0),
-                    "transaction_tax":  round(sp.transaction_tax, 0),
-                    "total_fee":        round(sp.commission + sp.transaction_tax, 0),
-                }
+        # ★ 제거됨: % 단계별 부분익절 폴백(고정 익절 금지 — 수익 매도는 전량
+        #   트레일링만). SELL_PARTIAL 수익매도 경로 없음.
 
-        # ── ⑩ Full Entry (나머지 70%) 진입 검토 ────────────
+        # ── Full Entry (나머지 70%) 진입 검토 (BUY, 매도정책 무관) ──
         # Early Entry(30%)만 체결된 포지션이 있고, BUY SCORE ≥ 0.75이면 추가 진입
         if (pos.current_level == 1 and
                 "full_entry_done" not in pos.level_entries and
