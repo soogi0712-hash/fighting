@@ -1547,10 +1547,11 @@ class StrategyManager:
 
         run() 이 보유 종목 순회 중 pyramid 가 HOLD 로 판단한 포지션에 대해 호출한다.
 
-        ★ 익절(+2%)·수익반납방지(+1%·SELL_SCORE≥6)·시간청산(20/40분)·최종 -5% 손절은
-          pyramid.evaluate() 소관이다. 이 메서드는 decide_sell 안전망을 실제 SELL 로
-          연결한다: 트레일링스탑·MA20 추세이탈·AI점수급락(SCORE_DROP) 및
+        ★ 수익 매도(전량 트레일링 +1.5%활성/고점대비 -1.0%)·시간청산(20/40분)·최종
+          -5% 손절은 pyramid.evaluate() 소관이다. 이 메서드는 decide_sell 안전망을
+          실제 SELL 로 연결한다: 트레일링스탑·MA20 추세이탈·AI점수급락(SCORE_DROP) 및
           하드 손절 티어(긴급 -3.0% / 일반 -1.2%, 보유 5분↑·SELL_SCORE≥7).
+          (고정 %익절·KRW 금액익절·SELL_SCORE 수익매도는 전면 폐지됨)
 
         ★ 매도정책: 손실 구간 조기 청산은 decide_sell 하드손절이 먼저 담당하고
           (긴급 -3.0% 무조건 / 일반 -1.2% + 5분 + SELL_SCORE≥7), pyramid.evaluate()
@@ -1993,35 +1994,15 @@ class StrategyManager:
                     "session": sess["session"],
                 }
 
-        # ── ★ SELL SCORE 수익 반납 방지 강제 매도 ─────────
-        # sell_urgent(≥6) + 포지션 수익 ≥ +1.0% → 즉시 청산
-        if (pos is not None and sell_urgent and
-                net_pct >= 1.0 and action == "HOLD"):
-            action = "SELL_ALL"
-            decision = {
-                "action":  "SELL_ALL",
-                "qty":     pos.total_qty,
-                "price":   cur_price,
-                "code":    code,
-                "name":    name,
-                "level":   pos.current_level,
-                "net_pct": round(net_pct, 2),
-                "reason":  (f"🚨SELL SCORE 수익반납방지(score={sell_score}≥6, "
-                            f"실질{net_pct:.2f}%≥1.0%) — "
-                            + ", ".join(
-                                f"{k}(+{v['weight']})" for k, v in sell_detail.items()
-                                if v.get("triggered")
-                            )),
-            }
-            logger.warning(
-                f"🚨 {name} SELL SCORE 즉시 매도! score={sell_score}, "
-                f"실질{net_pct:.2f}%"
-            )
+        # ── ★ [폐지] SELL SCORE 수익반납방지 강제 매도 제거 ──────
+        # 국내 수익 매도정책을 '전량 트레일링' 단일화하면서, sell_urgent(SELL_SCORE≥6)
+        # + 수익 ≥ +1.0% 즉시청산(고정 익절성 우회 분기)을 제거한다. SELL_SCORE 가
+        # 높아도 고점 대비 -1.0% 하락 전에는 수익 매도하지 않는다(pyramid 트레일링 소관).
 
         # ── ★ 보유 포지션 매도판단 오버레이 (decide_sell 안전망 + 하드손절) ──
         # pyramid 가 HOLD 로 판단한 보유 포지션에 decide_sell 을 적용해
         # 트레일링·MA20 이탈·점수급락·하드손절(-3.0%/-1.2%) 시 SELL_ALL 로 라우팅.
-        # 익절(+2%)·수익반납방지(+1%·SELL_SCORE≥6)·시간청산·최종 -5% 는 pyramid 소관.
+        # 수익 매도(전량 트레일링)·시간청산·최종 -5% 는 pyramid 소관(고정 익절 폐지).
         if pos is not None and action == "HOLD":
             action, decision = self._decide_sell_for_holding(
                 code, name, avg_price, highest_price, total_qty,

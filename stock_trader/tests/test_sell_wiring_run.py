@@ -216,25 +216,28 @@ class RunWiringTest(unittest.TestCase):
         self.assertIsNotNone(lc)
         self.assertEqual(lc.current_state, LifecycleState.ORDER_ACCEPTED)
 
-    # ── 요구사항 3: +2.0% 전량익절이 run() 에서 실제 SELL ──
-    def test_full_take_profit_sells_in_run(self):
-        sm, api = self._mk(cur_net=2.2)
+    # ── 정책변경: 고정 익절 폐지 — +2.2% 고점 유지 중이면 run() 에서도 HOLD ──
+    def test_no_fixed_take_profit_holds_in_run(self):
+        # ma20_mult=0.99(MA20 하단, 이탈 없음) + current_level=4(추가매수 없음)
+        sm, api = self._mk(cur_net=2.2, ma20_mult=0.99)
         seed_position(sm, "005930", "삼성전자", net_pct=2.2, elapsed_min=3)
+        sm.pyramid.positions["005930"].current_level = 4   # 피라미딩 추가 방지
         res = sm.run({"code": "005930", "name": "삼성전자"}, cached_cash=10_000_000)
-        self.assertEqual(res["action"], "SELL", res)
-        self.assertIn("전량익절", res["reason"])
-        self.assertEqual(len(api.sell_calls), 1)
-        self.assertEqual(api.sell_calls[0][1], 100)   # 전량
-        self._assert_pending_lifecycle_path("005930")
+        self.assertEqual(res["action"], "HOLD", res)       # 고정 익절 안 함
+        self.assertEqual(len(api.sell_calls), 0)
 
-    # ── 요구사항 3: +1.0% 이상 & sell_score≥6 → SELL ──
-    def test_profit_plus_sellscore6_sells_in_run(self):
-        sm, api = self._mk(cur_net=1.2, sell_score=6, sell_urgent=True)
+    # ── 정책변경: SELL_SCORE 높아도(sell_urgent) 고점대비 -1% 전에는 고정 매도 안 함 ──
+    def test_high_sellscore_urgent_no_fixed_sell_in_run(self):
+        # sell_urgent=True(SELL_SCORE≥6) + 수익 +1.2% 이지만 고점 유지 →
+        # [폐지된] 수익반납방지 강제매도가 더 이상 실행되지 않아야 한다(HOLD).
+        # ma20 하단·추가매수 방지로 오버레이/피라미딩 개입 배제.
+        sm, api = self._mk(cur_net=1.2, sell_score=6, sell_urgent=True,
+                           ma20_mult=0.99)
         seed_position(sm, "005930", "삼성전자", net_pct=1.2, elapsed_min=3)
+        sm.pyramid.positions["005930"].current_level = 4
         res = sm.run({"code": "005930", "name": "삼성전자"}, cached_cash=10_000_000)
-        self.assertEqual(res["action"], "SELL", res)
-        self.assertEqual(len(api.sell_calls), 1)
-        self._assert_pending_lifecycle_path("005930")
+        self.assertEqual(res["action"], "HOLD", res)
+        self.assertEqual(len(api.sell_calls), 0)
 
     # ── 요구사항 3: MA20 이탈 → decide_sell 안전망이 SELL 라우팅 ──
     def test_ma20_exit_sells_in_run(self):
@@ -270,10 +273,13 @@ class RunWiringTest(unittest.TestCase):
         self.assertEqual(len(api.sell_calls), 1)
         self._assert_pending_lifecycle_path("005930")
 
-    # ── 요구사항 3: 동일 종목 active SELL 존재 → pyramid SELL 이어도 추가 SELL 없음 ──
+    # ── 요구사항 3: 동일 종목 active SELL 존재 → pyramid SELL(트레일링)이어도 추가 SELL 없음 ──
     def test_active_sell_blocks_pyramid_sell(self):
-        sm, api = self._mk(cur_net=2.2)
-        seed_position(sm, "005930", "삼성전자", net_pct=2.2, elapsed_min=3)
+        # 트레일링 청산이 발생하는 시나리오(고점 +2% 후 +0.3%로 하락)에서
+        # in-flight 매도가 있으면 추가 매도하지 않음.
+        sm, api = self._mk(cur_net=0.3)
+        seed_position(sm, "005930", "삼성전자", net_pct=0.3, elapsed_min=3,
+                      highest_net=2.0)
         self.reg.register("KR", "t-existing", "005930", "SELL", 100,
                           "2026-08-04T09:00:00", odno="OD-EXIST")
         res = sm.run({"code": "005930", "name": "삼성전자"}, cached_cash=10_000_000)
