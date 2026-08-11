@@ -60,14 +60,19 @@ _kr_reconcile_lock = threading.Lock()
 #   (P0: 국내 루프가 지연·정지해도 미국 잡은 독립적으로 60초마다 실행돼야 한다)
 _us_trading_loop_lock = threading.Lock()
 # ★ 미국 독립 잡 관찰성(health) — /api/status us_loop_health 로 노출
+#   값은 모두 JSON 직렬화 가능한 원시타입(str/float/int/None)만 담는다.
+#   예외 '원문'은 담지 않는다(예외 클래스명만) — 계좌·API 원문 유출 방지.
+#   스키마 고정(키 동적 추가/삭제 없음) → dict() 스냅샷·필드 재대입이 GIL 하에서 안전.
 _us_loop_health = {
     "last_started_at":  None,   # 최근 진입 ISO 시각
     "last_finished_at": None,   # 최근 완료 ISO 시각
-    "last_result":      None,   # "ok" | "error: ..." | "skip: ..."
+    "last_result":      None,   # "ok" | "error: <ExcType>" | "skip: ..."
     "last_duration_sec": None,  # 최근 본체 실행시간(초)
     "last_skip_reason": None,   # 스킵/미실행 사유(락중복·휴장 등)
     "run_count":        0,      # 본체 실행 누적 횟수
 }
+# ★ US 잡이 스케줄러에 (재)등록된 epoch 시각 — heartbeat 시작 유예 판정용.
+_us_registered_ts = None
 
 
 def _kr_unknown_reconcile_job():
@@ -104,6 +109,26 @@ def _register_kr_reconcile_job(scheduler):
                       id="kr_unknown_reconcile", replace_existing=True)
 
 
+def _scheduler_kwargs():
+    """BackgroundScheduler 생성 인자(명시적 executor·job_defaults).
+
+    ★ P0 기아 방지: 국내 _trading_loop 가 hang 하면 워커 1개를 영구 점유한다.
+      기본 풀(10)보다 넉넉한 20 워커로 고정해, KR hang 1건이 US·session_watcher·
+      UNKNOWN 정합화 잡을 굶기지 않도록 한다(각 잡 max_instances=1 이라 동일 잡의
+      중복 누적도 없음). misfire_grace_time 으로 일시 지연된 실행도 유실 없이 수행.
+    """
+    from apscheduler.executors.pool import ThreadPoolExecutor as _APSPool
+    return {
+        "timezone":    "Asia/Seoul",
+        "executors":   {"default": _APSPool(max_workers=20)},
+        "job_defaults": {
+            "coalesce":           True,   # 밀린 실행은 1회로 합침
+            "max_instances":      1,      # 동일 잡 동시 1개(파일런 누적 방지)
+            "misfire_grace_time": 30,     # 30초 이내 지연은 유실 없이 실행
+        },
+    }
+
+
 def _register_all_scheduled_jobs(scheduler, sess):
     """KR·US 스케줄 잡을 '공용 함수 한 곳'에서 빠짐없이 동일하게 등록한다.
 
@@ -111,7 +136,13 @@ def _register_all_scheduled_jobs(scheduler, sess):
     모든 잡은 고유 id + replace_existing=True 라 두 경로가 연속 호출돼도 잡은 각각
     정확히 1개만 등록된다(중복 없음). ★ 미국 매매 잡(us_trading_loop)은 국내 매매
     잡(trading_loop)과 완전히 독립된 60초 interval 잡으로 등록한다(P0 분리).
+
+    ★ idempotent: 스케줄러가 이미 running 이어도 안전하게 (재)호출 가능하며, 어떤
+      잡(예: us_trading_loop)이 누락된 상태였다면 이 호출로 자동 복구된다.
     """
+    global _us_registered_ts
+    import time as _t
+    _us_registered_ts = _t.time()   # heartbeat 시작-유예 기준(재등록 시각)
     # ── 국내 매매 루프 (interval, 세션별 주기) ──
     scheduler.add_job(_trading_loop, "interval", seconds=sess["check_sec"],
                       id="trading_loop", replace_existing=True)
@@ -142,6 +173,28 @@ def _register_all_scheduled_jobs(scheduler, sess):
                       id="cancel_pending_buys", replace_existing=True)
     # ── UNKNOWN 저빈도 정합화 ──
     _register_kr_reconcile_job(scheduler)
+
+
+def _ensure_scheduler_started(sess):
+    """스케줄러를 생성(없으면)하고 KR·US 잡을 idempotent 하게 (재)등록한 뒤 시작한다.
+
+    ★ P0 결함 수정: 기존 두 진입점은 'if _scheduler is None or not running:' 로
+      등록 블록 '전체'를 감싸, 스케줄러가 이미 running 이면 등록을 통째로 건너뛰었다.
+      그 구조에서는 running 중에 특정 잡(예: us_trading_loop)이 누락돼도 재시작
+      호출로 복구할 수 없었다. 이 함수는 running 여부와 무관하게 항상 등록 함수를
+      호출한다(모든 잡 id+replace_existing → 중복 없이 누락 잡만 복구).
+    반환: 이번 호출에서 스케줄러를 새로 start 했으면 True.
+    """
+    global _scheduler
+    if _scheduler is None:
+        _scheduler = BackgroundScheduler(**_scheduler_kwargs())
+    # 항상 (재)등록 — 누락 잡 자동 복구, 중복은 replace_existing 로 방지
+    _register_all_scheduled_jobs(_scheduler, sess)
+    if not _scheduler.running:
+        _scheduler.start()
+        return True
+    return False
+
 
 # ── 루프 공용 잔고 캐시 ──────────────────────────────────────
 # 루프 시작 시 1회 조회 → 주문 직후 갱신 → 60초마다 자동 갱신
@@ -489,12 +542,9 @@ def _auto_start_bot():
         logger.error("[자동시작] API 초기화 실패 — 봇 자동 시작 불가")
         return
     _bot_running = True
-    if _scheduler is None or not _scheduler.running:
-        _scheduler = BackgroundScheduler(timezone="Asia/Seoul")
-        sess = session_info()
-        # ★ 공용 등록 함수로 KR·US 잡을 빠짐없이 동일하게 등록(중복 방지)
-        _register_all_scheduled_jobs(_scheduler, sess)
-        _scheduler.start()
+    # ★ 항상 등록 함수를 호출(running 중이어도) → 누락 잡 자동 복구, 중복 없음
+    _started_now = _ensure_scheduler_started(session_info())
+    if _started_now:
         # ★ 자동 재개 시 토큰 안정화 후 1회 신호 점검 (15초 딜레이)
         def _delayed_loop():
             time.sleep(15)
@@ -1518,35 +1568,43 @@ def _us_trading_job():
         _us_loop_health["last_skip_reason"] = "lock_busy(이미 실행 중 → 스킵)"
         logger.info("[US독립잡] 이미 실행 중 — 이번 호출 스킵(비재진입)")
         return
-    import time as _t
-    _start = _t.time()
-    _us_loop_health["last_started_at"]  = datetime.now().isoformat()
-    _us_loop_health["last_skip_reason"] = None
-    _us_loop_health["last_result"]      = "running"
+    # ★ 락 획득 이후는 '전부' try/finally 안 — 어떤 예외 경로에서도 락을 반드시 해제.
+    #   (health 기록 중 예외가 나도 락이 누수되면 US 잡이 영구 스킵되는 것을 방지)
+    _start = time.time()
     try:
+        _us_loop_health["last_started_at"]  = datetime.now().isoformat()
+        _us_loop_health["last_skip_reason"] = None
+        _us_loop_health["last_result"]      = "running"
         _us_trading_loop()
         # _us_trading_loop 이 조기 스킵 시 last_result 를 "skip: ..." 로 덮어쓴다.
         # 전체 순회를 마쳤으면 "running" 이 남아있으므로 "ok" 로 확정한다.
         if _us_loop_health.get("last_result") == "running":
             _us_loop_health["last_result"] = "ok"
     except Exception as _e:
-        _us_loop_health["last_result"] = f"error: {_e}"
+        # ★ /api/status 로 노출되므로 예외 '원문'은 담지 않는다(클래스명만).
+        #   전체 상세는 서버 로그로만 남긴다(대시보드 유출 방지).
+        _us_loop_health["last_result"] = f"error: {type(_e).__name__}"
         try:
             _log(f"❌ [US독립잡] 오류(격리 — KR 영향 없음): {_e}", "error")
         except Exception:
             logger.error(f"[US독립잡] 오류(격리): {_e}")
     finally:
         _us_loop_health["last_finished_at"]  = datetime.now().isoformat()
-        _us_loop_health["last_duration_sec"] = round(_t.time() - _start, 2)
+        _us_loop_health["last_duration_sec"] = round(time.time() - _start, 2)
         _us_loop_health["run_count"] += 1
         _us_trading_loop_lock.release()
 
 
 def _us_heartbeat_check():
-    """미국 정규장인데 마지막 US 루프 완료가 180초 이상 없으면 ERROR heartbeat.
+    """미국 정규장인데 US 독립 잡이 지연·정지된 경우에만 ERROR heartbeat.
 
-    독립 잡(_session_watcher, 30초)에서 호출한다. US 잡이 아예 미실행이거나 본체가
-    장시간 멈춘 경우를 관찰 가능하게 만든다(현재 P0 재발 조기 감지)."""
+    독립 잡(_session_watcher, 30초)에서 호출한다. 다음 상황에서는 '오탐하지 않는다':
+      - 앱/스케줄러 시작 직후(첫 US 실행 전, 등록 후 유예 180초 이내)
+      - 휴장→정규장 전환 직후(US 잡은 휴장에도 60초마다 완료기록을 갱신)
+      - bot 정지(_session_watcher 가 not _bot_running 으로 선반환 → 미호출)
+      - US 본체가 정상적으로 '실행 중'(락 점유 + 300초 이내)
+    실제 이상(정규장인데 완료가 180초+ 없고 실행 중도 아님 / 본체 300초+ 정지)만 경고.
+    """
     try:
         us_sess = us_session_info()
     except Exception:
@@ -1554,17 +1612,35 @@ def _us_heartbeat_check():
     if not us_sess.get("tradeable"):
         return   # 프리/애프터/휴장 — heartbeat 대상 아님
     from datetime import datetime as _dt
+
+    def _age_sec(iso):
+        try:
+            return (_dt.now() - _dt.fromisoformat(iso)).total_seconds()
+        except Exception:
+            return None
+
+    # ── 현재 본체가 실행 중(락 점유)이면: 장시간 스캔은 정상, 과도(>300s)만 경고 ──
+    if _us_trading_loop_lock.locked():
+        started = _us_loop_health.get("last_started_at")
+        a = _age_sec(started) if started else None
+        if a is not None and a > 300:
+            logger.error(
+                f"🚨 [US heartbeat] US 본체가 {a:.0f}초째 실행 중(>300s) — 정지 의심")
+        return   # 실행 중이면 그 외엔 정상
+
     fin = _us_loop_health.get("last_finished_at")
     if fin is None:
-        logger.error(
-            "🚨 [US heartbeat] 미국 정규장인데 US 독립 잡 완료 기록이 없음 "
-            "(아직 미실행 의심) — 스케줄 등록(id=us_trading_loop) 확인 필요")
+        # 아직 완료 기록 없음 → 등록 후 유예(180초) 경과했을 때만 미실행 경고
+        import time as _t
+        reg = _us_registered_ts
+        if reg is not None and (_t.time() - reg) > 180:
+            logger.error(
+                "🚨 [US heartbeat] 미국 정규장인데 US 잡 완료 기록이 없음"
+                "(미실행 의심) — 스케줄 등록(id=us_trading_loop) 확인 필요")
         return
-    try:
-        age = (_dt.now() - _dt.fromisoformat(fin)).total_seconds()
-    except Exception:
-        return
-    if age > 180:
+
+    age = _age_sec(fin)
+    if age is not None and age > 180:
         logger.error(
             f"🚨 [US heartbeat] 미국 정규장인데 마지막 US 루프 완료가 {age:.0f}초 전"
             f"(>180s) — US 잡 지연/정지 의심(last_result={_us_loop_health.get('last_result')})")
@@ -3619,12 +3695,9 @@ def bot_start():
     _bot_running = True
     _save_bot_state(True)   # ★ 상태 파일에 저장
 
-    if _scheduler is None or not _scheduler.running:
-        _scheduler = BackgroundScheduler(timezone="Asia/Seoul")
-        sess = session_info()
-        # ★ 공용 등록 함수로 KR·US 잡을 빠짐없이 동일하게 등록(중복 방지)
-        _register_all_scheduled_jobs(_scheduler, sess)
-        _scheduler.start()
+    # ★ 항상 등록 함수를 호출(running 중이어도) → 누락 잡 자동 복구, 중복 없음
+    _started_now = _ensure_scheduler_started(session_info())
+    if _started_now:
         # ★ 봇 시작 시 토큰 안정화 후 1회 신호 점검 (15초 딜레이)
         def _delayed_loop_start():
             time.sleep(15)

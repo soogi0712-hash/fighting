@@ -423,9 +423,11 @@ class AppJobTest(unittest.TestCase):
         # 잡 본문이 reconcile_unknowns_once 를 실제 호출
         self.assertIn("reconcile_unknowns_once()", src)
         # 등록은 공용 스케줄 등록 함수(_register_all_scheduled_jobs) 안에서 수행되고,
-        # 두 시작 경로(자동시작·/api/bot/start)가 그 공용 함수를 각각 호출한다.
+        # 두 시작 경로(자동시작·/api/bot/start)는 공용 시작 함수(_ensure_scheduler_started)
+        # 를 통해 그 등록 함수를 (running 중이어도) 항상 호출한다.
         self.assertIn("_register_kr_reconcile_job(scheduler)", src)
-        self.assertEqual(src.count("_register_all_scheduled_jobs(_scheduler, sess)"), 2)
+        self.assertEqual(src.count("_ensure_scheduler_started(session_info())"), 2)
+        self.assertEqual(src.count("_register_all_scheduled_jobs(_scheduler, sess)"), 1)
 
     def test_registration_is_single_per_process_runtime(self):
         """런타임: 두 진입점이 같은 _scheduler 에 등록해도 잡은 정확히 1개.
