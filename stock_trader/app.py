@@ -56,6 +56,18 @@ _bot_running  = False
 _trading_loop_lock = threading.Lock()
 # ★ UNKNOWN 정합화 저빈도 잡 중복 실행 방지(비재진입)
 _kr_reconcile_lock = threading.Lock()
+# ★ 미국 매매 잡 전용 비재진입 락 — KR(_trading_loop_lock)과 절대 공유 금지.
+#   (P0: 국내 루프가 지연·정지해도 미국 잡은 독립적으로 60초마다 실행돼야 한다)
+_us_trading_loop_lock = threading.Lock()
+# ★ 미국 독립 잡 관찰성(health) — /api/status us_loop_health 로 노출
+_us_loop_health = {
+    "last_started_at":  None,   # 최근 진입 ISO 시각
+    "last_finished_at": None,   # 최근 완료 ISO 시각
+    "last_result":      None,   # "ok" | "error: ..." | "skip: ..."
+    "last_duration_sec": None,  # 최근 본체 실행시간(초)
+    "last_skip_reason": None,   # 스킵/미실행 사유(락중복·휴장 등)
+    "run_count":        0,      # 본체 실행 누적 횟수
+}
 
 
 def _kr_unknown_reconcile_job():
@@ -90,6 +102,46 @@ def _register_kr_reconcile_job(scheduler):
     """
     scheduler.add_job(_kr_unknown_reconcile_job, "interval", seconds=25,
                       id="kr_unknown_reconcile", replace_existing=True)
+
+
+def _register_all_scheduled_jobs(scheduler, sess):
+    """KR·US 스케줄 잡을 '공용 함수 한 곳'에서 빠짐없이 동일하게 등록한다.
+
+    _auto_start_bot() 과 /api/bot/start(bot_start) 두 진입점 모두 이 함수만 호출한다.
+    모든 잡은 고유 id + replace_existing=True 라 두 경로가 연속 호출돼도 잡은 각각
+    정확히 1개만 등록된다(중복 없음). ★ 미국 매매 잡(us_trading_loop)은 국내 매매
+    잡(trading_loop)과 완전히 독립된 60초 interval 잡으로 등록한다(P0 분리).
+    """
+    # ── 국내 매매 루프 (interval, 세션별 주기) ──
+    scheduler.add_job(_trading_loop, "interval", seconds=sess["check_sec"],
+                      id="trading_loop", replace_existing=True)
+    # ── ★ 미국 매매 루프 (독립 잡, 60초, 비재진입·격리) ──
+    scheduler.add_job(_us_trading_job, "interval", seconds=60,
+                      id="us_trading_loop", replace_existing=True,
+                      max_instances=1, coalesce=True)
+    # ── 세션 감시 (주기 자동조정 + US heartbeat) ──
+    scheduler.add_job(_session_watcher, "interval", seconds=30,
+                      id="session_watcher", replace_existing=True)
+    # ── 국내 일일 스크리너 ──
+    scheduler.add_job(_daily_screen_job, "cron", hour=16, minute=5,
+                      timezone="Asia/Seoul", id="daily_screener",
+                      replace_existing=True)
+    scheduler.add_job(_weekly_lab_ranking_job, "cron", day_of_week="mon",
+                      hour=9, minute=0, timezone="Asia/Seoul",
+                      id="weekly_lab_ranking", replace_existing=True)
+    # ── 미국 스크리너 (관심목록 구성; 매매 루프와 별개) ──
+    scheduler.add_job(_us_market_job, "cron", hour=0, minute=0,
+                      timezone="Asia/Seoul", id="us_market_screener",
+                      replace_existing=True)
+    scheduler.add_job(_us_intraday_job, "cron", hour=10, minute=30,
+                      timezone="America/New_York",  # ET 10:30 (장 개시 1h 후)
+                      id="us_intraday_screener", replace_existing=True)
+    # ── 15:20:30 미체결 매수주문 자동 취소 ──
+    scheduler.add_job(_cancel_pending_buy_orders, "cron",
+                      hour=15, minute=20, second=30, timezone="Asia/Seoul",
+                      id="cancel_pending_buys", replace_existing=True)
+    # ── UNKNOWN 저빈도 정합화 ──
+    _register_kr_reconcile_job(scheduler)
 
 # ── 루프 공용 잔고 캐시 ──────────────────────────────────────
 # 루프 시작 시 1회 조회 → 주문 직후 갱신 → 60초마다 자동 갱신
@@ -440,26 +492,8 @@ def _auto_start_bot():
     if _scheduler is None or not _scheduler.running:
         _scheduler = BackgroundScheduler(timezone="Asia/Seoul")
         sess = session_info()
-        _scheduler.add_job(_trading_loop,  "interval", seconds=sess["check_sec"],
-                           id="trading_loop",       replace_existing=True)
-        _scheduler.add_job(_session_watcher, "interval", seconds=30,
-                           id="session_watcher",    replace_existing=True)
-        _scheduler.add_job(_daily_screen_job, "cron", hour=16, minute=5,
-                           timezone="Asia/Seoul",   id="daily_screener",   replace_existing=True)
-        _scheduler.add_job(_weekly_lab_ranking_job, "cron", day_of_week="mon", hour=9, minute=0,
-                           timezone="Asia/Seoul",   id="weekly_lab_ranking", replace_existing=True)
-        _scheduler.add_job(_us_market_job, "cron", hour=0, minute=0,
-                           timezone="Asia/Seoul",   id="us_market_screener", replace_existing=True)
-        _scheduler.add_job(_us_intraday_job, "cron", hour=10, minute=30,
-                           timezone="America/New_York",  # ET 10:30 (장 개시 1h 후)
-                           id="us_intraday_screener", replace_existing=True)
-        # ★ 15:20:30 미체결 매수주문 자동 취소 (장후시간외 체결 방지)
-        _scheduler.add_job(_cancel_pending_buy_orders, "cron",
-                           hour=15, minute=20, second=30,
-                           timezone="Asia/Seoul",
-                           id="cancel_pending_buys", replace_existing=True)
-        # ★ UNKNOWN(접수 불명확) 주문 저빈도 정합화 — 공용 등록 함수(중복 방지)
-        _register_kr_reconcile_job(_scheduler)
+        # ★ 공용 등록 함수로 KR·US 잡을 빠짐없이 동일하게 등록(중복 방지)
+        _register_all_scheduled_jobs(_scheduler, sess)
         _scheduler.start()
         # ★ 자동 재개 시 토큰 안정화 후 1회 신호 점검 (15초 딜레이)
         def _delayed_loop():
@@ -705,15 +739,16 @@ def _trading_loop_impl():
         except Exception as _ce:
             logger.error(f"[미체결취소] 루프 내 취소 오류: {_ce}")
 
-    # ── ★ 국내 휴장이어도 미국장 + 손절 점검은 반드시 실행 ──────
+    # ── ★ 국내 휴장이어도 손절 점검은 실행 (미국 루프는 독립 잡으로 분리됨) ──
     if not sess["tradeable"]:
-        _log(f"😴 [{sess['time_kst']}] 국내 휴장 — 손절 점검 + 미국장 체크...", "info")
+        _log(f"😴 [{sess['time_kst']}] 국내 휴장 — 손절 점검...", "info")
         # ★ 장 마감 중에도 포지션 손절 감시 (고아종목 포함)
         try:
             _orphan_loss_cut()
         except Exception as _e:
             _log(f"❌ 손절 점검 오류: {_e}", "error")
-        _us_trading_loop()   # 미국 정규장이면 실행, 아니면 내부에서 스킵
+        # ★ P0 분리: _us_trading_loop() 직접 호출 제거. 미국 매매는 독립 잡
+        #   _us_trading_job(APScheduler interval 60s)이 KR 과 무관하게 실행한다.
         return
 
     regime = _detect_current_regime()
@@ -989,8 +1024,9 @@ def _trading_loop_impl():
         except Exception as _fp_e:
             _log(f"❌ [KR FillPoll] 체결 폴링 오류: {_fp_e}", "error")
 
-    # ── ★ 해외주식 매매 루프 (미국 정규장 중일 때만) ──────────
-    _us_trading_loop()
+    # ── ★ P0 분리: 미국 매매 루프 직접 호출 제거 ───────────────
+    #   미국 매매는 독립 잡 _us_trading_job(APScheduler interval 60s)이 KR 루프의
+    #   지연·정지·락 점유와 무관하게 실행한다(KR 스캔 완료를 기다리지 않는다).
 
     # ══════════════════════════════════════════════════════════
     # ★ SELL 재시도 큐 처리 (매도 실패 자동 재시도)
@@ -1469,14 +1505,83 @@ def _build_us_effect_fns(ev: dict) -> dict:
     return fns
 
 
+def _us_trading_job():
+    """미국 매매 '독립' 잡 (APScheduler interval 60s, max_instances=1, coalesce=True).
+
+    ★ P0: 국내 _trading_loop/_trading_loop_impl 와 완전히 분리된 경로.
+      - KR 전용 락(_trading_loop_lock)과 절대 공유하지 않는 US 전용 비재진입 락 사용.
+      - KR 루프가 30분+ 지연·정지·무한실행이어도 이 잡은 60초마다 독립 실행된다.
+      - 전체를 try/except 로 격리 → US 오류가 KR 을, KR 오류가 US 를 막지 않는다.
+      - 진입/스킵/실행시간/결과를 _us_loop_health 에 기록(관찰 가능).
+    """
+    if not _us_trading_loop_lock.acquire(blocking=False):
+        _us_loop_health["last_skip_reason"] = "lock_busy(이미 실행 중 → 스킵)"
+        logger.info("[US독립잡] 이미 실행 중 — 이번 호출 스킵(비재진입)")
+        return
+    import time as _t
+    _start = _t.time()
+    _us_loop_health["last_started_at"]  = datetime.now().isoformat()
+    _us_loop_health["last_skip_reason"] = None
+    _us_loop_health["last_result"]      = "running"
+    try:
+        _us_trading_loop()
+        # _us_trading_loop 이 조기 스킵 시 last_result 를 "skip: ..." 로 덮어쓴다.
+        # 전체 순회를 마쳤으면 "running" 이 남아있으므로 "ok" 로 확정한다.
+        if _us_loop_health.get("last_result") == "running":
+            _us_loop_health["last_result"] = "ok"
+    except Exception as _e:
+        _us_loop_health["last_result"] = f"error: {_e}"
+        try:
+            _log(f"❌ [US독립잡] 오류(격리 — KR 영향 없음): {_e}", "error")
+        except Exception:
+            logger.error(f"[US독립잡] 오류(격리): {_e}")
+    finally:
+        _us_loop_health["last_finished_at"]  = datetime.now().isoformat()
+        _us_loop_health["last_duration_sec"] = round(_t.time() - _start, 2)
+        _us_loop_health["run_count"] += 1
+        _us_trading_loop_lock.release()
+
+
+def _us_heartbeat_check():
+    """미국 정규장인데 마지막 US 루프 완료가 180초 이상 없으면 ERROR heartbeat.
+
+    독립 잡(_session_watcher, 30초)에서 호출한다. US 잡이 아예 미실행이거나 본체가
+    장시간 멈춘 경우를 관찰 가능하게 만든다(현재 P0 재발 조기 감지)."""
+    try:
+        us_sess = us_session_info()
+    except Exception:
+        return
+    if not us_sess.get("tradeable"):
+        return   # 프리/애프터/휴장 — heartbeat 대상 아님
+    from datetime import datetime as _dt
+    fin = _us_loop_health.get("last_finished_at")
+    if fin is None:
+        logger.error(
+            "🚨 [US heartbeat] 미국 정규장인데 US 독립 잡 완료 기록이 없음 "
+            "(아직 미실행 의심) — 스케줄 등록(id=us_trading_loop) 확인 필요")
+        return
+    try:
+        age = (_dt.now() - _dt.fromisoformat(fin)).total_seconds()
+    except Exception:
+        return
+    if age > 180:
+        logger.error(
+            f"🚨 [US heartbeat] 미국 정규장인데 마지막 US 루프 완료가 {age:.0f}초 전"
+            f"(>180s) — US 잡 지연/정지 의심(last_result={_us_loop_health.get('last_result')})")
+
+
 def _us_trading_loop():
     """
     미국 정규장(ET 09:30~16:00) 중 호출.
     _us_watch_list 종목들을 순회하며 USStrategyManager.run() 실행.
     ★ 루프 시작 시 yfinance 배치 프리페치 → 종목별 개별 API 호출 최소화
+    ★ 호출 경로: 독립 잡 _us_trading_job (APScheduler interval 60s). KR 루프에서
+      직접 호출하지 않는다(P0 분리).
     """
     global _us_last_signals
     if not _bot_running or _us_strategy is None:
+        _us_loop_health["last_skip_reason"] = "bot_running=False 또는 US strategy 미초기화"
+        _us_loop_health["last_result"] = "skip: not_ready"
         return
 
     us_sess = us_session_info()
@@ -1496,7 +1601,11 @@ def _us_trading_loop():
             pass
 
     if not us_sess["tradeable"] and not has_positions and not _has_real_holdings:
-        return   # 미국 휴장 + 보유 포지션 없음(내부+실잔고) → 조용히 스킵
+        # 미국 휴장(프리/애프터/휴장) + 보유 포지션 없음(내부+실잔고) → 신규매수 없이 스킵
+        _us_loop_health["last_skip_reason"] = (
+            f"non_tradeable({us_sess.get('session','?')}) & 보유0 → 신규매수 스킵")
+        _us_loop_health["last_result"] = "skip: non_tradeable_no_positions"
+        return
 
     # ★ v30 긴급: 루프 최상단에서 실제 KIS 잔고 기준 -5% 강제 손절 먼저 실행
     # LOSS_LIMIT/MANUAL_STOP 상태와 완전히 독립적으로 동작
@@ -2410,9 +2519,17 @@ def _reschedule(interval_sec: int):
 
 
 def _session_watcher():
-    """세션 변경 감지 → 스케줄 주기 자동 조정 (30초마다 체크)"""
+    """세션 변경 감지 → 스케줄 주기 자동 조정 (30초마다 체크) + US heartbeat.
+
+    ★ 국내 _reschedule 는 국내 매매 잡(trading_loop) 주기만 조정한다. 미국 독립 잡
+      (us_trading_loop)의 60초 interval 은 여기서 변경하지 않는다(KR 세션 무관 유지)."""
     if not _bot_running:
         return
+    # ★ US 독립 잡 heartbeat (KR 과 무관한 관찰) — 정규장 180초+ 미완료 시 ERROR
+    try:
+        _us_heartbeat_check()
+    except Exception:
+        pass
     sess = session_info()
     _reschedule(sess["check_sec"])
     socketio.emit("session_update", {
@@ -2918,6 +3035,8 @@ def api_status():
         "us_watch_list":     _us_watch_list,
         "us_positions":      _us_strategy.positions if _us_strategy else {},
         "us_tradeable":      us_sess["tradeable"],
+        # ★ 미국 독립 잡 관찰성 (P0: KR 지연과 무관한 US 실행 상태)
+        "us_loop_health":    dict(_us_loop_health),
     })
 
 @app.route("/api/session")
@@ -3503,26 +3622,8 @@ def bot_start():
     if _scheduler is None or not _scheduler.running:
         _scheduler = BackgroundScheduler(timezone="Asia/Seoul")
         sess = session_info()
-        _scheduler.add_job(_trading_loop,  "interval", seconds=sess["check_sec"],
-                           id="trading_loop",         replace_existing=True)
-        _scheduler.add_job(_session_watcher, "interval", seconds=30,
-                           id="session_watcher",      replace_existing=True)
-        _scheduler.add_job(_daily_screen_job, "cron", hour=16, minute=5,
-                           timezone="Asia/Seoul",     id="daily_screener",     replace_existing=True)
-        _scheduler.add_job(_weekly_lab_ranking_job, "cron", day_of_week="mon", hour=9, minute=0,
-                           timezone="Asia/Seoul",     id="weekly_lab_ranking", replace_existing=True)
-        _scheduler.add_job(_us_market_job, "cron", hour=0, minute=0,
-                           timezone="Asia/Seoul",     id="us_market_screener", replace_existing=True)
-        _scheduler.add_job(_us_intraday_job, "cron", hour=10, minute=30,
-                           timezone="America/New_York",  # ET 10:30 (장 개시 1h 후)
-                           id="us_intraday_screener", replace_existing=True)
-        # ★ 15:20:30 미체결 매수주문 자동 취소 (장후시간외 체결 방지)
-        _scheduler.add_job(_cancel_pending_buy_orders, "cron",
-                           hour=15, minute=20, second=30,
-                           timezone="Asia/Seoul",
-                           id="cancel_pending_buys", replace_existing=True)
-        # ★ UNKNOWN(접수 불명확) 주문 저빈도 정합화 — 공용 등록 함수(중복 방지)
-        _register_kr_reconcile_job(_scheduler)
+        # ★ 공용 등록 함수로 KR·US 잡을 빠짐없이 동일하게 등록(중복 방지)
+        _register_all_scheduled_jobs(_scheduler, sess)
         _scheduler.start()
         # ★ 봇 시작 시 토큰 안정화 후 1회 신호 점검 (15초 딜레이)
         def _delayed_loop_start():
