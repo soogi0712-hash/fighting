@@ -57,6 +57,10 @@ def _holdings(rows):
 
 
 def _extract(names, extra_globals=None):
+    names = list(names)
+    if "_sync_positions_from_balance" in names and \
+            "_sync_positions_from_balance_locked" not in names:
+        names.append("_sync_positions_from_balance_locked")
     with open(_APP, encoding="utf-8") as f:
         mod = ast.parse(f.read())
     fns = [n for n in mod.body
@@ -65,7 +69,8 @@ def _extract(names, extra_globals=None):
     for want in names:
         assert want in got, f"app.py 에 {want} 없음"
     ns = {"threading": threading, "logging": logging,
-          "logger": logging.getLogger("kr-restore-test")}
+          "logger": logging.getLogger("kr-restore-test"),
+          "_kr_restore_lock": threading.Lock()}
     from datetime import datetime as _dt
     ns["datetime"] = _dt
     ns.update(extra_globals or {})
@@ -135,6 +140,23 @@ class SevenHoldingsRestoreTest(unittest.TestCase):
         d_sell = self._eval("006400", 495000)   # 고점대비 -1.0%
         self.assertEqual(d_sell["action"], "SELL_ALL")
         self.assertIn("트레일링", d_sell["reason"])
+
+    def test_10_repeat_restore_highest_never_lowered(self):
+        """[10] 복원 후 30초 잡 10회 반복 → highest 불변/상승만(현재가 하락에도 유지)."""
+        self.mgr.reconcile_from_broker(self._broker(), active_codes=set())
+        base_high = {c: self.mgr.positions[c].highest_price for c, *_ in SEVEN}
+        # 이후 대사에서 현재가가 하락(평단 미변)해도 highest 하향 금지
+        for i in range(10):
+            drop = {c: {"qty": 10, "avg_price": a, "name": n,
+                        "cur_price": max(1, p - 5000 - i * 100)}
+                    for (c, n, a, p) in SEVEN}
+            self.mgr.reconcile_from_broker(drop, active_codes=set())
+            for c, *_ in SEVEN:
+                self.assertGreaterEqual(self.mgr.positions[c].highest_price,
+                                        base_high[c], f"{c} highest 하향됨")
+        # 반대로 현재가 급등 시엔 트레일링 갱신은 evaluate 소관(reconcile 은 유지)
+        for c, *_ in SEVEN:
+            self.assertEqual(self.mgr.positions[c].highest_price, base_high[c])
 
     def test_I_restart_preserves_highest_and_recovered(self):
         """[I] 저장→재로드(재시작 모사) 후 highest·recovered 유지, 중복 없음."""
@@ -232,10 +254,12 @@ class IndependentRestoreJobTest(unittest.TestCase):
         # 먼저 정상 1회 → 7종목 복원
         ns["_kr_position_restore_job"]()
         self.assertEqual(len(self.pyr.positions), 7)
-        # 락 선점 → 스킵(본체 미실행)
+        # 락 선점(다른 _sync 진행 중 모사) → 직렬화 스킵(본체 미실행, 보존)
         ns["_kr_restore_lock"].acquire()
+        _before = len(self.pyr.positions)
         ns["_kr_position_restore_job"]()
-        self.assertEqual(health["last_result"], "skip: lock_busy")
+        self.assertIn("sync_in_progress", str(health["last_result"]))
+        self.assertEqual(len(self.pyr.positions), _before)   # 보존(중복 대사 없음)
         ns["_kr_restore_lock"].release()
         # 예외 격리: get_balance 예외 → _sync 내부에서 보존, 잡은 예외 없이 종료
         api.get_balance.side_effect = RuntimeError("EGW00215 raw")
@@ -244,6 +268,43 @@ class IndependentRestoreJobTest(unittest.TestCase):
         self.assertEqual(len(self.pyr.positions), 7)          # 보존
         # health 에 예외 원문 미노출
         self.assertNotIn("EGW00215 raw", json.dumps(dict(health)))
+
+    def test_9_concurrent_8x_restore_file_intact(self):
+        """[9/10] 시작 _sync·30초 잡 동시 8회 호출해도 원자저장·락으로 파일 정상·7종목."""
+        api = self._api("api", _holdings(SEVEN))
+        ns, health = self._job_ns(api)
+        errs = []
+
+        def _run():
+            try:
+                ns["_kr_position_restore_job"]()
+            except Exception as e:   # 어떤 스레드도 예외 전파 없어야
+                errs.append(e)
+        ts = [threading.Thread(target=_run) for _ in range(8)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(errs, [])
+        self.assertEqual(len(self.pyr.positions), 7)
+        # 저장 파일이 손상 없이 7종목 유효 JSON
+        with open(ps.PYRAMID_FILE, encoding="utf-8") as f:
+            saved = json.load(f)
+        self.assertEqual(len(saved), 7)
+        for c, *_ in SEVEN:
+            self.assertIn(c, saved)
+            self.assertTrue(saved[c]["recovered"])
+
+    def test_10_ten_api_errors_keep_seven(self):
+        """[10] 정상 복원 후 잔고 API 오류/EGW 10회 반복에도 7종목 유지."""
+        api = self._api("api", _holdings(SEVEN))
+        ns, health = self._job_ns(api)
+        ns["_kr_position_restore_job"]()
+        self.assertEqual(len(self.pyr.positions), 7)
+        for i in range(10):
+            api.get_balance.return_value = {"_source": "error", "holdings": []}
+            ns["_kr_position_restore_job"]()
+            self.assertEqual(len(self.pyr.positions), 7)
 
     def test_health_json_serializable_no_pii(self):
         """[#13] kr_restore_health 는 JSON 직렬화 가능 + 코드만(계좌·이름·원문 없음)."""
@@ -358,18 +419,112 @@ class OdnoAndHeldBuyTest(unittest.TestCase):
             "12345678-01", "KR", "006400", "BUY"))              # 영속 차단
 
     def test_F_is_kr_held_at_broker(self):
-        """[F] KIS 실보유(실조회) 종목 판정 → 신규 BUY 차단 근거."""
+        """[F/5] KIS 보유 판정 → 신규 BUY 차단 + 조회실패 시 fail-safe 차단."""
         sm = self._sm_stub()
         sm.api = MagicMock()
-        # 실조회(api) + 보유 → True
+        # 실조회(api) + 보유 → True(차단)
         sm.api.get_balance = MagicMock(return_value={
             "_source": "api", "holdings": _holdings(SEVEN)})
         self.assertTrue(sm._is_kr_held_at_broker("006400"))
-        self.assertFalse(sm._is_kr_held_at_broker("999999"))   # 미보유
-        # 캐시/오류 응답 → 오차단 방지 위해 False
+        self.assertFalse(sm._is_kr_held_at_broker("999999"))   # 데이터 有·미보유→허용
+        # 캐시 스냅샷(직전성공) 사용: 보유 → True, 미보유 → False
         sm.api.get_balance.return_value = {"_source": "cache",
                                            "holdings": _holdings(SEVEN)}
-        self.assertFalse(sm._is_kr_held_at_broker("006400"))
+        self.assertTrue(sm._is_kr_held_at_broker("006400"))
+        self.assertFalse(sm._is_kr_held_at_broker("999999"))
+        # 보유데이터 불명(error/empty) → 중복매수 방지 fail-safe 차단(True)
+        for src in ("error", "psbl", "empty"):
+            sm.api.get_balance.return_value = {"_source": src, "holdings": []}
+            self.assertTrue(sm._is_kr_held_at_broker("006400"),
+                            f"_source={src} 조회실패 fail-safe 차단 아님")
+        # 조회 예외 → fail-safe 차단
+        sm.api.get_balance.side_effect = RuntimeError("EGW00215")
+        self.assertTrue(sm._is_kr_held_at_broker("006400"))
+
+    def _mk_kr_order_api(self, ledger_db):
+        import api.kis_api as kmod
+        from api.kis_api import KISApi
+        from journal.unknown_order_ledger import UnknownOrderLedger
+        api = object.__new__(KISApi)
+        api.base_url = "https://mock"; api.account_no = "12345678-01"
+        api._live_order_guard = lambda *a, **k: None
+        api._pre_validate_kr_order = lambda *a, **k: None
+        api._order_cooldown = {}; api._ORDER_COOLDOWN_SEC = 0.0
+        api.tick_size = lambda p: 1
+        api.round_to_tick = lambda p, direction=1: int(p)
+        api.invalidate_balance_cache = lambda: None
+        api._on_api_success = lambda: None
+        api._on_api_error = lambda *a, **k: None
+        api._diagnose_500 = lambda *a, **k: ""
+        api._headers = lambda *a, **k: {}
+        api._rate_limit = lambda *a, **k: None
+        api._reject_if_nrcvb_insufficient = lambda *a, **k: None
+        api._account_buy_lock = lambda *a, **k: __import__("contextlib").nullcontext()
+        api._unknown_ledger = UnknownOrderLedger(ledger_db)
+        return kmod, api
+
+    def test_7_sell_rtcd0_empty_odno_nonblocking_confirm(self):
+        """[7] SELL rt_cd=0·ODNO 없음 → 비차단 확인대기 영속 + 후속 SELL 미차단."""
+        kmod, api = self._mk_kr_order_api(os.path.join(self.tmp, "s.db"))
+
+        class _R:
+            status_code = 200
+            def raise_for_status(self): pass
+            def json(self):
+                return {"rt_cd": "0", "output": {}, "msg1": "정상"}   # ODNO 없음
+        _orig = kmod.requests.post
+        kmod.requests.post = lambda *a, **k: _R()
+        try:
+            r = api._order("006400", "SELL", 10, 486500, ord_dvsn="00")
+        finally:
+            kmod.requests.post = _orig
+        # 접수(rt_cd=0) 유지, 단순 성공/실패 아님 — 확인대기 표식
+        self.assertEqual(r["rt_cd"], "0")
+        self.assertEqual(r["_status"], "SELL_ACCEPTED_UNCONFIRMED")
+        # 비차단: BUY·SELL 어느 쪽도 차단하지 않음(has_active=False)
+        self.assertFalse(api._unknown_ledger.has_active(
+            "12345678-01", "KR", "006400", "SELL"))
+        self.assertFalse(api._unknown_ledger.has_active(
+            "12345678-01", "KR", "006400", "BUY"))
+        # 그러나 '확인대기' 로 영속(단순 OK 로 버리지 않음) — 정합화 대상
+        recon = api._unknown_ledger.list_reconcilable()
+        self.assertEqual(len(recon), 1)
+        self.assertEqual(recon[0]["side"], "SELL")
+        self.assertEqual(recon[0]["status"], "PENDING_CONFIRM")
+
+    def test_7_sell_confirm_reconciled_connects_odno(self):
+        """[7] 비차단 SELL 확인대기 → 당일주문조회에서 발견 시 ODNO 연결·해소(부킹 없음)."""
+        from journal.unknown_order_ledger import UnknownOrderLedger
+        from journal.unknown_order_reconciler import reconcile_unknown_orders
+        led = UnknownOrderLedger(os.path.join(self.tmp, "sc.db"))
+        rid = led.record("12345678-01", "KR", "006400", "SELL", 10, 486500, "00",
+                         created_at="t", created_hhmmss="100000", blocking=False)
+        booked = []
+        # 당일주문조회에서 동일조건 SELL 발견(미체결)
+        prov = lambda row: {"query_ok": True, "candidates": [
+            {"odno": "S123", "qty": 10, "price": 486500, "cum_filled_qty": 0}]}
+        res = reconcile_unknown_orders(
+            led, prov, on_promote=lambda r, c: booked.append(c) or True,
+            on_fill=lambda r, c: booked.append(c) or True, now_iso="t2")
+        self.assertEqual(res, [(rid, "SELL_CONFIRMED")])
+        self.assertEqual(led.get(rid)["odno"], "S123")     # ODNO 연결
+        self.assertEqual(booked, [])                        # 부킹(promote/fill) 없음
+        # 확인대기가 아니게 됨(재점검 목록에서 빠짐)
+        self.assertEqual(led.list_reconcilable(), [])
+
+    def test_7_sell_confirm_keeps_when_not_found(self):
+        """[7] SELL 확인대기: 당일주문 미발견이면 비차단 유지(계속 확인대기)."""
+        from journal.unknown_order_ledger import UnknownOrderLedger
+        from journal.unknown_order_reconciler import reconcile_unknown_orders
+        led = UnknownOrderLedger(os.path.join(self.tmp, "sk.db"))
+        rid = led.record("12345678-01", "KR", "006400", "SELL", 10, 486500, "00",
+                         created_at="t", created_hhmmss="100000", blocking=False)
+        prov = lambda row: {"query_ok": True, "candidates": []}   # 0건
+        res = reconcile_unknown_orders(led, prov, now_iso="t2")
+        self.assertEqual(res, [(rid, "SELL_CONFIRM_KEEP")])
+        # 여전히 비차단 확인대기(신규 SELL 미차단)
+        self.assertFalse(led.has_active("12345678-01", "KR", "006400", "SELL"))
+        self.assertEqual(led.get(rid)["status"], "PENDING_CONFIRM")
 
 
 if __name__ == "__main__":

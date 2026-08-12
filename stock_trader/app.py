@@ -99,13 +99,13 @@ def _kr_position_restore_job():
       실행되지 않아, KIS 에 7종목이 있어도 pyramid.positions 가 비어 트레일링이
       동작하지 못했다. 이 잡은 국내 루프와 무관하게 저빈도로 계속 대사해, 잔고에
       있으나 원장에 없는 종목을 자동 복원한다(읽기 전용 잔고 대사, 실주문 없음).
-    ★ 비재진입 락 + 전체 격리. _source!="api" 면 _sync 내부에서 보존(삭제 안 함).
+    ★ 전체 격리. 직렬화는 _sync_positions_from_balance 내부의 _kr_restore_lock
+      (비블로킹)이 담당 → 시작시 _sync·watchdog·이 잡이 동시에 돌아도 reconcile/
+      저장이 중복·교차 실행되지 않는다(파일 손상·highest 초기화 방지).
+      _source!="api" 면 _sync 내부에서 보존(삭제 안 함).
     """
     if _strategy_mgr is None or _api is None:
         _kr_restore_health["last_result"] = "skip: not_ready"
-        return
-    if not _kr_restore_lock.acquire(blocking=False):
-        _kr_restore_health["last_result"] = "skip: lock_busy"
         return
     try:
         _kr_restore_health["last_started_at"] = datetime.now().isoformat()
@@ -125,7 +125,6 @@ def _kr_position_restore_job():
     finally:
         _kr_restore_health["last_finished_at"] = datetime.now().isoformat()
         _kr_restore_health["run_count"] += 1
-        _kr_restore_lock.release()
 
 
 def _kr_unknown_reconcile_job():
@@ -538,6 +537,21 @@ def _sync_positions_from_balance(_health=None):
         _set(last_result="skip: not_ready")
         return
 
+    # ★ 항목9: 모든 호출자(시작시 _sync·watchdog·30초 복원잡)를 '단일 비블로킹 락'
+    #   으로 직렬화한다. 이미 다른 동기화가 진행 중이면 즉시 보존 스킵(대기·중복 실행
+    #   없음) → 동시 reconcile/원자저장 교차로 인한 파일 손상·highest 초기화 방지.
+    #   매도·취소·체결감시는 이 락과 무관하므로 대기하지 않는다.
+    if not _kr_restore_lock.acquire(blocking=False):
+        _set(last_result="skip: sync_in_progress(직렬화, 보존)")
+        return
+    try:
+        _sync_positions_from_balance_locked(_set)
+    finally:
+        _kr_restore_lock.release()
+
+
+def _sync_positions_from_balance_locked(_set):
+    """_kr_restore_lock 보유 상태에서만 호출되는 실제 대사 본체."""
     # 1) 잔고 조회 — 실패하면 기존 포지션 그대로 보존
     try:
         balance = _api.get_balance()

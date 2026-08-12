@@ -24,7 +24,7 @@ from __future__ import annotations
 try:
     from journal.unknown_order_ledger import RECHECK_STATUSES
 except Exception:   # pragma: no cover - 임포트 폴백
-    RECHECK_STATUSES = ("PENDING", "UNKNOWN_NOT_FOUND")
+    RECHECK_STATUSES = ("PENDING", "UNKNOWN_NOT_FOUND", "PENDING_CONFIRM")
 
 
 def _match(cand, row):
@@ -43,8 +43,11 @@ def reconcile_unknown_orders(ledger, candidate_provider,
     UNKNOWN_NOT_FOUND 로 계속 차단하며, 후보가 나타날 때만 승격·부킹으로 해소한다.
     AMBIGUOUS_MATCH·MANUAL_REVIEW 는 수동확인 전용이라 자동 변경하지 않는다.
     """
+    # 재점검 대상 = 차단(PENDING/UNKNOWN_NOT_FOUND) + 비차단 확인대기(PENDING_CONFIRM)
+    _rows = (ledger.list_reconcilable()
+             if hasattr(ledger, "list_reconcilable") else ledger.list_active())
     results = []
-    for row in ledger.list_active():
+    for row in _rows:
         if row.get("status") not in RECHECK_STATUSES:
             continue    # AMBIGUOUS_MATCH·MANUAL_REVIEW·RESOLVED_* 는 자동 변경 안 함
         rid = row["id"]
@@ -60,6 +63,28 @@ def reconcile_unknown_orders(ledger, candidate_provider,
             continue
 
         cands = [c for c in (q.get("candidates") or []) if _match(c, row)]
+
+        # ── 비차단 SELL 확인대기(PENDING_CONFIRM): ODNO·체결 '연결'만 수행 ──
+        #   부킹은 하지 않는다(잔고 대사가 포지션 반영; 손익 임의 반영 금지).
+        #   신규 주문을 차단하지도 않는다. 후보 0/다수는 유지(계속 확인대기).
+        if row.get("status") == "PENDING_CONFIRM":
+            if len(cands) == 1:
+                c = cands[0]
+                odno = str(c.get("odno", "") or "").strip()
+                _filled = int(c.get("cum_filled_qty", 0) or 0) > 0
+                ledger.resolve(
+                    rid, "RESOLVED_FILLED" if _filled else "RESOLVED_ACCEPTED",
+                    odno=odno,
+                    note=("SELL 확인: 당일주문 발견 → ODNO 연결"
+                          + ("·체결확인" if _filled else "·미체결")),
+                    ts=now_iso)
+                results.append((rid, "SELL_CONFIRMED"))
+            else:
+                # 0건 또는 다수 → 상태 유지(비차단), 다음 주기 재확인
+                ledger.mark_checked(
+                    rid, note=f"SELL 확인대기 유지(후보 {len(cands)}건)", ts=now_iso)
+                results.append((rid, "SELL_CONFIRM_KEEP"))
+            continue
 
         if len(cands) == 0:
             # 성공 조회지만 동일조건 주문 0건 → UNKNOWN_NOT_FOUND 로 '계속 차단'.

@@ -36,9 +36,12 @@ _DEFAULT_DB = os.path.join(os.path.dirname(__file__), "..", "data", "trading_jou
 # 차단을 유지하는 상태(신규 BUY 차단)
 BLOCKING_STATUSES = ("PENDING", "UNKNOWN_NOT_FOUND", "AMBIGUOUS_MATCH",
                      "MANUAL_REVIEW")
+# ★ 비차단 확인대기(SELL rt_cd=0·ODNO 미수신): 신규 주문을 '차단하지 않지만'
+#   당일주문/체결조회 정합화로 ODNO·체결을 연결하기 위해 영속·재점검한다.
+NONBLOCK_STATUSES = ("PENDING_CONFIRM",)
 # 정합화 잡이 자동으로 재점검·상태변경할 수 있는 상태
 # (AMBIGUOUS_MATCH/MANUAL_REVIEW 는 수동확인 전용 → 자동 변경 안 함)
-RECHECK_STATUSES = ("PENDING", "UNKNOWN_NOT_FOUND")
+RECHECK_STATUSES = ("PENDING", "UNKNOWN_NOT_FOUND", "PENDING_CONFIRM")
 
 
 class UnknownOrderLedger:
@@ -86,9 +89,16 @@ class UnknownOrderLedger:
 
     # ── 기록 ────────────────────────────────────────────────────
     def record(self, account, market, code, side, qty, price, ord_dvsn,
-               created_at, created_hhmmss="", reason="") -> int:
-        """접수 불명확 POST 를 PENDING 으로 영속 기록. 새 row id 반환."""
-        hist = json.dumps([{"ts": created_at, "event": "RECORD_UNKNOWN",
+               created_at, created_hhmmss="", reason="", blocking=True) -> int:
+        """접수 불명확 POST 를 영속 기록. 새 row id 반환.
+
+        blocking=True  → PENDING(차단): BUY 중복주문 방지용(신규 BUY 차단).
+        blocking=False → PENDING_CONFIRM(비차단): SELL rt_cd=0·ODNO 미수신 등
+          '확인대기'. 신규 주문을 차단하지 않으며, 정합화가 ODNO·체결을 연결한다.
+        """
+        _status = "PENDING" if blocking else "PENDING_CONFIRM"
+        _ev = "RECORD_UNKNOWN" if blocking else "RECORD_CONFIRM_PENDING"
+        hist = json.dumps([{"ts": created_at, "event": _ev,
                             "note": reason}], ensure_ascii=False)
         with self._lock, self._conn() as c:
             cur = c.execute(
@@ -97,7 +107,7 @@ class UnknownOrderLedger:
                 "last_checked_at, resolved_at, history) VALUES "
                 "(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (account, market, code, side, int(qty), int(price or 0),
-                 ord_dvsn or "", created_at, created_hhmmss, "PENDING", "",
+                 ord_dvsn or "", created_at, created_hhmmss, _status, "",
                  "", "", hist))
             return cur.lastrowid
 
@@ -117,6 +127,20 @@ class UnknownOrderLedger:
         q = ("SELECT * FROM unknown_orders WHERE status IN (%s)"
              % ",".join("?" * len(BLOCKING_STATUSES)))
         args = list(BLOCKING_STATUSES)
+        if account:
+            q += " AND account=?"; args.append(account)
+        if market:
+            q += " AND market=?"; args.append(market)
+        q += " ORDER BY id ASC"
+        with self._lock, self._conn() as c:
+            return [dict(r) for r in c.execute(q, args).fetchall()]
+
+    def list_reconcilable(self, account=None, market=None):
+        """정합화가 자동 재점검할 수 있는 row 목록(차단 PENDING/UNKNOWN_NOT_FOUND +
+        비차단 PENDING_CONFIRM). 리콘실러가 이 목록을 순회한다."""
+        q = ("SELECT * FROM unknown_orders WHERE status IN (%s)"
+             % ",".join("?" * len(RECHECK_STATUSES)))
+        args = list(RECHECK_STATUSES)
         if account:
             q += " AND account=?"; args.append(account)
         if market:

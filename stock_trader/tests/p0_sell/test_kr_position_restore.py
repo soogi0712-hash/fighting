@@ -204,6 +204,12 @@ class AppWiringTest(unittest.TestCase):
     _APP = os.path.join(_ROOT, "app.py")
 
     def _extract(self, names, extra_globals=None):
+        import threading as _th, logging as _lg
+        names = list(names)
+        # _sync 는 내부 _sync_..._locked 를 호출 + _kr_restore_lock 사용 → 함께 추출·주입
+        if "_sync_positions_from_balance" in names and \
+                "_sync_positions_from_balance_locked" not in names:
+            names.append("_sync_positions_from_balance_locked")
         with open(self._APP, encoding="utf-8") as f:
             mod = ast.parse(f.read())
         fns = [n for n in mod.body
@@ -211,7 +217,9 @@ class AppWiringTest(unittest.TestCase):
         got = {n.name for n in fns}
         for want in names:
             self.assertIn(want, got, f"app.py 에 {want} 없음")
-        ns = {}
+        ns = {"threading": _th, "logging": _lg,
+              "logger": _lg.getLogger("kr-restore-app-test"),
+              "_kr_restore_lock": _th.Lock()}
         ns.update(extra_globals or {})
         exec(compile(ast.Module(fns, []), "<appfns>", "exec"), ns)
         return ns
