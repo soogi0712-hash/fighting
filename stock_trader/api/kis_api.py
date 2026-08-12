@@ -1018,11 +1018,14 @@ class KISApi:
             msg1   = result.get("msg1", "")
             if rt_cd == "0":
                 # ★ P0: rt_cd=0 이지만 ODNO 가 없으면 '접수됐으나 추적 불가' 상태다.
-                #   일반 등록 성공으로 처리하지 않는다. BUY 는 UNKNOWN 으로 라우팅해
-                #   (중복 BUY 차단 + 당일주문조회 정합화가 실제 ODNO 확인·승격),
-                #   SELL 은 접수는 유효하므로 OK 로 두되 추적은 잔고 대사에 맡긴다.
-                if not _extract_kr_odno(result) and order_type == "BUY":
-                    return {"status": "OK_NO_ODNO", "result": result}
+                #   일반 등록 성공으로 처리하지 않는다.
+                #   BUY  → UNKNOWN 차단 라우팅(중복 BUY 차단 + 당일주문조회 정합화).
+                #   SELL → 비차단 확인대기 라우팅(신규 SELL 미차단 + 당일주문/체결조회로
+                #          ODNO·체결 연결; 단순 OK 로 버리지 않는다).
+                if not _extract_kr_odno(result):
+                    if order_type == "BUY":
+                        return {"status": "OK_NO_ODNO", "result": result}
+                    return {"status": "OK_SELL_NO_ODNO", "result": result}
                 return {"status": "OK", "result": result}
             if msg_cd == "EGW00201":
                 self._on_api_error(200, msg_cd, msg1)   # TPS backoff(재제출은 안 함)
@@ -1093,6 +1096,34 @@ class KISApi:
                 "🟠 [주문] %s BUY rt_cd=0 이나 ODNO 미수신 → 접수됐으나 추적 불가 → "
                 "UNKNOWN 영속(중복 BUY 차단)+당일주문조회 정합화", stock_code)
             return _unknown("rt_cd=0 이나 ODNO 미수신(추적 불가)", qty)
+        if first["status"] == "OK_SELL_NO_ODNO":
+            # SELL 접수(rt_cd=0)됐으나 ODNO 미수신 → 재제출 금지. 후속 SELL 은 막지
+            # 않는다(비차단). 단순 OK 로 버리지 않고 '비차단 확인대기' 원장에 영속해
+            # 당일주문/체결조회 정합화가 ODNO·체결을 연결한다. 확인 전 포지션·손익은
+            # 임의 반영하지 않는다(FillObserver 는 odno 없으면 부킹하지 않음).
+            self.invalidate_balance_cache()
+            self._on_api_success()
+            _uled = getattr(self, "_unknown_ledger", None)
+            if _uled is not None:
+                try:
+                    _now = datetime.now(KST)
+                    _uled.record(
+                        self.account_no, "KR", stock_code, "SELL",
+                        qty, order_price, ord_dvsn,
+                        created_at=_now.isoformat(),
+                        created_hhmmss=_now.strftime("%H%M%S"),
+                        reason="SELL rt_cd=0 이나 ODNO 미수신(비차단 확인대기)",
+                        blocking=False)
+                    logger.error(
+                        "🟠 [주문] %s SELL rt_cd=0 이나 ODNO 미수신 → 비차단 확인대기 "
+                        "영속(후속 SELL 미차단)+당일주문/체결조회 정합화", stock_code)
+                except Exception as _se:
+                    logger.error("[확인대기원장] SELL 기록 실패(%s): %s",
+                                 stock_code, _se)
+            return {"rt_cd": "0", "_status": "SELL_ACCEPTED_UNCONFIRMED",
+                    "code": stock_code, "qty": qty, "price": order_price,
+                    "msg1": "SELL 접수(rt_cd=0)됐으나 ODNO 미수신 — 비차단 확인대기·정합화",
+                    "_ord_dvsn": ord_dvsn, "_ord_unpr": order_price, "_tr_id": tr_id}
         if first["status"] == "ODNO":
             return _attach(first["result"])            # 접수 정황 → 재제출 금지
         if first["status"] == "AMBIGUOUS":

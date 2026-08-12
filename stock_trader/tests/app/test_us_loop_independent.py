@@ -387,6 +387,25 @@ class SelfHealAndConfigTest(unittest.TestCase):
         self.assertIn("us_trading_loop", sched.jobs)
         self.assertEqual(list(sched.jobs).count("trading_loop"), 1)
 
+    def test_A_kr_restore_job_registered_and_self_heals(self):
+        """[item3] kr_position_restore 잡이 등록되고, running 중 누락돼도 복구된다."""
+        ns = self._reg_ns()
+        reg = ns["_register_all_scheduled_jobs"]
+        sched = _FakeScheduler()
+        sched.running = True
+        reg(sched, {"check_sec": 30})
+        self.assertIn("kr_position_restore", sched.jobs)
+        rj = sched.jobs["kr_position_restore"]
+        self.assertEqual(rj["trigger"], "interval")
+        self.assertEqual(rj["seconds"], 30)
+        self.assertEqual(rj["max_instances"], 1)
+        self.assertTrue(rj["coalesce"])
+        # 누락 후 재등록 → 복구, 중복 없음
+        del sched.jobs["kr_position_restore"]
+        reg(sched, {"check_sec": 30})
+        self.assertIn("kr_position_restore", sched.jobs)
+        self.assertEqual(list(sched.jobs).count("kr_position_restore"), 1)
+
     def test_A_ensure_start_calls_register_unconditionally(self):
         """[A] _ensure_scheduler_started 는 running 여부와 무관하게 등록 함수를
         '먼저' 호출한다(등록이 'not running' 가드 안에 갇혀있지 않음)."""

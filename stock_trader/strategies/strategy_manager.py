@@ -550,25 +550,33 @@ class StrategyManager:
             return ""
 
     def _is_kr_held_at_broker(self, code: str) -> bool:
-        """해당 KR 종목이 KIS 실계좌 잔고(실조회)에서 보유수량>0 인지.
+        """해당 KR 종목의 KIS 실계좌 보유 여부(신규 BUY 차단 판정). SELL 은 호출 안 함.
 
-        req9: pyramid 원장 복원 전이라도 실보유 종목의 신규 매수를 차단하기 위한 확인.
-        ★ 실조회(_source=="api") 응답에서만 True. 조회 실패·캐시·오류는 오차단 방지를
-          위해 False(미보유 취급). 계좌·원문은 로그에 남기지 않는다.
+        req5/req9: pyramid 원장 복원 전이라도 실보유 종목의 신규 매수를 차단한다.
+        ★ get_balance 는 단기 캐시(동일 스캔 스냅샷)를 공유 → 종목별 별도 HTTP 없음.
+        ★ 보유데이터 사용 가능(_source in api/cache)일 때만 정확 판정:
+            해당 종목 보유수량>0 → True(차단), 데이터 있고 미보유 → False(허용).
+        ★ 보유데이터 불명(error/psbl/empty/예외/비정상 응답) → 중복매수 방지 위해
+          fail-safe 차단(True). 계좌·원문·자격증명은 로그에 남기지 않는다.
         """
         try:
             api = getattr(self, "api", None)
             if api is None:
-                return False
+                return False   # api 미구성(테스트/초기화 전) — 매매 경로 아님
             bal = api.get_balance()
-            if not isinstance(bal, dict) or bal.get("_source") != "api":
-                return False
-            for h in bal.get("holdings", []) or []:
-                if h.get("code") == code and int(h.get("qty", 0) or 0) > 0:
-                    return True
+            if not isinstance(bal, dict):
+                return True    # 응답 비정상 → fail-safe 차단
+            src = bal.get("_source")
+            if src in ("api", "cache"):
+                # 실보유 스냅샷(신선/직전성공) 사용 — 종목별 추가 HTTP 없음
+                for h in bal.get("holdings", []) or []:
+                    if h.get("code") == code and int(h.get("qty", 0) or 0) > 0:
+                        return True
+                return False   # 보유데이터 있음 + 미보유 → 매수 허용
+            # error/psbl/empty 등 보유데이터 불명 → 중복매수 방지 fail-safe 차단
+            return True
         except Exception:
-            return False
-        return False
+            return True        # 조회 예외 → fail-safe 차단
 
     # ══════════════════════════════════════════════════════════
     # UNKNOWN 주문 정합화 배선 (저빈도 스케줄러/시작시 호출)
