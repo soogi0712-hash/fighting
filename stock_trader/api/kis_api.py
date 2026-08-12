@@ -1017,6 +1017,12 @@ class KISApi:
             msg_cd = result.get("msg_cd", "")
             msg1   = result.get("msg1", "")
             if rt_cd == "0":
+                # ★ P0: rt_cd=0 이지만 ODNO 가 없으면 '접수됐으나 추적 불가' 상태다.
+                #   일반 등록 성공으로 처리하지 않는다. BUY 는 UNKNOWN 으로 라우팅해
+                #   (중복 BUY 차단 + 당일주문조회 정합화가 실제 ODNO 확인·승격),
+                #   SELL 은 접수는 유효하므로 OK 로 두되 추적은 잔고 대사에 맡긴다.
+                if not _extract_kr_odno(result) and order_type == "BUY":
+                    return {"status": "OK_NO_ODNO", "result": result}
                 return {"status": "OK", "result": result}
             if msg_cd == "EGW00201":
                 self._on_api_error(200, msg_cd, msg1)   # TPS backoff(재제출은 안 함)
@@ -1077,6 +1083,16 @@ class KISApi:
         first = _post_once(qty)
         if first["status"] == "OK":
             return _finalize_ok(first["result"], qty)
+        if first["status"] == "OK_NO_ODNO":
+            # BUY 접수(rt_cd=0)됐으나 ODNO 미수신 → 접수 반영(잔고 캐시 무효화·성공
+            # 카운트)하되, 일반 등록 성공으로 두지 않고 UNKNOWN 영속(중복 BUY 차단)+
+            # 당일주문조회 정합화로 ODNO 확인·승격에 연결한다.
+            self.invalidate_balance_cache()
+            self._on_api_success()
+            logger.error(
+                "🟠 [주문] %s BUY rt_cd=0 이나 ODNO 미수신 → 접수됐으나 추적 불가 → "
+                "UNKNOWN 영속(중복 BUY 차단)+당일주문조회 정합화", stock_code)
+            return _unknown("rt_cd=0 이나 ODNO 미수신(추적 불가)", qty)
         if first["status"] == "ODNO":
             return _attach(first["result"])            # 접수 정황 → 재제출 금지
         if first["status"] == "AMBIGUOUS":

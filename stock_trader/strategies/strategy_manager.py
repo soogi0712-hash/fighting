@@ -470,8 +470,19 @@ class StrategyManager:
 
         try:
             output = order_response.get("output", {}) or {}
+            if isinstance(output, list):
+                output = output[0] if output else {}
             if market == "KR":
-                odno = str(output.get("KNO_ORD_NO", "") or "").strip()
+                # ★ P0 근본원인: KIS 국내 order-cash 성공 응답은 ODNO 를 반환한다
+                #   (KRX_FWDG_ORD_ORGNO 보조, KNO_ORD_NO 는 구필드/정합화-promote 경로).
+                #   기존엔 KNO_ORD_NO 만 읽어 실주문 응답(ODNO)에서 항상 '' → 등록 거부·
+                #   허위 '등록 완료 odno=""' 로그가 발생했다. 견고 추출로 교정한다.
+                odno = ""
+                for _k in ("ODNO", "odno", "KRX_FWDG_ORD_ORGNO", "KNO_ORD_NO"):
+                    _v = str(output.get(_k, "") or "").strip()
+                    if _v and _v not in ("0", "00000", "0000000"):
+                        odno = _v
+                        break
             else:
                 # US: result["output"]["ODNO"]
                 odno = str(output.get("ODNO", "") or "").strip()
@@ -479,8 +490,22 @@ class StrategyManager:
             from datetime import datetime as _dt
             submitted_at = _dt.now().isoformat()
 
-            # PendingOrderRegistry에 등록
-            self._pending_registry.register(
+            # ★ P0: odno 가 비어 있으면(rt_cd=0 이지만 ODNO 누락) '등록 성공'으로
+            #   처리하지 않는다. PendingRegistry.register 는 odno='' 를 거부하므로,
+            #   accept(odno='') 로 lifecycle 만 ACTIVE 로 만들어 '등록 완료' 를
+            #   허위 로깅하던 결함을 차단한다. 이 경우 등록 실패로 보고하고(빈 문자열
+            #   반환), UNKNOWN 영속·당일주문조회 정합화(kis_api 경로)가 ODNO 를 찾아
+            #   승격하도록 맡긴다.
+            if not odno:
+                logger.error(
+                    "[PendingRegistry] 등록 실패 — ODNO 없음(rt_cd=0이나 미수신): "
+                    "market=%s code=%s side=%s lifecycle_id=%s → 정상 등록 아님"
+                    "(UNKNOWN 정합화가 ODNO 확인 예정)",
+                    market, code, side, lifecycle_id)
+                return ""   # 등록 실패 — accept/등록완료 로그 없음
+
+            # PendingOrderRegistry에 등록 (반환값=row id; 0 이면 거부)
+            _reg_id = self._pending_registry.register(
                 market             = market,
                 trade_id           = lifecycle_id,   # lifecycle_id를 trade_id로 사용
                 code               = code,
@@ -493,6 +518,12 @@ class StrategyManager:
                 exchange           = exchange,
                 currency           = currency,
             )
+            # ★ 등록이 거부(0/None)됐으면 accept·등록완료 로그를 남기지 않는다.
+            if not _reg_id:
+                logger.error(
+                    "[PendingRegistry] 등록 거부됨(row 미생성) — 정상 등록 아님: "
+                    "market=%s code=%s side=%s odno=%r", market, code, side, odno)
+                return ""
 
             # Lifecycle에도 odno 주입 (accept 시 odno 저장)
             lc = self._lifecycle_mgr.load(lifecycle_id)
@@ -517,6 +548,27 @@ class StrategyManager:
                 market, code, side, exc,
             )
             return ""
+
+    def _is_kr_held_at_broker(self, code: str) -> bool:
+        """해당 KR 종목이 KIS 실계좌 잔고(실조회)에서 보유수량>0 인지.
+
+        req9: pyramid 원장 복원 전이라도 실보유 종목의 신규 매수를 차단하기 위한 확인.
+        ★ 실조회(_source=="api") 응답에서만 True. 조회 실패·캐시·오류는 오차단 방지를
+          위해 False(미보유 취급). 계좌·원문은 로그에 남기지 않는다.
+        """
+        try:
+            api = getattr(self, "api", None)
+            if api is None:
+                return False
+            bal = api.get_balance()
+            if not isinstance(bal, dict) or bal.get("_source") != "api":
+                return False
+            for h in bal.get("holdings", []) or []:
+                if h.get("code") == code and int(h.get("qty", 0) or 0) > 0:
+                    return True
+        except Exception:
+            return False
+        return False
 
     # ══════════════════════════════════════════════════════════
     # UNKNOWN 주문 정합화 배선 (저빈도 스케줄러/시작시 호출)
@@ -1887,6 +1939,18 @@ class StrategyManager:
                     f"연속양봉수={iv5['consec_bull']} | "
                     f"사유={chase_reason}"
                 )
+
+        # ── ★ req9: KIS 실계좌 보유 종목 신규 진입 차단(원장 복원 전이라도) ──
+        #   pyramid 원장에 아직 복원되지 않아 포지션이 없다고 판단해 신규 LEVEL1
+        #   진입을 내는 경우, 실제 KIS 잔고에 보유 중이면 중복 매수를 차단한다.
+        #   (복원 잡이 곧 원장에 반영 → 이후 트레일링 등 정상 관리로 전환)
+        if action in ("BUY_LEVEL1_EARLY", "BUY_LEVEL1_FULL") and \
+                self._is_kr_held_at_broker(code):
+            action = "SKIP"
+            decision["reason"] = "⛔KIS 보유 종목(원장 복원 대기) — 신규 매수 차단"
+            logger.warning(
+                "[신규매수 차단] %s(%s) KIS 실잔고 보유 중이나 pyramid 미복원 → "
+                "중복 매수 방지(복원 대사 후 정상 관리)", name, code)
 
         # ── ★ 재진입 차단 체크 (매도 후 24h/72h 쿨다운) ─────────
         # BUY 계열이고 아직 SKIP 되지 않은 경우에만 체크

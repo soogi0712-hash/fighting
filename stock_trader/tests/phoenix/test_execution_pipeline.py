@@ -218,7 +218,12 @@ class TestRegisterPendingOrderKRBuy(unittest.TestCase):
         self.assertEqual(loaded.current_state, LifecycleState.ORDER_ACCEPTED)
 
     def test_T04_kr_buy_empty_odno_no_exception(self):
-        """T04: odno 필드 없는 응답 → 빈 문자열 반환, 예외 없음."""
+        """T04: odno 필드 없는 응답(rt_cd=0이나 ODNO 미수신) → 빈 문자열 반환, 예외 없음.
+
+        ★ P0 개선: odno 가 비면 register 를 '호출하지 않고' 즉시 실패 반환한다.
+          (기존엔 register 를 호출해 내부에서 거부됐으나, 이제 상위에서 차단해
+           accept(odno='')·허위 '등록 완료' 로그를 원천 방지한다.)
+        """
         sm = _make_strategy_manager_stub(self.tmp)
         sm._pending_registry = self._make_registry_mock()
 
@@ -231,7 +236,8 @@ class TestRegisterPendingOrderKRBuy(unittest.TestCase):
             lifecycle_id=lc.order_lifecycle_id,
         )
         self.assertEqual(odno, "")
-        sm._pending_registry.register.assert_called_once()
+        # odno 없음 → register 미호출(허위 등록·accept·'등록 완료' 로그 원천 방지)
+        sm._pending_registry.register.assert_not_called()
 
     def test_T05_kr_buy_no_pending_registry_returns_empty_string(self):
         """T05: _pending_registry=None → 빈 문자열 반환, 예외 없음."""

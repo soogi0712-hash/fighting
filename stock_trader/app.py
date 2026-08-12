@@ -74,6 +74,59 @@ _us_loop_health = {
 # ★ US 잡이 스케줄러에 (재)등록된 epoch 시각 — heartbeat 시작 유예 판정용.
 _us_registered_ts = None
 
+# ★ KR 포지션 복원(KIS 잔고→pyramid 원장) 독립 잡 전용 비재진입 락.
+#   국내 매매 루프(_trading_loop_lock)와 절대 공유하지 않는다 — KR 루프가 지연·정지해도
+#   복원 대사는 저빈도 잡으로 계속 실행돼야 한다(P0: 빈 원장 → 트레일링 미작동 방지).
+_kr_restore_lock = threading.Lock()
+# ★ 복원 잡 관찰성(health) — /api/status kr_restore_health 로 노출.
+#   JSON 직렬화 가능한 원시타입만. 계좌·API 원문·자격증명 미포함.
+_kr_restore_health = {
+    "last_started_at":  None,
+    "last_finished_at": None,
+    "last_result":      None,   # "ok" | "skip: <src>" | "error: <ExcType>"
+    "last_source":      None,   # 마지막 잔고 출처(api/cache/psbl/error/empty)
+    "restored_codes":   [],     # 최근 복원된 종목코드(코드만; 이름·계좌 없음)
+    "position_count":   0,      # 현재 pyramid.positions 종목 수
+    "run_count":        0,
+}
+
+
+def _kr_position_restore_job():
+    """KIS 실계좌 잔고 → pyramid 트레일링 원장 '독립' 저빈도 복원 잡.
+
+    ★ P0: 기존엔 _sync_positions_from_balance 가 (1)앱 시작 1회 + (2)_watchdog(국내
+      _trading_loop_impl 말미) 에서만 호출됐다. 국내 루프가 지연·정지하면 (2)가
+      실행되지 않아, KIS 에 7종목이 있어도 pyramid.positions 가 비어 트레일링이
+      동작하지 못했다. 이 잡은 국내 루프와 무관하게 저빈도로 계속 대사해, 잔고에
+      있으나 원장에 없는 종목을 자동 복원한다(읽기 전용 잔고 대사, 실주문 없음).
+    ★ 비재진입 락 + 전체 격리. _source!="api" 면 _sync 내부에서 보존(삭제 안 함).
+    """
+    if _strategy_mgr is None or _api is None:
+        _kr_restore_health["last_result"] = "skip: not_ready"
+        return
+    if not _kr_restore_lock.acquire(blocking=False):
+        _kr_restore_health["last_result"] = "skip: lock_busy"
+        return
+    try:
+        _kr_restore_health["last_started_at"] = datetime.now().isoformat()
+        _sync_positions_from_balance(_health=_kr_restore_health)
+        try:
+            _kr_restore_health["position_count"] = len(
+                _strategy_mgr.pyramid.positions)
+        except Exception:
+            pass
+    except Exception as _e:
+        _kr_restore_health["last_result"] = f"error: {type(_e).__name__}"
+        try:
+            _log(f"⚠️ [KR포지션복원잡] 오류(격리, 매도·취소·체결 영향 없음): {_e}",
+                 "warning")
+        except Exception:
+            logger.warning(f"[KR포지션복원잡] 오류(격리): {_e}")
+    finally:
+        _kr_restore_health["last_finished_at"] = datetime.now().isoformat()
+        _kr_restore_health["run_count"] += 1
+        _kr_restore_lock.release()
+
 
 def _kr_unknown_reconcile_job():
     """저빈도 UNKNOWN 정합화 잡. 장애 격리: 오류가 스캔·매도·체결감시를 막지 않는다.
@@ -173,6 +226,10 @@ def _register_all_scheduled_jobs(scheduler, sess):
                       id="cancel_pending_buys", replace_existing=True)
     # ── UNKNOWN 저빈도 정합화 ──
     _register_kr_reconcile_job(scheduler)
+    # ── ★ KR 포지션 복원(KIS 잔고→pyramid 원장) 독립 잡 (30초, 국내 루프 무관) ──
+    scheduler.add_job(_kr_position_restore_job, "interval", seconds=30,
+                      id="kr_position_restore", replace_existing=True,
+                      max_instances=1, coalesce=True)
 
 
 def _ensure_scheduler_started(sess):
@@ -458,7 +515,7 @@ def _build_kr_scan_list(watch_list, positions):
     return scan, held_only
 
 
-def _sync_positions_from_balance():
+def _sync_positions_from_balance(_health=None):
     """실제 KIS 잔고 ↔ 내부 피라미딩 포지션의 '존재/수량/평단'만 정합화 (P0-3).
 
     ★ 회계 무개입: apply_buy/apply_sell/positions.pop(매도부킹)/손익확정/재진입등록/
@@ -466,11 +523,19 @@ def _sync_positions_from_balance():
       _handle_buy_filled / _handle_sell_filled 만 담당한다.
     ★ ACTIVE(ACCEPTED/PARTIALLY_FILLED) 주문 종목은 접수→체결 창의 정상 수량차이
       이므로 유령/누락으로 오판하지 않고 그대로 보존한다.
-    ★ 잔고 조회 실패(예외) 시 아무 것도 바꾸지 않고 기존 포지션을 보존한다.
+    ★ 잔고 조회 실패(예외)·비정상·_source!="api" 시 아무 것도 바꾸지 않고 기존
+      포지션을 보존한다(EGW00215/캐시/타임아웃/빈응답으로 원장 삭제·{} 저장 금지).
     ★ idempotent — 여러 번 실행해도 결과가 동일하다.
+    _health: 전달되면 last_source/last_result/restored_codes 를 기록(관찰성 전용).
     """
     global _strategy_mgr
+
+    def _set(**kw):
+        if _health is not None:
+            _health.update(kw)
+
     if _strategy_mgr is None or _api is None:
+        _set(last_result="skip: not_ready")
         return
 
     # 1) 잔고 조회 — 실패하면 기존 포지션 그대로 보존
@@ -478,17 +543,22 @@ def _sync_positions_from_balance():
         balance = _api.get_balance()
     except Exception as e:
         logger.warning(f"[포지션동기화] 잔고 조회 실패 — 기존 포지션 보존: {e}")
+        _set(last_result="skip: query_exception", last_source="exception")
         return
     if not isinstance(balance, dict) or balance.get("holdings") is None:
         logger.warning("[포지션동기화] 잔고 응답 비정상 — 기존 포지션 보존")
+        _set(last_result="skip: bad_response", last_source="bad")
         return
     # ★ req14: 캐시/폴백/조회실패(_source!="api") 응답으로는 대사하지 않는다.
     #   빈 holdings 를 '전 종목 청산'으로 오인해 보유수량을 0으로 만들지 않도록,
     #   실제 조회 성공("api") 응답일 때만 포지션 동기화를 수행한다.
-    if balance.get("_source") != "api":
+    _src = balance.get("_source")
+    _set(last_source=_src)
+    if _src != "api":
         logger.warning(
             "[포지션동기화] 잔고 출처=%s (실조회 아님) — 기존 포지션 보존"
-            "(캐시오류로 보유수량 0 오인 방지)", balance.get("_source"))
+            "(EGW00215/캐시오류로 보유수량 0 오인·원장 삭제 방지)", _src)
+        _set(last_result=f"skip: source={_src}(원장 보존)")
         return
 
     # 2) 브로커 보유맵 구성
@@ -511,6 +581,11 @@ def _sync_positions_from_balance():
 
     # 4) 구조적 정합화(회계 무개입) — 실제 반영/삭제/교정은 reconcile 이 수행
     rep = _strategy_mgr.pyramid.reconcile_from_broker(broker, active_codes)
+
+    # health: 복원 결과(코드만) 기록 — 계좌·이름·원문 미포함
+    _set(last_result="ok",
+         restored_codes=[c for c in broker.keys()
+                         if c not in set(active_codes or ())])
 
     # 5) 로그
     if rep.get("added"):
@@ -3113,6 +3188,8 @@ def api_status():
         "us_tradeable":      us_sess["tradeable"],
         # ★ 미국 독립 잡 관찰성 (P0: KR 지연과 무관한 US 실행 상태)
         "us_loop_health":    dict(_us_loop_health),
+        # ★ KR 포지션 복원 잡 관찰성(코드만; 계좌·원문 없음)
+        "kr_restore_health": dict(_kr_restore_health),
     })
 
 @app.route("/api/session")

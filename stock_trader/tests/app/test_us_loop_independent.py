@@ -71,7 +71,7 @@ class RegistrationTest(unittest.TestCase):
         "_trading_loop", "_us_trading_job", "_session_watcher",
         "_daily_screen_job", "_weekly_lab_ranking_job", "_us_market_job",
         "_us_intraday_job", "_cancel_pending_buy_orders",
-        "_kr_unknown_reconcile_job",
+        "_kr_unknown_reconcile_job", "_kr_position_restore_job",
     ]
 
     def _ns(self):
@@ -364,7 +364,7 @@ class SelfHealAndConfigTest(unittest.TestCase):
         "_trading_loop", "_us_trading_job", "_session_watcher",
         "_daily_screen_job", "_weekly_lab_ranking_job", "_us_market_job",
         "_us_intraday_job", "_cancel_pending_buy_orders",
-        "_kr_unknown_reconcile_job",
+        "_kr_unknown_reconcile_job", "_kr_position_restore_job",
     ]
 
     def _reg_ns(self):
