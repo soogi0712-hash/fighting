@@ -205,6 +205,116 @@ class JournalListApiTest(unittest.TestCase):
         self.assertNotIn("status_display", rows[0])
 
     # ── graceful: 빈 DB ───────────────────────────────────────
+    # ── 리뷰 회귀: US 환율 누락 정책 ──────────────────────────
+    def test_us_pnl_krw_missing_policy(self):
+        # US 청산: net_profit 있으나 pnl_krw NULL → 전체 원화합에서 제외 + 미확인 카운트
+        _entry("T-US-NOFX", "US", "TSLA", "Tesla", avg_price=200.0)
+        _exit("T-US-NOFX", "US", "TSLA", "Tesla", 15.0, 7.5,
+              "익절", pnl_krw=None)  # 환율 미확인
+        # helper 가 pnl_krw=None → net_profit 로 대체하므로 명시적으로 NULL 로 갱신
+        c = jnl._get_conn()
+        c.execute("UPDATE trade_exits SET pnl_krw=NULL WHERE trade_id='T-US-NOFX'")
+        c.commit()
+        card = jnl.query_journal_card("2026-08-13")
+        # 전체 pnl_krw 는 기존 29000 그대로(미확인 건은 합산 제외)
+        self.assertEqual(card["all"]["pnl_krw"], 29000.0)
+        self.assertEqual(card["all"]["pnl_krw_missing"], 1)
+        self.assertEqual(card["US"]["pnl_krw_missing"], 1)
+        # 혼화폐 방지: 전체 pnl_native 는 None
+        self.assertIsNone(card["all"]["pnl_native"])
+
+    # ── 리뷰 회귀: 승률/평균은 청산완료(trade_exits)만 집계 ──
+    def test_card_counts_closed_only(self):
+        # setUp: 청산 3건(2승1패), OPEN 2건, REJECTED 1건
+        card = jnl.query_journal_card("2026-08-13")
+        self.assertEqual(card["all"]["trades"], 3)          # 청산만
+        self.assertEqual(card["all"]["wins"] + card["all"]["losses"], 3)
+        self.assertAlmostEqual(card["all"]["win_rate"], 2 / 3 * 100.0, places=3)
+
+    # ── 리뷰 회귀: 분할매수(다중 trade_id)·부분체결 중복집계 없음 ──
+    def test_no_double_count_pyramid_and_events(self):
+        # 동일 종목 분할매수 = 서로 다른 trade_id 2건(각각 1거래)
+        _entry("T-KR-P1", "KR", "005930", "삼성전자")
+        _exit("T-KR-P1", "KR", "005930", "삼성전자", 1000.0, 1.0, "익절")
+        _entry("T-KR-P2", "KR", "005930", "삼성전자")
+        _exit("T-KR-P2", "KR", "005930", "삼성전자", 2000.0, 2.0, "익절")
+        # 부분체결 흔적(PRICE_HIGH 이벤트 다수) + 단일 exit → 1거래
+        c = jnl._get_conn()
+        for i in range(5):
+            c.execute("INSERT INTO trade_events(trade_id,event_type,market,code,price,ts)"
+                      " VALUES('T-KR-P1','PRICE_HIGH_UPDATED','KR','005930',?, ?)",
+                      (76000 + i, f"2026-08-13T10:0{i}:00"))
+        c.commit()
+        # 목록: JOIN fan-out 없음 — 005930 삼성 행은 정확히 3건(WIN + P1 + P2)
+        rows = jnl.query_journal_list(code="005930", limit=100)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(len({r["trade_id"] for r in rows}), 3)
+        # 카드: 청산 5건(setUp 3 + P1 + P2) — 이벤트로 중복되지 않음
+        self.assertEqual(jnl.query_journal_card("2026-08-13")["all"]["trades"], 5)
+
+    # ── 리뷰 회귀: 날짜 범위(sargable) 경계 귀속 정확 ──────────
+    def test_date_boundary_attribution(self):
+        _entry("T-EOD", "KR", "111111", "말일종목", created_at="2026-08-13T23:59:59.900")
+        _exit("T-EOD", "KR", "111111", "말일종목", 100.0, 0.5, "익절",
+              created_at="2026-08-13T23:59:59.999")
+        _entry("T-NXT", "KR", "222222", "익일종목", created_at="2026-08-14T00:00:00.000")
+        _exit("T-NXT", "KR", "222222", "익일종목", 200.0, 1.0, "익절",
+              created_at="2026-08-14T00:00:00.001")
+        c13 = jnl.query_journal_card("2026-08-13")["all"]
+        c14 = jnl.query_journal_card("2026-08-14")["all"]
+        # 13일 23:59 는 13일, 14일 00:00 는 14일로 정확 귀속
+        self.assertEqual(c13["trades"], 4)   # setUp 3 + T-EOD
+        self.assertEqual(c14["trades"], 1)   # T-NXT
+
+    # ── 리뷰 회귀: pagination limit/offset ────────────────────
+    def test_pagination(self):
+        first = jnl.query_journal_list(limit=2, offset=0)
+        second = jnl.query_journal_list(limit=2, offset=2)
+        self.assertEqual(len(first), 2)
+        self.assertEqual(len(second), 2)
+        self.assertTrue(set(r["trade_id"] for r in first).isdisjoint(r["trade_id"] for r in second))
+
+    # ── 리뷰 회귀: 기존 state 파라미터 하위호환 ───────────────
+    def test_state_param_backcompat(self):
+        self.assertEqual(len(jnl.query_journal_list(state="CLOSED")), 3)
+        self.assertEqual(len(jnl.query_journal_list(state="REJECTED")), 1)
+
+    # ── 리뷰 회귀: NULL 과다/구버전 결측 행도 500 없이 처리 ──
+    def test_null_heavy_row_safe(self):
+        c = jnl._get_conn()
+        c.execute("INSERT INTO trade_entries(trade_id,market,code,state) VALUES('T-NULL','KR','999999','OPEN')")
+        c.execute("INSERT INTO trade_exits(trade_id,market,code) VALUES('T-NULL2-CLOSED-NOEXITVALS','KR','888888')")
+        c.execute("INSERT INTO trade_entries(trade_id,market,code,state) VALUES('T-NULL2-CLOSED-NOEXITVALS','KR','888888','CLOSED')")
+        c.commit()
+        rows = {r["trade_id"]: r for r in jnl.query_journal_list(limit=100)}
+        self.assertIn("T-NULL", rows)
+        self.assertEqual(rows["T-NULL"]["status_display"], "확인대기")  # fill_confirmed NULL→확인대기
+        self.assertIsNone(rows["T-NULL"]["net_profit"])
+        # exit 는 있으나 net_profit NULL → 카드 승패에 영향 없음, 예외 없음
+        card = jnl.query_journal_card("2026-08-13")
+        self.assertIsInstance(card["all"]["trades"], int)
+
+    # ── 리뷰 회귀: 조회는 WAL·읽기전용 — 기록을 막지 않음 ─────
+    def test_queries_are_readonly_and_wal(self):
+        conn = jnl._get_conn()
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        self.assertEqual(str(mode).lower(), "wal")  # 동시 읽기/쓰기 허용
+
+        def _counts():
+            return tuple(
+                conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                for t in ("trade_entries", "trade_exits", "trade_events", "daily_trade_summary")
+            )
+        before = _counts()
+        # 모든 조회 함수 실행
+        jnl.query_journal_list(limit=100)
+        jnl.query_journal_list(market="US", status="청산완료", exit_category="익절")
+        jnl.query_journal_card("2026-08-13")
+        jnl.query_daily_summary(include_avg_return=True)
+        jnl.query_journal_detail("T-KR-WIN")
+        after = _counts()
+        self.assertEqual(before, after)  # 어떤 조회도 DB 를 변경하지 않음
+
     def test_empty_db_safe(self):
         tmp2 = tempfile.mktemp(suffix=".db")
         _fresh_db(tmp2)

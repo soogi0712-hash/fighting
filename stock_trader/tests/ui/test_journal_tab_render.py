@@ -86,6 +86,57 @@ class JournalTabRenderTest(unittest.TestCase):
     def test_responsive_viewport(self):
         self.assertIn('name="viewport"', self.html)
 
+    # ── 리뷰 회귀: XSS 방지 (이스케이프 헬퍼 + 적용) ──────────
+    def test_xss_escape_helper_and_applied(self):
+        self.assertIn("function _jEsc(", self.html)
+        self.assertIn("&lt;", self.html)  # 이스케이프 매핑 존재
+        # 종목명·매수사유는 이스케이프 적용, 원시 삽입 금지
+        self.assertIn("_jEscDash(r.name)", self.html)
+        self.assertIn("_jEscDash(r.entry_reason)", self.html)
+        self.assertNotIn("${_jDash(r.name)}", self.html)
+        self.assertNotIn("${r.name}", self.html)
+        self.assertNotIn("${r.entry_reason}", self.html)
+        # note 이스케이프(부분치환 제거)
+        self.assertIn("_jEsc(ev.note)", self.html)
+        self.assertNotIn("String(ev.note).replace(/</g", self.html)
+        # 모달 사유/전략도 이스케이프
+        self.assertIn("_jEscDash(x.exit_reason)", self.html)
+        self.assertIn("_jEscDash(e.strategy_name)", self.html)
+
+    # ── 리뷰 회귀: 탭 클릭 시 중복 loadJournal 없음 ───────────
+    def test_no_double_load_on_tab_click(self):
+        # 탭 버튼 onclick 은 showTab 만 호출(loadJournal 중복 호출 금지)
+        self.assertIn('''onclick="showTab('tab-journal',this)"''', self.html)
+        self.assertNotIn('''showTab('tab-journal',this);loadJournal()''', self.html)
+        # 로드 트리거는 showTab 분기 한 곳
+        self.assertIn("if(id==='tab-journal') loadJournal();", self.html)
+
+    # ── 리뷰 회귀: 자동갱신 타이머 단일 등록 ──────────────────
+    def test_single_autorefresh_timer(self):
+        # 가드형 자동갱신 블록(탭 표시 중 + 토글 on)이 정확히 1회만 등록
+        self.assertEqual(self.html.count("auto && auto.checked){ loadJournal(); }"), 1)
+        # setInterval 로 직접 loadJournal 을 무조건 호출하는 형태는 없어야 함(가드 필수)
+        self.assertNotIn("setInterval(loadJournal", self.html)
+
+    # ── 리뷰 회귀: US 환율 표시 정책(모달·카드) ───────────────
+    def test_us_fx_policy_shown(self):
+        self.assertIn("원화 환산", self.html)
+        self.assertIn("환율 미확인", self.html)
+
+    # ── 리뷰 회귀: 모바일 반응형(테이블 가로스크롤 + 모달) ────
+    def test_mobile_responsive_containers(self):
+        # 목록은 table-wrap(overflow-x)로 감싸 모바일 가로 스크롤
+        self.assertRegex(self.html, r'class="table-wrap"[\s\S]*?id="jnl-tbody"')
+        # 필터바 flex-wrap 으로 줄바꿈
+        self.assertRegex(self.html, r'id="jf-from"[\s\S]{0,400}?')
+        self.assertIn("flex-wrap:wrap", self.html)
+        # 모달: 화면 넘칠 때 스크롤 + 반응형 폭
+        m = re.search(r'id="jnl-modal"[\s\S]{0,400}', self.html)
+        self.assertIsNotNone(m)
+        self.assertIn("overflow:auto", m.group(0))
+        self.assertIn("width:100%", m.group(0))
+        self.assertIn("max-width:", m.group(0))
+
 
 if __name__ == "__main__":
     unittest.main()

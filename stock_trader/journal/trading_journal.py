@@ -1295,7 +1295,8 @@ def query_daily_summary(
         where_sql = ("WHERE " + " AND ".join(wheres)) if wheres else ""
         avg_col = (
             ", (SELECT AVG(x.net_profit_pct) FROM trade_exits x "
-            "   WHERE substr(x.created_at,1,10)=daily_trade_summary.trade_date "
+            "   WHERE x.created_at >= daily_trade_summary.trade_date "
+            "     AND x.created_at < date(daily_trade_summary.trade_date, '+1 day') "
             "     AND x.market=daily_trade_summary.market "
             "     AND x.net_profit_pct IS NOT NULL) AS avg_return_pct"
         ) if include_avg_return else ""
@@ -1323,19 +1324,24 @@ def query_journal_card(date: Optional[str] = None) -> dict:
         conn = _get_conn()
         d = date or datetime.now().strftime("%Y-%m-%d")
 
+        # ★ 날짜 범위(sargable) — substr() 대신 idx_tx_created 활용.
+        #   created_at 는 'YYYY-MM-DDTHH:MM:SS.fff' 이므로 [d, d+1일) 문자열 범위비교로
+        #   당일(서버 localtime=KST) 청산거래를 인덱스로 선택한다.
         def _agg(market: Optional[str]) -> dict:
-            w = "substr(created_at,1,10)=?"
-            p: list = [d]
+            w = "created_at >= ? AND created_at < date(?, '+1 day')"
+            p: list = [d, d]
             if market:
                 w += " AND market=?"; p.append(market)
             row = conn.execute(
                 f"""SELECT
                       COUNT(*)                                    AS trades,
-                      COALESCE(SUM(pnl_krw), 0)                   AS pnl_krw,
-                      COALESCE(SUM(net_profit), 0)                AS pnl_native,
+                      SUM(pnl_krw)                                AS pnl_krw,
+                      SUM(net_profit)                             AS pnl_native,
                       SUM(CASE WHEN net_profit > 0 THEN 1 ELSE 0 END) AS wins,
                       SUM(CASE WHEN net_profit < 0 THEN 1 ELSE 0 END) AS losses,
-                      AVG(net_profit_pct)                         AS avg_return_pct
+                      AVG(net_profit_pct)                         AS avg_return_pct,
+                      SUM(CASE WHEN net_profit IS NOT NULL AND pnl_krw IS NULL
+                               THEN 1 ELSE 0 END)                 AS pnl_krw_missing
                     FROM trade_exits WHERE {w}""",
                 p,
             ).fetchone()
@@ -1343,10 +1349,17 @@ def query_journal_card(date: Optional[str] = None) -> dict:
             t = r.get("trades") or 0
             r["wins"]     = r.get("wins") or 0
             r["losses"]   = r.get("losses") or 0
+            r["pnl_krw"]  = r.get("pnl_krw") or 0.0
+            r["pnl_native"] = r.get("pnl_native") or 0.0
+            r["pnl_krw_missing"] = r.get("pnl_krw_missing") or 0
             r["win_rate"] = (r["wins"] / t * 100.0) if t else None
             return r
 
-        return {"date": d, "all": _agg(None), "KR": _agg("KR"), "US": _agg("US")}
+        allb = _agg(None)
+        # ★ 전체 블록의 pnl_native 는 KR(원)+US(USD) 혼화폐 합이므로 무의미 → None.
+        #   통합 손익은 반드시 pnl_krw(원) 를 사용한다.
+        allb["pnl_native"] = None
+        return {"date": d, "all": allb, "KR": _agg("KR"), "US": _agg("US")}
     except Exception as e:
         _inc_error("query_journal_card", e)
         return {"date": date, "all": {}, "KR": {}, "US": {}}
