@@ -60,7 +60,7 @@ from phoenix.lifecycle import (
 )
 from phoenix.execution_driven import ExecutionDrivenPositionUpdater
 from strategies.us_strategy_manager import (
-    _US_REG_REGISTERED, _US_REG_HOLD, _US_REG_ROLLBACK,
+    _US_REG_REGISTERED, _US_REG_PENDING_CONFIRM, _US_REG_UNKNOWN_CONFIRM,
 )
 
 

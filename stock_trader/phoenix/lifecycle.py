@@ -902,20 +902,34 @@ class OrderLifecycleManager:
             self.accept(lc, odno)
         return lc.current_state
 
-    def cancel_unaccepted(
+    def cancel_local_only(
         self, lc: OrderLifecycle, reason: Optional[str] = None
     ) -> LifecycleState:
-        """★ pre-accepted lifecycle 을 안전하게 단말(CANCELLED)로 종결한다.
+        """★ '외부 주문이 존재하지 않음이 확실한' pre-accepted lifecycle 만 로컬
+        단말(CANCELLED)로 정리한다. **외부 증권사 취소를 수행하지 않는다** —
+        순수 로컬 상태 종결 함수다.
 
-        UNKNOWN/SIGNAL_CONFIRMED/ORDER_SUBMITTED 처럼 아직 접수(ODNO)되지 않은
-        lifecycle 을 정리할 때 사용한다. EXPIRED 는 전이표상 접수 이후에만 도달
-        가능하므로, orphan 종결은 CANCELLED 로 한다. 상태 전이표를 준수해
-        (UNKNOWN → SIGNAL_CONFIRMED →) CANCELLED 로 밟아 내려간다. 이미 단말이거나
-        이미 접수(ORDER_ACCEPTED/PARTIALLY_FILLED)된 lifecycle 은 건드리지 않는다
-        (오사용 방지·멱등). 반환: 최종 current_state.
+        ⚠️ 호출 조건(엄격): 외부 접수(KIS rt_cd=0) 또는 ODNO 가 있을 수 있는
+           경로에서는 **절대 호출 금지**. 실주문이 살아 있는데 로컬만 CANCELLED 로
+           만들면 다음 회차 중복 주문이 나갈 수 있다.
+
+        안전장치: lc.odno 가 설정돼 있으면(=외부 주문번호 존재) 취소를 거부하고
+           현재 상태를 그대로 반환한다(무변경 + 경고). 이로써 ODNO 보유 주문이
+           이 함수로 실수 종결되는 사고를 원천 차단한다.
+
+        허용 대상: odno 가 없고 아직 접수 전(UNKNOWN/SIGNAL_CONFIRMED/ORDER_SUBMITTED)
+           인 lifecycle. 전이표를 준수해 (UNKNOWN→SIGNAL_CONFIRMED→) CANCELLED 로
+           밟아 내려간다. 이미 단말/접수된 경우는 무변경(멱등). 반환: 최종 상태.
         """
         s = LifecycleState
         if lc.is_terminal:
+            return lc.current_state
+        # ★ 외부 주문번호(ODNO) 보유 → 외부 주문 존재 가능 → 로컬 취소 거부.
+        if str(getattr(lc, "odno", "") or "").strip():
+            logger.warning(
+                "[Lifecycle] cancel_local_only 거부 — ODNO 보유(외부 주문 존재 "
+                "가능): order_lifecycle_id=%s odno=%r state=%s",
+                lc.order_lifecycle_id, lc.odno, lc.current_state.name)
             return lc.current_state
         if lc.current_state in (s.ORDER_ACCEPTED, s.PARTIALLY_FILLED):
             # 접수된 주문은 이 helper 로 종결하지 않는다(중복 방지·안전).
