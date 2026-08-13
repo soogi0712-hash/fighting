@@ -113,12 +113,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_po_trade_id ON pending_orders(trade_id);
 
 # pending_orders.status 상수
 class PendingStatus:
+    # ★ PENDING_SUBMIT: KIS 주문 API 호출 '전'에 저장하는 durable submit-intent.
+    #   ODNO 미확보(odno='') 상태이며, 접수 여부가 불명확한 창(호출 직후 crash 등)
+    #   에서도 재시작 후 동일 symbol/side 재주문을 차단하기 위한 앵커다.
+    PENDING_SUBMIT   = "PENDING_SUBMIT"
     ACCEPTED         = "ACCEPTED"
     PARTIALLY_FILLED = "PARTIALLY_FILLED"
     FILLED           = "FILLED"
     REJECTED         = "REJECTED"
     CANCELLED        = "CANCELLED"
     EXPIRED          = "EXPIRED"
+    # ★ UNKNOWN_CONFIRM: rt_cd=0·ODNO 미수신 / rt_cd=9(예외 래핑) / 알 수 없는 코드 /
+    #   ODNO 존재 rt_cd≠0 등 '외부 접수 가능하나 불명확' → 영속 확인대기(재주문 금지).
+    UNKNOWN_CONFIRM  = "UNKNOWN_CONFIRM"
     UNKNOWN          = "UNKNOWN"
 
     # 추적 대상 상태 (조회 대상)
@@ -349,6 +356,64 @@ class PendingOrderRegistry:
         except Exception as e:
             # 인덱스 생성 실패해도 기존 동작은 유지 (경고만)
             logger.warning(f"[PendingRegistry] trade_id UNIQUE 마이그레이션 실패: {e}")
+
+    # ── 제출-의도 사전 등록(KIS 호출 전 durable 앵커) ──────────────
+    def register_intent(
+        self,
+        market: str,
+        trade_id: str,
+        code: str,
+        side: str,
+        order_qty: int,
+        price: float,
+        submitted_at: str,
+        client_order_id: str = "",
+        exchange: Optional[str] = None,
+        currency: str = "KRW",
+    ) -> int:
+        """★ KIS 주문 API 호출 '전' 에 durable submit-intent 를 저장한다.
+
+        status=PENDING_SUBMIT, odno='' 로 삽입한다(register 와 달리 odno 필수 아님).
+        symbol/side/qty/price/client_intent_id(trade_id)/created_at 을 영속화해,
+        주문 응답 직후 프로세스가 강제종료돼도 재시작 후 이 앵커로 동일 symbol/side
+        재주문을 차단할 수 있게 한다. 가격은 raw_order_response 에 intent_price 로 보존.
+
+        저장 위치: trading_journal.db(pending_orders) — docker volume ./data:/app/data.
+        Returns: 삽입/갱신된 row id (실패 시 0 또는 예외).
+        """
+        conn = _get_conn()
+        now = datetime.now().isoformat()
+        raw_json = json.dumps(
+            {"intent_price": price, "intent": True}, ensure_ascii=False)
+        cur = conn.execute(
+            """
+            INSERT INTO pending_orders
+              (market, trade_id, code, side, odno, client_order_id,
+               order_qty, cumulative_filled_qty, status,
+               submitted_at, last_checked_at, retry_count,
+               raw_order_response, exchange, currency,
+               created_at, updated_at)
+            VALUES (?,?,?,?,?,?, ?,?,?, ?,?,?, ?,?,?, ?,?)
+            ON CONFLICT(trade_id) DO UPDATE SET
+               order_qty  = excluded.order_qty,
+               exchange   = excluded.exchange,
+               currency   = excluded.currency,
+               updated_at = excluded.updated_at
+            """,
+            (
+                market, trade_id, code, side, "", client_order_id,
+                order_qty, 0, PendingStatus.PENDING_SUBMIT,
+                submitted_at, None, 0,
+                raw_json, exchange, currency,
+                now, now,
+            ),
+        )
+        conn.commit()
+        logger.info(
+            f"[PendingRegistry] submit-intent 저장(PENDING_SUBMIT): market={market} "
+            f"code={code} side={side} qty={order_qty} price={price} trade_id={trade_id}"
+        )
+        return cur.lastrowid
 
     # ── 등록 ──────────────────────────────────────────────────
     def register(
