@@ -4462,20 +4462,29 @@ except Exception:
 
 @app.route("/api/trading/journal")
 def api_journal():
-    """거래 저널 목록 조회.
-    Query params: market(KR/US), code, state(OPEN/CLOSED/REJECTED), date_from, date_to, limit, offset
+    """거래 저널 목록 조회 (매수+매도 병합, 매매일지 탭용).
+
+    Query params:
+      market(KR/US), q(종목검색), code(정확일치),
+      status(보유중/확인대기/청산완료/거절), state(OPEN/CLOSED/REJECTED),
+      exit_category(트레일링/익절/손절/시간청산/수동/기타),
+      date_from, date_to, limit, offset
+    ★ 조회 전용 확장 — 매매 판단/DB 스키마는 변경하지 않음.
     """
     if not _APP_JOURNAL_ENABLED:
         return jsonify({"error": "journal module unavailable"}), 503
     try:
-        rows = _app_jnl.query_journal(
-            market    = request.args.get("market"),
-            code      = request.args.get("code"),
-            state     = request.args.get("state"),
-            date_from = request.args.get("date_from"),
-            date_to   = request.args.get("date_to"),
-            limit     = int(request.args.get("limit", 50)),
-            offset    = int(request.args.get("offset", 0)),
+        rows = _app_jnl.query_journal_list(
+            market        = request.args.get("market"),
+            q             = request.args.get("q"),
+            code          = request.args.get("code"),
+            status        = request.args.get("status"),
+            state         = request.args.get("state"),
+            exit_category = request.args.get("exit_category"),
+            date_from     = request.args.get("date_from"),
+            date_to       = request.args.get("date_to"),
+            limit         = int(request.args.get("limit", 100)),
+            offset        = int(request.args.get("offset", 0)),
         )
         return jsonify({"ok": True, "count": len(rows), "data": rows})
     except Exception as e:
@@ -4510,8 +4519,25 @@ def api_daily_summary():
             date   = date_str,
             market = request.args.get("market"),
             limit  = int(request.args.get("limit", 30)),
+            include_avg_return = True,
         )
         return jsonify({"ok": True, "date": date_str, "count": len(rows), "data": rows})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/trading/journal-card")
+def api_journal_card():
+    """매매일지 오늘 요약 카드 집계 (청산 확정 기준, 통합손익은 원(pnl_krw)).
+    Query params: date(YYYY-MM-DD, 기본=오늘). ★ 조회 전용 — 매매 로직/DB 무변경.
+    """
+    if not _APP_JOURNAL_ENABLED:
+        return jsonify({"error": "journal module unavailable"}), 503
+    try:
+        from datetime import date as _date
+        date_str = request.args.get("date", _date.today().isoformat())
+        data = _app_jnl.query_journal_card(date_str)
+        return jsonify({"ok": True, "data": data})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 

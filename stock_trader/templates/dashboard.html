@@ -491,6 +491,7 @@ tr:hover td{background:rgba(88,166,255,.03);}
       <div class="tab" onclick="showTab('tab-us',this);loadUSMarket()">🇺🇸 미국증시</div>
       <div class="tab" onclick="showTab('tab-indicator',this)">🎯 지표 검증</div>
       <div class="tab" onclick="showTab('tab-trades',this)">📜 거래내역</div>
+      <div class="tab" onclick="showTab('tab-journal',this);loadJournal()">📒 매매일지</div>
       <div class="tab" onclick="showTab('tab-backtest',this)">🧪 백테스트</div>
       <div class="tab" onclick="showTab('tab-logs',this)">📡 로그</div>
     </div>
@@ -670,6 +671,65 @@ tr:hover td{background:rgba(88,166,255,.03);}
         <button onclick="document.getElementById('log-area').innerHTML=''" style="padding:3px 9px;background:var(--surface2);border:1px solid var(--border);border-radius:4px;color:var(--muted);cursor:pointer;font-size:.72rem">지우기</button>
       </div>
       <div class="log-area" id="log-area"></div>
+    </div>
+
+    <!-- 📒 매매일지 -->
+    <div id="tab-journal" style="display:none;padding:16px">
+      <style>
+        #tab-journal .jf-l{font-size:.66rem;color:var(--muted);margin-bottom:3px;}
+        #tab-journal .jf-i{background:var(--surface2);border:1px solid var(--border);border-radius:5px;color:var(--text);padding:5px 8px;font-size:.76rem;}
+        #tab-journal .jbadge{display:inline-block;padding:2px 7px;border-radius:10px;font-size:.68rem;font-weight:700;}
+        #tab-journal tbody tr{cursor:pointer;}
+        #tab-journal .tl-dot{width:9px;height:9px;border-radius:50%;background:var(--blue);flex:0 0 auto;margin-top:4px;}
+        #tab-journal .tl-line{border-left:2px solid var(--border);margin-left:4px;padding-left:14px;padding-bottom:12px;}
+      </style>
+
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px;">
+        <span style="font-size:1rem;font-weight:700;">📒 매매일지</span>
+        <div style="display:flex;gap:10px;align-items:center;">
+          <span id="jnl-updated" style="font-size:.7rem;color:var(--muted)">—</span>
+          <label style="font-size:.7rem;color:var(--muted);display:flex;align-items:center;gap:4px;cursor:pointer;">
+            <input type="checkbox" id="jnl-auto" checked> 30초 자동갱신
+          </label>
+          <button onclick="loadJournal()" style="padding:6px 12px;background:var(--surface2);border:1px solid var(--blue);border-radius:6px;color:var(--blue);cursor:pointer;font-size:.78rem;font-weight:600;">🔄 새로고침</button>
+        </div>
+      </div>
+
+      <!-- 오늘 요약 카드 -->
+      <div class="stat-grid" id="jnl-cards" style="margin-bottom:14px;">
+        <div class="stat-card"><div class="lbl">오늘 실현손익(전체·원)</div><div class="val" id="jc-all">-</div><div class="sub" id="jc-all-sub">-</div></div>
+        <div class="stat-card"><div class="lbl">국내 실현손익</div><div class="val" id="jc-kr">-</div><div class="sub" id="jc-kr-sub">-</div></div>
+        <div class="stat-card"><div class="lbl">미국 실현손익</div><div class="val" id="jc-us">-</div><div class="sub" id="jc-us-sub">-</div></div>
+        <div class="stat-card"><div class="lbl">완료 거래수</div><div class="val" id="jc-trades">-</div><div class="sub">청산 확정</div></div>
+        <div class="stat-card"><div class="lbl">승 / 패</div><div class="val" id="jc-wl">-</div><div class="sub">&nbsp;</div></div>
+        <div class="stat-card"><div class="lbl">승률</div><div class="val" id="jc-winrate">-</div><div class="sub">&nbsp;</div></div>
+        <div class="stat-card"><div class="lbl">평균 수익률</div><div class="val" id="jc-avg">-</div><div class="sub">청산 net%</div></div>
+      </div>
+
+      <!-- 필터 -->
+      <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;margin-bottom:12px;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:10px;">
+        <div><div class="jf-l">시작일</div><input type="date" id="jf-from" class="jf-i"></div>
+        <div><div class="jf-l">종료일</div><input type="date" id="jf-to" class="jf-i"></div>
+        <div><div class="jf-l">시장</div><select id="jf-market" class="jf-i"><option value="">전체</option><option value="KR">국내</option><option value="US">미국</option></select></div>
+        <div><div class="jf-l">상태</div><select id="jf-status" class="jf-i"><option value="">전체</option><option>보유중</option><option>확인대기</option><option>청산완료</option><option>거절</option></select></div>
+        <div><div class="jf-l">매도사유</div><select id="jf-exit" class="jf-i"><option value="">전체</option><option>트레일링</option><option>익절</option><option>손절</option><option>시간청산</option><option>수동</option><option>기타</option></select></div>
+        <div style="flex:1;min-width:130px;"><div class="jf-l">종목 검색</div><input type="text" id="jf-q" class="jf-i" placeholder="코드/종목명" style="width:100%" onkeydown="if(event.key==='Enter')loadJournalList()"></div>
+        <button onclick="loadJournalList()" style="padding:7px 14px;background:var(--blue);border:none;border-radius:6px;color:#fff;cursor:pointer;font-size:.78rem;font-weight:700;">조회</button>
+        <button onclick="resetJournalFilter()" style="padding:7px 12px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--muted);cursor:pointer;font-size:.78rem;">초기화</button>
+      </div>
+
+      <!-- 거래 목록 -->
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>시장</th><th>종목</th><th>매수일시</th><th>매도일시</th><th>수량</th>
+            <th>평균매수가</th><th>평균매도가</th><th>실현손익</th><th>수익률</th>
+            <th>매수사유</th><th>매도사유</th><th>상태</th>
+          </tr></thead>
+          <tbody id="jnl-tbody"><tr><td colspan="12" style="text-align:center;color:var(--muted);padding:20px">불러오는 중…</td></tr></tbody>
+        </table>
+      </div>
+      <div id="jnl-count" style="font-size:.7rem;color:var(--muted);margin-top:8px;">—</div>
     </div>
   </div>
 
@@ -1083,10 +1143,11 @@ function escHtml(s){
 function showTab(id,el){
   document.querySelectorAll('.tabs .tab').forEach(t=>t.classList.remove('active'));
   el.classList.add('active');
-  ['tab-chart','tab-us','tab-indicator','tab-trades','tab-backtest','tab-logs'].forEach(tid=>{
+  ['tab-chart','tab-us','tab-indicator','tab-trades','tab-journal','tab-backtest','tab-logs'].forEach(tid=>{
     document.getElementById(tid).style.display=tid===id?'block':'none';
   });
   if(id==='tab-trades') loadTrades();
+  if(id==='tab-journal') loadJournal();
 }
 
 // ── 차트 ───────────────────────────────────────────────────
@@ -1294,6 +1355,189 @@ async function loadTrades(){
   // stat-today-profit은 /api/asset-summary의 realized_pnl로 동기화 (loadAssetSummary 담당)
   // 여기서는 거래 테이블 렌더링만 수행
 }
+
+// ── 📒 매매일지 ─────────────────────────────────────────────
+function _jDash(v){ return (v===null||v===undefined||v==='') ? '-' : v; }
+function _jNum(v){ return (v===null||v===undefined||isNaN(v)) ? null : Number(v); }
+function _jMoney(v, cur){
+  const n=_jNum(v); if(n===null) return '-';
+  const sign=n>0?'+':'';
+  if(cur==='US') return sign+n.toLocaleString(undefined,{maximumFractionDigits:2})+'$';
+  return sign+Math.round(n).toLocaleString()+'원';
+}
+function _jPct(v){
+  const n=_jNum(v); if(n===null) return '-';
+  return (n>0?'+':'')+n.toFixed(2)+'%';
+}
+function _jColor(v){ // 빨강=수익, 파랑=손실 (국내 관례)
+  const n=_jNum(v); if(n===null||n===0) return 'color:var(--muted)';
+  return n>0?'color:var(--red)':'color:var(--blue)';
+}
+function _jTime(v){ return v ? String(v).slice(0,16).replace('T',' ') : '-'; }
+function _jStatusBadge(s){
+  const map={'보유중':'var(--yellow)','확인대기':'var(--orange)','청산완료':'var(--green)','거절':'var(--muted)'};
+  const c=map[s]||'var(--muted)';
+  return `<span class="jbadge" style="color:${c};border:1px solid ${c};background:rgba(139,148,158,.08)">${_jDash(s)}</span>`;
+}
+function _jExitBadge(cat){
+  if(!cat) return '-';
+  const map={'트레일링':'var(--purple)','익절':'var(--red)','손절':'var(--blue)','시간청산':'var(--orange)','수동':'var(--yellow)','기타':'var(--muted)'};
+  const c=map[cat]||'var(--muted)';
+  return `<span class="jbadge" style="color:${c};border:1px solid ${c};background:rgba(139,148,158,.08)">${cat}</span>`;
+}
+
+async function loadJournal(){
+  await Promise.all([loadJournalCard(), loadJournalList()]);
+  const el=document.getElementById('jnl-updated');
+  if(el) el.textContent='갱신 '+new Date().toLocaleTimeString('ko-KR');
+}
+
+async function loadJournalCard(){
+  try{
+    const j=await fetch('/api/trading/journal-card').then(r=>r.json());
+    if(!j.ok){ return; }
+    const d=j.data||{}; const a=d.all||{}, kr=d.KR||{}, us=d.US||{};
+    const set=(id,html,style)=>{ const e=document.getElementById(id); if(e){ e.innerHTML=html; if(style!==undefined) e.style.cssText=style; } };
+    set('jc-all', _jMoney(a.pnl_krw,'KR'), _jColor(a.pnl_krw));
+    set('jc-all-sub', '거래 '+_jDash(a.trades)+'건');
+    set('jc-kr', _jMoney(kr.pnl_native,'KR'), _jColor(kr.pnl_native));
+    set('jc-kr-sub', '거래 '+_jDash(kr.trades)+'건');
+    set('jc-us', _jMoney(us.pnl_native,'US'), _jColor(us.pnl_native));
+    set('jc-us-sub', (_jNum(us.pnl_krw)!==null?('≈'+_jMoney(us.pnl_krw,'KR')):'') + ' · 거래 '+_jDash(us.trades)+'건');
+    set('jc-trades', _jDash(a.trades));
+    set('jc-wl', _jDash(a.wins)+' / '+_jDash(a.losses));
+    set('jc-winrate', a.win_rate!=null?a.win_rate.toFixed(1)+'%':'-');
+    set('jc-avg', _jPct(a.avg_return_pct), _jColor(a.avg_return_pct));
+  }catch(e){ /* 화면 유지, 무시 */ }
+}
+
+async function loadJournalList(){
+  const tb=document.getElementById('jnl-tbody'); if(!tb) return;
+  const p=new URLSearchParams();
+  const g=id=>{ const e=document.getElementById(id); return e?e.value:''; };
+  if(g('jf-market')) p.set('market', g('jf-market'));
+  if(g('jf-status')) p.set('status', g('jf-status'));
+  if(g('jf-exit'))   p.set('exit_category', g('jf-exit'));
+  if(g('jf-q'))      p.set('q', g('jf-q').trim());
+  if(g('jf-from'))   p.set('date_from', g('jf-from'));
+  if(g('jf-to'))     p.set('date_to', g('jf-to'));
+  p.set('limit','200');
+  try{
+    const j=await fetch('/api/trading/journal?'+p.toString()).then(r=>r.json());
+    const rows=(j&&j.ok&&j.data)?j.data:[];
+    const cnt=document.getElementById('jnl-count');
+    if(cnt) cnt.textContent=rows.length?('총 '+rows.length+'건'):'조회 결과 없음';
+    if(!rows.length){ tb.innerHTML='<tr><td colspan="12" style="text-align:center;color:var(--muted);padding:20px">데이터 없음</td></tr>'; return; }
+    tb.innerHTML=rows.map(r=>{
+      const cur=r.market;
+      const buyT=_jTime(r.buy_fill_time||r.order_time||r.signal_time);
+      const sellT=_jTime(r.sell_fill_time);
+      const qty=_jNum(r.fill_qty)||_jNum(r.order_qty);
+      const buyP=_jNum(r.avg_price), sellP=_jNum(r.sell_fill_price);
+      const pnl=(r.net_profit!=null)?r.net_profit:(r.pnl_krw!=null?r.pnl_krw:null);
+      const mk = cur==='US'?'<span style="color:var(--blue)">🇺🇸US</span>':'<span style="color:var(--red)">🇰🇷KR</span>';
+      return `<tr onclick="openJournalModal('${r.trade_id}')">
+        <td>${mk}</td>
+        <td><b>${_jDash(r.name)}</b><div style="font-size:.66rem;color:var(--muted)">${_jDash(r.code)}</div></td>
+        <td style="color:var(--muted);white-space:nowrap">${buyT}</td>
+        <td style="color:var(--muted);white-space:nowrap">${sellT}</td>
+        <td>${qty!=null?qty.toLocaleString()+'주':'-'}</td>
+        <td>${buyP!=null?buyP.toLocaleString(undefined,{maximumFractionDigits:2}):'-'}</td>
+        <td>${sellP!=null?sellP.toLocaleString(undefined,{maximumFractionDigits:2}):'-'}</td>
+        <td style="${_jColor(pnl)}">${_jMoney(pnl,cur)}</td>
+        <td style="${_jColor(r.net_profit_pct)}">${_jPct(r.net_profit_pct)}</td>
+        <td style="max-width:150px;font-size:.7rem;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(r.entry_reason||'').replace(/"/g,'')}">${_jDash(r.entry_reason)}</td>
+        <td>${_jExitBadge(r.exit_category)}</td>
+        <td>${_jStatusBadge(r.status_display)}</td>
+      </tr>`;
+    }).join('');
+  }catch(e){
+    tb.innerHTML='<tr><td colspan="12" style="text-align:center;color:var(--blue);padding:20px">불러오기 실패</td></tr>';
+  }
+}
+
+function resetJournalFilter(){
+  ['jf-from','jf-to','jf-q'].forEach(id=>{const e=document.getElementById(id); if(e)e.value='';});
+  ['jf-market','jf-status','jf-exit'].forEach(id=>{const e=document.getElementById(id); if(e)e.value='';});
+  loadJournalList();
+}
+
+const _JM_EVENT_LABEL={
+  SIGNAL_CONFIRMED:'🔔 신호 발생', ORDER_SUBMITTED:'📤 주문 제출', ORDER_ACCEPTED:'✅ 접수(주문번호)',
+  ORDER_FILLED:'🟢 완전체결(매수)', ORDER_PARTIALLY_FILLED:'🟡 부분체결', ORDER_REJECTED:'❌ 주문거절',
+  SELL_SIGNAL_CONFIRMED:'🔔 매도 신호', SELL_ORDER_SUBMITTED:'📤 매도 제출', SELL_ORDER_ACCEPTED:'✅ 매도 접수',
+  SELL_ORDER_FILLED:'🔵 매도 체결', SELL_ORDER_REJECTED:'❌ 매도거절', TRADE_CLOSED:'🏁 청산 완료',
+  PRICE_HIGH_UPDATED:'📈 최고가 갱신', PRICE_LOW_UPDATED:'📉 최저가 갱신'
+};
+
+async function openJournalModal(tradeId){
+  const modal=document.getElementById('jnl-modal'), body=document.getElementById('jm-body'), title=document.getElementById('jm-title');
+  if(!modal) return;
+  body.innerHTML='<div style="color:var(--muted);padding:20px;text-align:center">불러오는 중…</div>';
+  modal.style.display='flex';
+  try{
+    const j=await fetch('/api/trading/journal/'+encodeURIComponent(tradeId)).then(r=>r.json());
+    if(!j.ok||!j.data){ body.innerHTML='<div style="color:var(--blue);padding:20px">상세를 찾을 수 없습니다.</div>'; return; }
+    const e=j.data.entry||{}, x=j.data.exit||null, evs=j.data.events||[];
+    title.textContent='📒 '+_jDash(e.name)+' ('+_jDash(e.code)+') · '+_jDash(e.market);
+    // 주문번호(odno) 추출: 이벤트 payload_json 또는 note("odno=...") 에서 best-effort
+    let odno='-';
+    for(const ev of evs){
+      try{ const pj=ev.payload_json?JSON.parse(ev.payload_json):{}; if(pj.odno||pj.ODNO){ odno=pj.odno||pj.ODNO; break; } }catch(_){}
+      const m=String(ev.note||'').match(/odno=([A-Za-z0-9]+)/i); if(m){ odno=m[1]; break; }
+    }
+    // 트레일링 최고가 (exit 확정값 우선, 없으면 PRICE_HIGH 이벤트 max)
+    let hi=null; evs.forEach(ev=>{ if(ev.event_type==='PRICE_HIGH_UPDATED'){ const pv=_jNum(ev.price); if(pv!=null&&(hi===null||pv>hi))hi=pv; } });
+    const row=(k,v)=>`<div style="display:flex;justify-content:space-between;gap:12px;padding:3px 0;border-bottom:1px solid var(--border)"><span style="color:var(--muted)">${k}</span><span>${v}</span></div>`;
+    const holdH = _jNum(x&&x.holding_seconds); const holdStr = holdH!=null?(Math.floor(holdH/3600)+'시간 '+Math.floor((holdH%3600)/60)+'분'):'-';
+    let html='<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:14px">';
+    html+='<div>';
+    html+=row('전략', _jDash(e.strategy_name));
+    html+=row('진입유형', _jDash(e.entry_type));
+    html+=row('매수 점수', _jDash(_jNum(e.buy_score)));
+    html+=row('신호가', e.signal_price!=null?Number(e.signal_price).toLocaleString():'-');
+    html+=row('평균매수가', e.avg_price!=null?Number(e.avg_price).toLocaleString():'-');
+    html+=row('주문번호', _jDash(odno));
+    html+=row('상태', _jStatusBadge(_jDash(x?'청산완료':(e.state==='OPEN'?(e.fill_confirmed?'보유중':'확인대기'):(e.state==='REJECTED'?'거절':e.state)))));
+    html+='</div><div>';
+    html+=row('실현손익', x?`<span style="${_jColor(x.net_profit)}">${_jMoney(x.net_profit,e.market)}</span>`:'-');
+    html+=row('수익률', x?`<span style="${_jColor(x.net_profit_pct)}">${_jPct(x.net_profit_pct)}</span>`:'-');
+    html+=row('보유 중 최고수익률', x&&x.max_profit_pct!=null?`<span style="color:var(--red)">${_jPct(x.max_profit_pct)}</span>`:'-');
+    html+=row('보유 중 최대하락률', x&&x.max_drawdown_pct!=null?`<span style="color:var(--blue)">${_jPct(x.max_drawdown_pct)}</span>`:'-');
+    html+=row('트레일링 최고가', hi!=null?hi.toLocaleString():(x&&x.max_profit_pct!=null?'(수익률로 대체)':'-'));
+    html+=row('매도기준(사유)', x?(_jExitBadge(_jExitCat(x))+' <span style="font-size:.68rem;color:var(--muted)">'+_jDash(x.exit_reason)+'</span>'):'-');
+    html+=row('보유시간', holdStr);
+    html+='</div></div>';
+    // 타임라인
+    html+='<div style="font-weight:700;margin:6px 0 8px">라이프사이클 타임라인</div>';
+    if(!evs.length){ html+='<div style="color:var(--muted)">이벤트 기록 없음</div>'; }
+    else{
+      html+='<div>';
+      evs.forEach((ev,i)=>{
+        const lbl=_JM_EVENT_LABEL[ev.event_type]||ev.event_type;
+        const meta=[]; if(ev.price!=null)meta.push('가격 '+Number(ev.price).toLocaleString()); if(ev.qty!=null&&ev.qty!==0)meta.push('수량 '+ev.qty); if(ev.rt_cd)meta.push('rt_cd='+ev.rt_cd);
+        html+=`<div style="display:flex;gap:8px"><div class="tl-dot"></div><div class="tl-line" style="${i===evs.length-1?'border-left-color:transparent':''}">
+          <div style="font-size:.78rem;font-weight:600">${lbl}</div>
+          <div style="font-size:.68rem;color:var(--muted)">${_jTime(ev.ts)} ${meta.length?'· '+meta.join(' · '):''}</div>
+          ${ev.note?`<div style="font-size:.66rem;color:var(--muted)">${String(ev.note).replace(/</g,'&lt;')}</div>`:''}
+        </div></div>`;
+      });
+      html+='</div>';
+    }
+    body.innerHTML=html;
+  }catch(err){ body.innerHTML='<div style="color:var(--blue);padding:20px">상세 조회 실패</div>'; }
+}
+function _jExitCat(x){
+  if(!x) return null;
+  if(x.is_stoploss) return '손절';
+  const r=String(x.exit_reason||'');
+  if(r.includes('트레일')) return '트레일링';
+  if(r.includes('익절')||r.includes('목표')) return '익절';
+  if(r.includes('시간')||r.includes('마감')||r.includes('장종료')) return '시간청산';
+  if(x.is_forced||r.includes('수동')||r.includes('강제')) return '수동';
+  return '기타';
+}
+function closeJournalModal(){ const m=document.getElementById('jnl-modal'); if(m)m.style.display='none'; }
 
 // ── 시장 국면 배지/배분 패널 업데이트 ────────────────────────
 function applyRegime(status){
@@ -1688,6 +1932,24 @@ setInterval(renderPyramid,   20000);
 setInterval(loadHoldings,    30000);  // ★ 실제 계좌 보유현황 30초마다 갱신
 setInterval(loadCompound,    15000);
 setInterval(loadUSBalance,   60000);  // ★ 해외잔고 1분마다 갱신
+
+// ── 📒 매매일지 30초 자동갱신 (탭 표시 중 + 자동갱신 체크 시에만) ──
+setInterval(()=>{
+  const tab=document.getElementById('tab-journal');
+  const auto=document.getElementById('jnl-auto');
+  if(tab && tab.style.display!=='none' && auto && auto.checked){ loadJournal(); }
+}, 30000);
 </script>
+
+<!-- 📒 매매일지 상세 모달 -->
+<div id="jnl-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.62);z-index:1000;align-items:flex-start;justify-content:center;overflow:auto;padding:30px 12px;" onclick="if(event.target===this)closeJournalModal()">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;max-width:840px;width:100%;padding:20px;box-shadow:0 12px 40px rgba(0,0,0,.5)">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
+      <span id="jm-title" style="font-size:1rem;font-weight:700;">거래 상세</span>
+      <button onclick="closeJournalModal()" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--muted);cursor:pointer;padding:4px 11px;font-size:.9rem">✕</button>
+    </div>
+    <div id="jm-body" style="font-size:.8rem;"></div>
+  </div>
+</div>
 </body>
 </html>

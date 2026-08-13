@@ -1074,6 +1074,179 @@ def query_journal(
         return []
 
 
+def classify_exit_category(exit_reason: Optional[str],
+                           is_stoploss=0, is_forced=0) -> Optional[str]:
+    """매도사유 문자열/플래그 → 표시용 카테고리(트레일링/익절/손절/시간청산/수동/기타).
+
+    ★ 관측·표시 전용. 매매 판단 로직과 무관하며 DB 를 변경하지 않는다.
+      미청산(exit 없음) 이면 None 을 반환한다.
+    """
+    if not exit_reason and not is_stoploss and not is_forced:
+        return None
+    r = str(exit_reason or "")
+    if is_stoploss:
+        return "손절"
+    if "트레일" in r or "trail" in r.lower():
+        return "트레일링"
+    if "익절" in r or "목표" in r:
+        return "익절"
+    if "시간" in r or "마감" in r or "청산시간" in r or "장종료" in r:
+        return "시간청산"
+    if is_forced or "수동" in r or "강제" in r:
+        return "수동"
+    return "기타"
+
+
+def _status_display(state: Optional[str], fill_confirmed) -> str:
+    """상태 표시(보유중/확인대기/청산완료/거절). 구버전 데이터도 안전."""
+    s = (state or "").upper()
+    if s == "CLOSED":
+        return "청산완료"
+    if s == "REJECTED":
+        return "거절"
+    if s == "OPEN":
+        return "보유중" if fill_confirmed else "확인대기"
+    return s or "-"
+
+
+# 상태 필터(표시값) → SQL 조건 매핑
+_STATUS_WHERE = {
+    "보유중":   ("e.state=? AND e.fill_confirmed=1", ["OPEN"]),
+    "확인대기": ("e.state=? AND (e.fill_confirmed=0 OR e.fill_confirmed IS NULL)", ["OPEN"]),
+    "청산완료": ("e.state=?", ["CLOSED"]),
+    "거절":     ("e.state=?", ["REJECTED"]),
+    "OPEN":     ("e.state=?", ["OPEN"]),
+    "CLOSED":   ("e.state=?", ["CLOSED"]),
+    "REJECTED": ("e.state=?", ["REJECTED"]),
+}
+
+# 매도사유 카테고리 → SQL 조건(청산 존재 전제)
+_EXIT_CAT_WHERE = {
+    "손절":     ("x.is_stoploss=1", []),
+    "트레일링": ("(x.exit_reason LIKE '%트레일%')", []),
+    "익절":     ("(x.exit_reason LIKE '%익절%' OR x.exit_reason LIKE '%목표%')", []),
+    "시간청산": ("(x.exit_reason LIKE '%시간%' OR x.exit_reason LIKE '%마감%' OR x.exit_reason LIKE '%장종료%')", []),
+    "수동":     ("(x.is_forced=1 OR x.exit_reason LIKE '%수동%' OR x.exit_reason LIKE '%강제%')", []),
+    "기타":     ("(x.trade_id IS NOT NULL AND x.is_stoploss=0 AND (x.is_forced=0 OR x.is_forced IS NULL) "
+                 "AND (x.exit_reason IS NULL OR (x.exit_reason NOT LIKE '%트레일%' "
+                 "AND x.exit_reason NOT LIKE '%익절%' AND x.exit_reason NOT LIKE '%목표%' "
+                 "AND x.exit_reason NOT LIKE '%시간%' AND x.exit_reason NOT LIKE '%마감%' "
+                 "AND x.exit_reason NOT LIKE '%장종료%' AND x.exit_reason NOT LIKE '%수동%' "
+                 "AND x.exit_reason NOT LIKE '%강제%')))", []),
+}
+
+
+def query_journal_list(
+    market: Optional[str] = None,
+    q: Optional[str] = None,
+    code: Optional[str] = None,
+    status: Optional[str] = None,
+    state: Optional[str] = None,
+    exit_category: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> list:
+    """매매일지 목록: trade_entries LEFT JOIN trade_exits (매수+매도 필드 병합).
+
+    ★ 조회 전용. 기존 query_journal 은 변경하지 않고, 목록 표시에 필요한 매도 필드
+      (매도일시/평균매도가/실현손익/수익률/매도사유)와 파생 필드(status_display,
+      exit_category)를 추가로 제공한다. DB 스키마·매매 로직은 변경하지 않는다.
+
+    필터:
+      market       : KR / US
+      q            : 종목 검색(코드 또는 종목명 부분일치)
+      code         : 코드 정확일치(하위호환)
+      status       : 보유중 / 확인대기 / 청산완료 / 거절 (표시값) — state 보다 우선
+      state        : OPEN / CLOSED / REJECTED (원시값)
+      exit_category: 트레일링 / 익절 / 손절 / 시간청산 / 수동 / 기타
+      date_from/to : entry.created_at 기준 (YYYY-MM-DD)
+    """
+    try:
+        conn   = _get_conn()
+        wheres = []
+        params: list = []
+        if market:
+            wheres.append("e.market=?"); params.append(market)
+        if q:
+            wheres.append("(e.code LIKE ? OR e.name LIKE ?)")
+            params += [f"%{q}%", f"%{q}%"]
+        if code:
+            wheres.append("e.code=?"); params.append(code)
+        _st = status or state
+        if _st and _st in _STATUS_WHERE:
+            cond, cparams = _STATUS_WHERE[_st]
+            wheres.append(cond); params += cparams
+        if exit_category and exit_category in _EXIT_CAT_WHERE:
+            cond, cparams = _EXIT_CAT_WHERE[exit_category]
+            wheres.append(cond); params += cparams
+        if date_from:
+            wheres.append("e.created_at >= ?"); params.append(date_from)
+        if date_to:
+            wheres.append("e.created_at <= ?"); params.append(date_to + "T23:59:59")
+        where_sql = ("WHERE " + " AND ".join(wheres)) if wheres else ""
+        params += [limit, offset]
+        rows = conn.execute(
+            f"""
+            SELECT
+              e.trade_id            AS trade_id,
+              e.market              AS market,
+              e.code                AS code,
+              e.name                AS name,
+              e.entry_type          AS entry_type,
+              e.strategy_name       AS strategy_name,
+              e.signal_time         AS signal_time,
+              e.signal_price        AS signal_price,
+              e.buy_score           AS buy_score,
+              e.sell_score          AS sell_score,
+              e.order_time          AS order_time,
+              e.order_qty           AS order_qty,
+              e.fill_time           AS buy_fill_time,
+              e.fill_qty            AS fill_qty,
+              e.fill_confirmed      AS fill_confirmed,
+              e.avg_price           AS avg_price,
+              e.entry_reason        AS entry_reason,
+              e.session             AS session,
+              e.state               AS state,
+              e.created_at          AS entry_created_at,
+              x.exit_reason         AS exit_reason,
+              x.sell_signal_time    AS sell_signal_time,
+              x.sell_fill_time      AS sell_fill_time,
+              x.sell_fill_price     AS sell_fill_price,
+              x.sell_fill_qty       AS sell_fill_qty,
+              x.net_profit          AS net_profit,
+              x.net_profit_pct      AS net_profit_pct,
+              x.pnl_krw             AS pnl_krw,
+              x.holding_seconds     AS holding_seconds,
+              x.max_profit_pct      AS max_profit_pct,
+              x.max_drawdown_pct    AS max_drawdown_pct,
+              x.is_stoploss         AS is_stoploss,
+              x.is_forced           AS is_forced,
+              x.trade_id            AS has_exit
+            FROM trade_entries e
+            LEFT JOIN trade_exits x ON x.trade_id = e.trade_id
+            {where_sql}
+            ORDER BY e.created_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            params,
+        ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["status_display"] = _status_display(d.get("state"), d.get("fill_confirmed"))
+            d["exit_category"]  = classify_exit_category(
+                d.get("exit_reason"), d.get("is_stoploss") or 0,
+                d.get("is_forced") or 0) if d.get("has_exit") else None
+            d.pop("has_exit", None)
+            out.append(d)
+        return out
+    except Exception as e:
+        _inc_error("query_journal_list", e)
+        return []
+
+
 def query_journal_detail(trade_id: str) -> Optional[dict]:
     """trade_id 상세 조회 (entry + exit + events)."""
     try:
@@ -1104,8 +1277,13 @@ def query_daily_summary(
     date: Optional[str] = None,
     market: Optional[str] = None,
     limit: int = 30,
+    include_avg_return: bool = False,
 ) -> list:
-    """daily_trade_summary 조회."""
+    """daily_trade_summary 조회.
+
+    include_avg_return=True 이면 각 행에 avg_return_pct(해당 날짜·시장 청산거래의
+    net_profit_pct 평균)를 추가한다. 기본 False → 기존 반환 형태 하위호환.
+    """
     try:
         conn   = _get_conn()
         wheres = []
@@ -1115,9 +1293,15 @@ def query_daily_summary(
         if market:
             wheres.append("market=?"); params.append(market)
         where_sql = ("WHERE " + " AND ".join(wheres)) if wheres else ""
+        avg_col = (
+            ", (SELECT AVG(x.net_profit_pct) FROM trade_exits x "
+            "   WHERE substr(x.created_at,1,10)=daily_trade_summary.trade_date "
+            "     AND x.market=daily_trade_summary.market "
+            "     AND x.net_profit_pct IS NOT NULL) AS avg_return_pct"
+        ) if include_avg_return else ""
         params.append(limit)
         rows = conn.execute(
-            f"SELECT * FROM daily_trade_summary {where_sql}"
+            f"SELECT *{avg_col} FROM daily_trade_summary {where_sql}"
             f" ORDER BY trade_date DESC, market LIMIT ?",
             params,
         ).fetchall()
@@ -1125,6 +1309,47 @@ def query_daily_summary(
     except Exception as e:
         _inc_error("query_daily_summary", e)
         return []
+
+
+def query_journal_card(date: Optional[str] = None) -> dict:
+    """매매일지 '오늘 요약 카드' 집계 (청산 확정 trade_exits 기준, 조회 전용).
+
+    ★ 시장 통합 손익은 pnl_krw(원) 로 합산해 통화 혼동을 방지한다.
+      pnl_native 는 시장 원화폐(KR: 원, US: USD). DB/매매 로직 변경 없음.
+    반환: {date, all:{...}, KR:{...}, US:{...}} — 각 블록:
+      trades, wins, losses, win_rate, pnl_krw, pnl_native, avg_return_pct
+    """
+    try:
+        conn = _get_conn()
+        d = date or datetime.now().strftime("%Y-%m-%d")
+
+        def _agg(market: Optional[str]) -> dict:
+            w = "substr(created_at,1,10)=?"
+            p: list = [d]
+            if market:
+                w += " AND market=?"; p.append(market)
+            row = conn.execute(
+                f"""SELECT
+                      COUNT(*)                                    AS trades,
+                      COALESCE(SUM(pnl_krw), 0)                   AS pnl_krw,
+                      COALESCE(SUM(net_profit), 0)                AS pnl_native,
+                      SUM(CASE WHEN net_profit > 0 THEN 1 ELSE 0 END) AS wins,
+                      SUM(CASE WHEN net_profit < 0 THEN 1 ELSE 0 END) AS losses,
+                      AVG(net_profit_pct)                         AS avg_return_pct
+                    FROM trade_exits WHERE {w}""",
+                p,
+            ).fetchone()
+            r = dict(row)
+            t = r.get("trades") or 0
+            r["wins"]     = r.get("wins") or 0
+            r["losses"]   = r.get("losses") or 0
+            r["win_rate"] = (r["wins"] / t * 100.0) if t else None
+            return r
+
+        return {"date": d, "all": _agg(None), "KR": _agg("KR"), "US": _agg("US")}
+    except Exception as e:
+        _inc_error("query_journal_card", e)
+        return {"date": date, "all": {}, "KR": {}, "US": {}}
 
 
 # ── 모듈 import 시 자동 초기화 ────────────────────────────────
