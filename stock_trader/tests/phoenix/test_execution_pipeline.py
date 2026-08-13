@@ -59,6 +59,9 @@ from phoenix.lifecycle import (
     make_order_lifecycle_id,
 )
 from phoenix.execution_driven import ExecutionDrivenPositionUpdater
+from strategies.us_strategy_manager import (
+    _US_REG_REGISTERED, _US_REG_HOLD, _US_REG_ROLLBACK,
+)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -658,7 +661,7 @@ class TestUSPipeline(unittest.TestCase):
             excd="NASD", trade_id="us-trade-001",
         )
         reg.register.assert_called_once()
-        self.assertEqual(odno, "US-ODNO-001")
+        self.assertEqual(odno, _US_REG_REGISTERED)
 
     def test_T21_us_register_pending_calls_lifecycle_accept(self):
         """T21: _us_register_pending_order → lifecycle.accept 호출 후 ACCEPTED 유지."""
@@ -694,7 +697,7 @@ class TestUSPipeline(unittest.TestCase):
             lifecycle_id=lc.order_lifecycle_id,
             excd="NASD",
         )
-        self.assertEqual(odno, "NVDA-001")
+        self.assertEqual(odno, _US_REG_REGISTERED)
         call_kwargs = reg.register.call_args.kwargs
         self.assertEqual(call_kwargs["odno"], "NVDA-001")
         self.assertEqual(call_kwargs["currency"], "USD")
@@ -714,7 +717,7 @@ class TestUSPipeline(unittest.TestCase):
             lifecycle_id=lc.order_lifecycle_id,
             excd="NASD",
         )
-        self.assertEqual(odno, "META-SELL-001")
+        self.assertEqual(odno, _US_REG_REGISTERED)
         call_kwargs = reg.register.call_args.kwargs
         self.assertEqual(call_kwargs["side"], "SELL")
         self.assertEqual(call_kwargs["market"], "US")
