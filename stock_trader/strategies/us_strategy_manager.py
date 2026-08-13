@@ -92,14 +92,17 @@ try:
         PendingStatus as _USPendingStatus,
     )
     _US_FILL_OBSERVER_ENABLED = True
-    # 로컬 durable 단말(체결/취소/거부/만료) — ghost meta 대사(req5)에 사용.
-    _US_TERMINAL_PENDING = frozenset({
+    # ★ 안전-해제(차단 해제 허용) 증거 = '해소가 확실한' 단말만.
+    #   FILLED   : 체결 완료(주문 소멸).
+    #   CANCELLED: 명시적 취소(외부 취소 감지 또는 운영자 감사기반 수동 해제).
+    #   EXPIRED/REJECTED 는 US 체결조회의 한계상 '주문 없음' 을 증명하지 못하므로
+    #   (poll 재시도 소진 등 불명확) 자동 해제 증거로 쓰지 않는다 → 차단 유지.
+    _US_RESOLVED_PENDING = frozenset({
         _USPendingStatus.FILLED, _USPendingStatus.CANCELLED,
-        _USPendingStatus.REJECTED, _USPendingStatus.EXPIRED,
     })
 except Exception as _us_foe:
     _US_FILL_OBSERVER_ENABLED = False
-    _US_TERMINAL_PENDING = frozenset()
+    _US_RESOLVED_PENDING = frozenset()
     import logging as _us_fo_logging
     _us_fo_logging.getLogger("USStrategy").warning(
         f"[US FillObserver] import 실패 — fill observer 비활성화: {_us_foe}"
@@ -108,13 +111,19 @@ except Exception as _us_foe:
 logger = get_logger("USStrategy")
 
 # ── US 주문 등록 결과 상태(단일 계약) ────────────────────────────────
-#   REGISTERED : ODNO 확보 → pending row + lifecycle ACCEPTED. 차단 meta 유지.
-#   HOLD       : rt_cd=0 이나 ODNO 미수신(불명확 성공). lifecycle→ORDER_SUBMITTED
-#                로 '제출됨·확인대기' 를 durable 기록. 차단 meta 유지(재주문 금지).
-#   ROLLBACK   : 등록/전이 불일치. registry·lifecycle 을 단말로 롤백. 차단 meta 제거.
-_US_REG_REGISTERED = "REGISTERED"
-_US_REG_HOLD       = "HOLD"
-_US_REG_ROLLBACK   = "ROLLBACK"
+# ★ 이 함수는 KIS rt_cd=0(접수 성공) 이후에만 호출된다. 즉 '외부 증권사에 주문이
+#   접수됐을 수 있는' 상태이므로, 로컬 후처리 실패를 이유로 절대 REJECTED·취소·
+#   meta 제거(재주문 허용)를 하지 않는다. 모든 결과는 차단(재주문 금지)을 유지한다.
+#   REGISTERED      : ODNO 확보 + registry ACCEPTED + lifecycle ACCEPTED (완전 정합).
+#   PENDING_CONFIRM : ODNO 존재(외부 주문 존재 가능)하나 로컬 등록/전이 일부 실패.
+#                     ODNO/symbol/side/qty/price/submitted_at 을 durable 확인대기
+#                     원장(registry ACCEPTED row / lifecycle odno)에 보존. 차단 유지,
+#                     절대 종말화 안 함.
+#   UNKNOWN_CONFIRM : rt_cd=0 이나 ODNO 미수신·불명확. lifecycle→ORDER_SUBMITTED durable.
+#                     차단 유지(재주문 금지).
+_US_REG_REGISTERED      = "REGISTERED"
+_US_REG_PENDING_CONFIRM = "PENDING_CONFIRM"
+_US_REG_UNKNOWN_CONFIRM = "UNKNOWN_CONFIRM"
 
 US_POSITIONS_FILE = os.path.join(
     os.path.dirname(__file__), "..", "data", "us_positions.json"
@@ -1162,37 +1171,38 @@ class USStrategyManager:
                         cur_sess, rebuilt)
 
     def _us_meta_is_stale(self, oid: str) -> bool:
-        """meta 항목(oid=lifecycle_id)이 로컬 durable 증거상 이미 단말(체결/취소/
-        거부/만료)로 확정됐는지 판정한다.
+        """meta 항목(oid=lifecycle_id)이 로컬 durable 증거상 '해소가 확실'한지 판정.
 
-        ★ req5: has_active_sell 이 '단순 내부 ACTIVE 플래그' 만 보고 영구 차단하지
-          않도록, 차단 전에 증거를 대사한다. 여기서는 KIS 조회(신뢰 불가한 US
-          미체결 필드)를 쓰지 않고 **로컬 durable 상태만** 사용한다:
-            (a) OrderLifecycle DB 가 terminal(FILLED/CANCELLED/REJECTED/EXPIRED)
-            (b) PendingRegistry row 가 terminal
-          둘 중 하나면 ghost → in-flight 아님 → 차단 해제(중복위험 0: 로컬 증거가
-          '더 이상 미체결 아님'을 명시). FillObserver 가 FILLED 로 확정(req12)하거나
-          취소가 CANCELLED 로 마킹되면, 다음 회차 이 판정으로 meta ghost 가
-          자동 해소된다(req7 의 로컬 증거 부분).
+        ★ req5/6/8: has_active_sell 이 '단순 내부 ACTIVE 플래그' 만 보고 영구 차단
+          하지 않도록 차단 전에 증거를 대사하되, **해제는 오직 확실한 해소 증거로만**
+          허용한다. KIS 미체결조회(US 는 신뢰 불가)를 쓰지 않고 로컬 durable 상태만
+          사용하며, 해제 허용 증거는 다음뿐이다:
+            (a) OrderLifecycle 이 FILLED 또는 CANCELLED
+            (b) PendingRegistry row 가 FILLED 또는 CANCELLED
+          FILLED=체결완료(주문 소멸), CANCELLED=명시적 취소(외부 취소 감지 또는
+          운영자 감사기반 수동 해제)만 안전 해제로 본다.
 
-        불명확(조회 실패·상태 미확정)이면 False 를 반환해 **차단을 유지**한다
-        (req6/req8: 확인 전 중복 제출 금지).
+        ⚠️ EXPIRED/REJECTED 는 '주문이 없음'을 증명하지 못하므로(US 체결조회 한계·
+          poll 재시도 소진 등 불명확) 해제 증거로 쓰지 않는다 → 차단 유지. 조회
+          실패·미확정도 False → **차단 유지**(req6/8: 확인 전 중복 제출 금지, 단순
+          경과에 의한 자동 해제 금지).
         """
-        # (a) lifecycle terminal?
+        s = LifecycleState
+        # (a) lifecycle 이 FILLED/CANCELLED?
         mgr = getattr(self, "_us_lifecycle_mgr", None)
         if mgr is not None:
             try:
                 lc = mgr.load(oid)
-                if lc is not None and lc.is_terminal:
+                if lc is not None and lc.current_state in (s.FILLED, s.CANCELLED):
                     return True
             except Exception:
                 pass
-        # (b) registry row terminal?
+        # (b) registry row 가 FILLED/CANCELLED?
         reg = getattr(self, "_us_pending_registry", None)
         if reg is not None and _US_FILL_OBSERVER_ENABLED:
             try:
                 row = reg.get_by_trade_id(oid)
-                if row is not None and row.get("status") in _US_TERMINAL_PENDING:
+                if row is not None and row.get("status") in _US_RESOLVED_PENDING:
                     return True
             except Exception:
                 pass
@@ -1241,17 +1251,25 @@ class USStrategyManager:
     ) -> str:
         """US KIS 주문 응답(rt_cd=0)에서 ODNO 추출 + PendingRegistry 등록 + lifecycle 전이.
 
+        ★★ 이 함수는 **KIS rt_cd=0(접수 성공) 이후에만** 호출된다. 즉 외부 증권사에
+           주문이 접수됐을 수 있는 상태다. 따라서 **로컬 등록/전이 실패를 이유로
+           registry REJECTED·lifecycle 취소·meta 제거(재주문 허용)를 절대 하지 않는다.**
+           모든 경로가 차단(재주문 금지)을 유지하고, 실주문 정보(ODNO 등)를 durable
+           확인대기 원장에 보존한다.
+
         US 응답 구조: result["output"]["ODNO"].
 
-        Returns (단일 계약):
-            _US_REG_REGISTERED — ODNO 확보. pending row + lifecycle ACCEPTED. (차단 유지)
-            _US_REG_HOLD       — rt_cd=0 이나 ODNO 미수신. lifecycle→ORDER_SUBMITTED
-                                 로 '제출됨·확인대기' durable 기록. (차단 유지, 재주문 금지)
-            _US_REG_ROLLBACK   — 등록/전이 불일치. registry·lifecycle 단말 롤백. (차단 제거)
+        Returns (단일 계약 — 모두 '차단 유지'):
+            _US_REG_REGISTERED      — ODNO 확보 + registry ACCEPTED + lifecycle ACCEPTED.
+            _US_REG_PENDING_CONFIRM — ODNO 존재(외부 주문 존재 가능)하나 로컬 등록/전이
+                                      일부 실패. durable(registry ACCEPTED row 또는
+                                      lifecycle odno)에 보존, 절대 종말화 안 함.
+            _US_REG_UNKNOWN_CONFIRM — rt_cd=0 이나 ODNO 미수신·불명확. lifecycle→
+                                      ORDER_SUBMITTED durable. 차단 유지.
         """
         if self._us_pending_registry is None or self._us_lifecycle_mgr is None:
-            # lifecycle/registry 미가용 → 안전하게 차단 유지(HOLD).
-            return _US_REG_HOLD
+            # lifecycle/registry 미가용 → 안전하게 차단 유지(확인대기).
+            return _US_REG_UNKNOWN_CONFIRM
 
         output = order_response.get("output", {}) or {}
         if isinstance(output, list):
@@ -1261,7 +1279,7 @@ class USStrategyManager:
         # ── ODNO 없음(rt_cd=0 이나 미수신 = 불명확 성공) ────────────────
         #   register(odno='') 는 거부되므로 pending row 를 만들지 않는다. 대신
         #   lifecycle 을 ORDER_SUBMITTED 로 전이해 '제출됨·확인대기' 를 durable 로
-        #   남긴다(재시작 후에도 orphan(미제출)과 구분). 즉시 재주문 금지(HOLD).
+        #   남긴다(재시작 후에도 미제출과 구분). 즉시 재주문 금지.
         if not odno:
             try:
                 lc = self._us_lifecycle_mgr.load(lifecycle_id)
@@ -1273,19 +1291,22 @@ class USStrategyManager:
                         self._us_lifecycle_mgr.submit(lc, trade_id)
             except Exception as _hexc:
                 logger.error(
-                    "[US PendingRegistry] HOLD 전이 실패(차단 유지): "
+                    "[US PendingRegistry] UNKNOWN_CONFIRM 전이 실패(차단 유지): "
                     "lifecycle_id=%s error=%s", lifecycle_id, _hexc)
             logger.error(
-                "[US PendingRegistry] ODNO 미수신(불명확 성공) → HOLD(확인대기): "
-                "symbol=%s side=%s lifecycle_id=%s — 즉시 재주문 금지",
+                "[US PendingRegistry] ODNO 미수신(불명확 성공) → UNKNOWN_CONFIRM"
+                "(확인대기): symbol=%s side=%s lifecycle_id=%s — 즉시 재주문 금지",
                 symbol, side, lifecycle_id)
-            return _US_REG_HOLD
+            return _US_REG_UNKNOWN_CONFIRM
 
+        # ── ODNO 존재 = 외부 주문 존재 가능 → 어떤 로컬 실패에도 종말화·해제 금지 ──
         from datetime import datetime as _dt
         submitted_at = _dt.now().isoformat()
+
+        # 1) durable 확인대기 원장(registry ACCEPTED row) 에 실주문 정보 우선 저장.
+        #    ODNO/symbol/side/qty/submitted_at/raw(가격 포함) 가 여기 영속된다(req3).
         _registered = False
         try:
-            # 1) pending 등록 (status=ACCEPTED). 반환 row id=0 이면 거부.
             _row = self._us_pending_registry.register(
                 market             = "US",
                 trade_id           = lifecycle_id,
@@ -1299,46 +1320,58 @@ class USStrategyManager:
                 exchange           = excd or None,
                 currency           = "USD",
             )
-            if not _row:
-                raise RuntimeError(f"pending register 거부(row 미생성) odno={odno!r}")
-            _registered = True
+            _registered = bool(_row)
+        except Exception as _rexc:
+            logger.error(
+                "[US PendingRegistry] register 예외(차단 유지, 종말화 안 함): "
+                "symbol=%s odno=%r error=%s", symbol, odno, _rexc)
 
-            # 2) ★ lifecycle 을 단일 공용 helper 로 정상 전이(UNKNOWN→SIGNAL_CONFIRMED
-            #    →ORDER_SUBMITTED→ORDER_ACCEPTED). 직접 accept() 하지 않는다.
+        # 2) lifecycle 에 ODNO 를 durable 로 반영(정상 전이 → ORDER_ACCEPTED).
+        #    실패해도 절대 롤백/취소하지 않는다(외부 주문 존재 가능).
+        _lc_ok = False
+        try:
             lc = self._us_lifecycle_mgr.load(lifecycle_id)
-            if lc is None:
-                # lifecycle 없음 → pending 롤백(ghost active 방지)
-                raise RuntimeError(f"lifecycle 조회 실패: {lifecycle_id}")
-            self._us_lifecycle_mgr.advance_to_accepted(
-                lc, client_order_id=trade_id, odno=odno)
+            if lc is not None:
+                self._us_lifecycle_mgr.advance_to_accepted(
+                    lc, client_order_id=trade_id, odno=odno)
+                _lc_ok = (lc.current_state == LifecycleState.ORDER_ACCEPTED)
+        except Exception as _lexc:
+            logger.error(
+                "[US PendingRegistry] lifecycle 전이 예외(차단 유지, 롤백 안 함): "
+                "symbol=%s odno=%r lifecycle_id=%s error=%s",
+                symbol, odno, lifecycle_id, _lexc)
+
+        if _registered and _lc_ok:
             logger.info(
                 "[US PendingRegistry] 등록 완료: symbol=%s side=%s odno=%r "
-                "lifecycle_id=%s state=%s",
-                symbol, side, odno, lifecycle_id, lc.current_state.name)
+                "lifecycle_id=%s state=ORDER_ACCEPTED", symbol, side, odno,
+                lifecycle_id)
             return _US_REG_REGISTERED
 
-        except Exception as exc:
-            # ★ req4: 부분 등록 rollback — registry pending 을 단말(REJECTED)로,
-            #   lifecycle 도 안전하게 단말(CANCELLED)로 롤백해 ghost active BUY/SELL 이
-            #   남지 않게 한다(in-flight 영구차단 방지 → 다음 회차 재시도 허용).
-            if _registered:
-                try:
-                    self._us_pending_registry.mark_terminal(
-                        lifecycle_id, _USPendingStatus.REJECTED,
-                        reason=f"US 등록 전이 실패 롤백: {type(exc).__name__}")
-                except Exception as _rb:
-                    logger.error("[US PendingRegistry] registry 롤백 실패: %s", _rb)
+        # 3) 부분 실패 → 외부 주문 보존(PENDING_CONFIRM). durable 근거 최종 확인.
+        _durable = _registered
+        if not _durable:
+            # registry 저장 실패 → lifecycle 에라도 odno 가 영속됐는지 확인(재시작
+            #   정합화가 이 odno 로 복원·차단한다). 그것도 없으면 fail-safe:
+            #   in-memory meta(호출부 유지)만으로 차단하고 CRITICAL 로 수동확인 요청.
             try:
-                _lc = self._us_lifecycle_mgr.load(lifecycle_id)
-                if _lc is not None:
-                    self._us_lifecycle_mgr.cancel_unaccepted(
-                        _lc, reason=f"US 등록 롤백: {type(exc).__name__}")
-            except Exception as _lrb:
-                logger.error("[US PendingRegistry] lifecycle 롤백 실패: %s", _lrb)
+                _lc2 = self._us_lifecycle_mgr.load(lifecycle_id)
+                _durable = bool(_lc2 is not None
+                                and str(getattr(_lc2, "odno", "") or "").strip())
+            except Exception:
+                _durable = False
+        if _durable:
             logger.error(
-                "[US PendingRegistry] 등록 오류 → 롤백(ghost 방지): symbol=%s "
-                "side=%s error=%s", symbol, side, exc)
-            return _US_REG_ROLLBACK
+                "[US PendingRegistry] 부분 실패 → PENDING_CONFIRM(외부 주문 보존, "
+                "차단 유지): symbol=%s side=%s odno=%r registry=%s lifecycle_odno=%s",
+                symbol, side, odno, _registered, (not _registered))
+        else:
+            logger.critical(
+                "[US PendingRegistry] ★durable 저장 전부 실패★ — 외부 주문(odno=%r) "
+                "존재 가능. in-memory 차단만 유지되므로 재시작 시 유실 위험. 운영자 "
+                "KIS 미체결 확인 필요: symbol=%s side=%s qty=%s lifecycle_id=%s",
+                odno, symbol, side, order_qty, lifecycle_id)
+        return _US_REG_PENDING_CONFIRM
 
     def us_dispatch_fill(
         self,
@@ -1601,17 +1634,21 @@ class USStrategyManager:
         전이 예외로 UNKNOWN(lc.odno='') 에 멈춘' 이중 불일치이므로, **lifecycle 뿐
         아니라 registry row 도 함께 대사**해 다음과 같이 정합화한다:
 
-          - 단말(lifecycle is_terminal): 복원 대상 아님 → 스킵.
-          - registry row 가 단말(FILLED/CANCELLED/…): 이미 해소 → 차단 미복원(스킵).
+          - lifecycle 이 FILLED/CANCELLED(해소 확정): 복원 대상 아님 → 스킵.
+          - registry row 가 FILLED/CANCELLED(해소 확정): 이미 해소 → 차단 미복원(스킵).
+          - registry row 가 EXPIRED/REJECTED: US 체결조회 한계상 '주문 없음' 미증명
+            (불명확) → **차단 유지**(복원). 단순 경과로 자동 해제하지 않는다.
           - ORDER_ACCEPTED / PARTIALLY_FILLED: 진짜 in-flight → 차단 meta 복원.
           - pre-accepted 이나 (registry row 가 ACCEPTED/PARTIALLY_FILLED **또는** odno
             근거 존재): 사고 ghost. registry 의 odno 로 advance_to_accepted 하여
             lifecycle↔registry 를 일치시킨 뒤 차단 meta 복원(체결 부킹 정상화,
             재시작 경로의 'UNKNOWN→ORDER_ACCEPTED 직접 전이' 오류 제거).
           - ORDER_SUBMITTED 이나 odno·registry 근거 無: 주문시점 'rt_cd=0·ODNO 미수신'
-            HOLD(req9) 흔적 → 영속 확인대기. 차단 meta 복원(재주문 금지).
+            확인대기(req9) 흔적 → 영속 확인대기. 차단 meta 복원(재주문 금지).
           - UNKNOWN/SIGNAL_CONFIRMED 이고 odno·registry 근거 全無: 접수·제출 근거가
-            없는 orphan → CANCELLED 로 정리하고 차단 meta 미복원(영구 차단 방지).
+            없는 orphan → cancel_local_only(로컬 CANCELLED) 로 정리하고 차단 meta
+            미복원(영구 차단 방지). ※ odno 보유 lifecycle 은 cancel_local_only 가
+            자체 거부하므로 여기 도달하지 않는다.
         """
         if self._us_lifecycle_mgr is None:
             return
@@ -1632,8 +1669,11 @@ class USStrategyManager:
             if (lc.market or "").upper() != "US":
                 continue
             try:
+                if lc.current_state in (s.FILLED, s.CANCELLED):
+                    continue   # 해소 확정 → 복원 대상 아님
                 if lc.is_terminal:
-                    continue
+                    # EXPIRED/REJECTED lifecycle: 불명확 → 아래에서 차단 유지 처리
+                    pass
             except Exception:
                 pass
             lc_id = lc.order_lifecycle_id
@@ -1653,15 +1693,21 @@ class USStrategyManager:
                     pass
             odno = str(getattr(lc, "odno", "") or "").strip() or row_odno
 
-            # registry 가 이미 단말 → 해소된 주문 → 차단 미복원.
-            if row_status in _US_TERMINAL_PENDING:
+            # registry 가 해소 확정(FILLED/CANCELLED) → 차단 미복원.
+            if row_status in _US_RESOLVED_PENDING:
                 logger.info(
-                    "[US RestoreMeta] registry 단말(%s) → 차단 미복원: "
+                    "[US RestoreMeta] registry 해소(%s) → 차단 미복원: "
                     "symbol=%s side=%s", row_status, lc.code, side)
                 continue
+            # registry EXPIRED/REJECTED(불명확) → 차단 유지(복원). odno 있으면 정합화.
+            if row_status in (_USPendingStatus.EXPIRED, _USPendingStatus.REJECTED):
+                logger.warning(
+                    "[US RestoreMeta] registry 불명확(%s) → 차단 유지(자동 해제 금지): "
+                    "symbol=%s side=%s odno=%r", row_status, lc.code, side, odno)
 
             _row_active = row_status in (
-                _USPendingStatus.ACCEPTED, _USPendingStatus.PARTIALLY_FILLED)
+                _USPendingStatus.ACCEPTED, _USPendingStatus.PARTIALLY_FILLED,
+                _USPendingStatus.EXPIRED, _USPendingStatus.REJECTED)
 
             # pre-accepted 정합화
             if state in _PRE_ACCEPTED:
@@ -1690,18 +1736,24 @@ class USStrategyManager:
                         "symbol=%s side=%s → 차단 유지(재주문 금지)",
                         lc.code, side)
                 else:
-                    # UNKNOWN/SIGNAL_CONFIRMED + 근거 全無 → 미제출 orphan → CANCELLED
+                    # UNKNOWN/SIGNAL_CONFIRMED + 근거 全無 → 미제출 orphan.
+                    #   cancel_local_only 는 odno 보유 시 자체 거부하므로 안전.
                     try:
-                        self._us_lifecycle_mgr.cancel_unaccepted(
+                        _res = self._us_lifecycle_mgr.cancel_local_only(
                             lc, reason="restart: unsubmitted orphan, no odno")
                     except Exception:
-                        pass
-                    expired += 1
-                    logger.info(
-                        "[US RestoreMeta] 미제출 orphan(근거 全無) 정리: "
-                        "symbol=%s side=%s state=%s → CANCELLED(차단 미복원)",
-                        lc.code, side, state.name)
-                    continue
+                        _res = None
+                    if _res == s.CANCELLED:
+                        expired += 1
+                        logger.info(
+                            "[US RestoreMeta] 미제출 orphan(근거 全無) 정리: "
+                            "symbol=%s side=%s state=%s → CANCELLED(차단 미복원)",
+                            lc.code, side, state.name)
+                        continue
+                    # 취소가 거부됨(예: odno 보유) → 안전측: 차단 유지(복원)
+                    logger.warning(
+                        "[US RestoreMeta] orphan 취소 거부 → 차단 유지: "
+                        "symbol=%s side=%s state=%s", lc.code, side, state.name)
             elif state not in _ACTIVE_INFLIGHT:
                 # 예상 밖 상태 → 보수적으로 차단 유지(복원)하되 로그
                 logger.warning(
@@ -1730,7 +1782,118 @@ class USStrategyManager:
                 restored_buy, restored_sell, advanced, held, expired,
             )
 
+    def us_list_pending_confirm(self) -> list[dict]:
+        """운영자 확인용: 현재 '확인대기(차단 중)' US 주문 목록을 반환한다.
 
+        자동 해제가 불가능한(=US 체결조회로 '주문 없음'을 증명 못 하는) 주문들을
+        운영자가 KIS 앱에서 실제 미체결 여부를 확인한 뒤 us_manual_release_pending
+        으로 수동 해제할 수 있도록, 차단 근거를 종목·side·odno·상태와 함께 제공한다.
+        """
+        out: list[dict] = []
+        mgr = getattr(self, "_us_lifecycle_mgr", None)
+        reg = getattr(self, "_us_pending_registry", None)
+        for side, meta_map in (("BUY", self._us_pending_buy_meta),
+                               ("SELL", self._us_pending_sell_meta)):
+            for lc_id, meta in list(meta_map.items()):
+                odno = ""
+                lc_state = ""
+                row_status = ""
+                if mgr is not None:
+                    try:
+                        lc = mgr.load(lc_id)
+                        if lc is not None:
+                            odno = str(getattr(lc, "odno", "") or "").strip()
+                            lc_state = lc.current_state.name
+                    except Exception:
+                        pass
+                if reg is not None and _US_FILL_OBSERVER_ENABLED:
+                    try:
+                        row = reg.get_by_trade_id(lc_id)
+                        if row is not None:
+                            row_status = row.get("status") or ""
+                            odno = odno or str(row.get("odno") or "").strip()
+                    except Exception:
+                        pass
+                out.append({
+                    "lifecycle_id": lc_id, "symbol": meta.get("code"),
+                    "side": side, "qty": meta.get("qty"),
+                    "price": meta.get("price"), "odno": odno,
+                    "lifecycle_state": lc_state, "registry_status": row_status,
+                })
+        return out
+
+    def us_manual_release_pending(
+        self, lifecycle_id: str, operator: str, reason: str,
+        verified_no_open_order: bool = False,
+    ) -> dict:
+        """운영자 수동 해제(안전 절차·감사기록 필수) — req6.
+
+        US 는 KIS 미체결조회로 '주문 없음'을 자동 증명할 수 없으므로, 확인대기로
+        차단된 주문은 자동 해제하지 않는다. 운영자가 **KIS 앱에서 해당 주문이
+        미체결로 존재하지 않음(취소/소멸)을 직접 확인**한 뒤에만 이 함수로 해제한다.
+
+        요구사항(모두 필수, 미충족 시 거부):
+          - operator: 해제 수행자 식별자(비어 있으면 거부).
+          - reason:   해제 사유(비어 있으면 거부).
+          - verified_no_open_order=True: 운영자가 KIS 에서 미체결 없음을 확인했다는
+            명시적 확인 플래그(False 면 거부).
+
+        동작: registry row → CANCELLED(mark_terminal, 감사 사유), lifecycle →
+        CANCELLED(직접 cancel; 접수건도 허용), in-memory 차단 meta 제거. 모든 필드와
+        함께 [US AUDIT] 감사 로그를 남긴다. 반환: 처리 결과 dict.
+        """
+        operator = (operator or "").strip()
+        reason   = (reason or "").strip()
+        if not operator or not reason or not verified_no_open_order:
+            logger.error(
+                "[US AUDIT] 수동 해제 거부 — 필수조건 미충족: lifecycle_id=%s "
+                "operator=%r reason=%r verified=%s",
+                lifecycle_id, operator, reason, verified_no_open_order)
+            return {"ok": False, "reason": "operator/reason/verified 필수"}
+
+        from datetime import datetime as _dt
+        ts = _dt.now().isoformat()
+        symbol = side = odno = ""
+        mgr = getattr(self, "_us_lifecycle_mgr", None)
+        reg = getattr(self, "_us_pending_registry", None)
+
+        if reg is not None and _US_FILL_OBSERVER_ENABLED:
+            try:
+                row = reg.get_by_trade_id(lifecycle_id)
+                if row is not None:
+                    symbol = row.get("code") or ""
+                    side   = row.get("side") or ""
+                    odno   = str(row.get("odno") or "").strip()
+                    reg.mark_terminal(
+                        lifecycle_id, _USPendingStatus.CANCELLED,
+                        reason=f"MANUAL_RELEASE by={operator}: {reason}")
+            except Exception as _rexc:
+                logger.error("[US AUDIT] registry 수동취소 실패: %s", _rexc)
+
+        if mgr is not None:
+            try:
+                lc = mgr.load(lifecycle_id)
+                if lc is not None:
+                    symbol = symbol or lc.code
+                    side   = side or (lc.side or "")
+                    odno   = odno or str(getattr(lc, "odno", "") or "").strip()
+                    if not lc.is_terminal:
+                        mgr.cancel(lc, reason=f"MANUAL_RELEASE by={operator}: {reason}")
+            except Exception as _lexc:
+                logger.error("[US AUDIT] lifecycle 수동취소 실패: %s", _lexc)
+
+        self._us_pending_buy_meta.pop(lifecycle_id, None)
+        self._us_pending_sell_meta.pop(lifecycle_id, None)
+
+        logger.warning(
+            "[US AUDIT] 수동 해제 완료 — operator=%s reason=%r ts=%s "
+            "lifecycle_id=%s symbol=%s side=%s odno=%s (운영자 KIS 미체결없음 확인)",
+            operator, reason, ts, lifecycle_id, symbol, side, odno)
+        return {
+            "ok": True, "lifecycle_id": lifecycle_id, "symbol": symbol,
+            "side": side, "odno": odno, "operator": operator,
+            "reason": reason, "ts": ts,
+        }
 
     @property
     def positions(self) -> dict:
@@ -3005,50 +3168,47 @@ class USStrategyManager:
             except Exception as _uje:
                 _us_jnl._inc_error("us_accepted", _uje)
         # ★ Phase 4: US BUY lifecycle 등록 + PendingRegistry 자동 연결
+        #   rt_cd=0(외부 접수 성공) 이후이므로, create/register 가 실패해도 실주문이
+        #   살아 있을 수 있다 → 차단 meta 를 create 이전에 먼저 심고, 어떤 실패에도
+        #   제거하지 않는다(중복 매수 방지).
         if _US_LIFECYCLE_ENABLED and self._us_lifecycle_mgr is not None:
+            _us_lc_id = make_order_lifecycle_id("US", "BUY", symbol)
+            self._us_pending_buy_meta[_us_lc_id] = {
+                "code": symbol, "name": name, "qty": qty,
+                "price": cur_price, "avg_price": cur_price,
+                "excd": excd, "level": 1,
+                "trade_id": _us_trade_id,
+                "reason": entry_reason,
+            }
             try:
-                _us_lc_id = make_order_lifecycle_id("US", "BUY", symbol)
-                _us_lc = self._us_lifecycle_mgr.create(
-                    trade_id      = _us_trade_id or _us_lc_id,
-                    market        = "US",
-                    code          = symbol,
-                    side          = "BUY",
-                    strategy_name = "USStrategyManager",
-                    order_qty     = qty,
+                self._us_lifecycle_mgr.create(
+                    trade_id           = _us_trade_id or _us_lc_id,
+                    market             = "US",
+                    code               = symbol,
+                    side               = "BUY",
+                    strategy_name      = "USStrategyManager",
+                    order_qty          = qty,
+                    order_lifecycle_id = _us_lc_id,
                 )
-                self._us_pending_buy_meta[_us_lc.order_lifecycle_id] = {
-                    "code": symbol, "name": name, "qty": qty,
-                    "price": cur_price, "avg_price": cur_price,
-                    "excd": excd, "level": 1,
-                    "trade_id": _us_trade_id,
-                    "reason": entry_reason,
-                }
                 _us_reg = self._us_register_pending_order(
                     symbol         = symbol,
                     side           = "BUY",
                     order_qty      = qty,
                     order_response = result,
-                    lifecycle_id   = _us_lc.order_lifecycle_id,
+                    lifecycle_id   = _us_lc_id,
                     excd           = excd,
                     trade_id       = _us_trade_id,
                 )
-                if _us_reg == _US_REG_ROLLBACK:
-                    # ★ 등록 롤백 → in-memory meta 제거(ghost in-flight BUY 방지)
-                    self._us_pending_buy_meta.pop(_us_lc.order_lifecycle_id, None)
-                    logger.error(
-                        "[US BUY] 등록 롤백 → meta 제거(ghost 방지): symbol=%s", symbol)
-                else:
-                    # REGISTERED 또는 HOLD(확인대기) → 차단 meta 유지(재주문 금지)
-                    logger.info(
-                        "[US BUY ACCEPTED] lifecycle+PendingRegistry %s: "
-                        "order_lifecycle_id=%s symbol=%s qty=%s",
-                        _us_reg, _us_lc.order_lifecycle_id, symbol, qty)
+                # 모든 결과(REGISTERED/PENDING_CONFIRM/UNKNOWN_CONFIRM)가 차단 유지.
+                logger.info(
+                    "[US BUY ACCEPTED] lifecycle+PendingRegistry %s: "
+                    "order_lifecycle_id=%s symbol=%s qty=%s",
+                    _us_reg, _us_lc_id, symbol, qty)
             except Exception as _us_le:
-                logger.warning("[US BUY Lifecycle] 등록 오류: %s", _us_le)
-                try:
-                    self._us_pending_buy_meta.pop(_us_lc.order_lifecycle_id, None)
-                except Exception:
-                    pass
+                # 외부 주문 존재 가능 → meta 유지(차단), 절대 제거 금지.
+                logger.critical(
+                    "[US BUY] lifecycle/등록 예외 → 차단 유지(외부주문 보존, meta 제거 "
+                    "안 함): symbol=%s error=%s", symbol, _us_le)
         # ── [US OPEN SCAN] 첫 매수 기록 ──────────────────────
         self._record_first_buy()
         logger.info(
@@ -3121,49 +3281,43 @@ class USStrategyManager:
             except Exception as _uje:
                 _us_jnl._inc_error("us_add_accepted", _uje)
         # ★ Phase 4: US ADD_BUY lifecycle 등록 + PendingRegistry 자동 연결
+        #   rt_cd=0 이후 → 실패해도 실주문 존재 가능 → 차단 meta 선(先)등록·비제거.
         if _US_LIFECYCLE_ENABLED and self._us_lifecycle_mgr is not None:
+            _us_add_lc_id = make_order_lifecycle_id("US", "BUY", symbol)
+            self._us_pending_buy_meta[_us_add_lc_id] = {
+                "code": symbol, "name": name, "qty": add_qty,
+                "price": cur_price, "avg_price": cur_price,
+                "excd": excd, "level": 2,
+                "trade_id": _us_add_trade_id,
+                "reason": reason,
+            }
             try:
-                _us_add_lc_id = make_order_lifecycle_id("US", "BUY", symbol)
-                _us_add_lc = self._us_lifecycle_mgr.create(
-                    trade_id      = _us_add_trade_id or _us_add_lc_id,
-                    market        = "US",
-                    code          = symbol,
-                    side          = "BUY",
-                    strategy_name = "USStrategyManager_AddBuy",
-                    order_qty     = add_qty,
+                self._us_lifecycle_mgr.create(
+                    trade_id           = _us_add_trade_id or _us_add_lc_id,
+                    market             = "US",
+                    code               = symbol,
+                    side               = "BUY",
+                    strategy_name      = "USStrategyManager_AddBuy",
+                    order_qty          = add_qty,
+                    order_lifecycle_id = _us_add_lc_id,
                 )
-                self._us_pending_buy_meta[_us_add_lc.order_lifecycle_id] = {
-                    "code": symbol, "name": name, "qty": add_qty,
-                    "price": cur_price, "avg_price": cur_price,
-                    "excd": excd, "level": 2,
-                    "trade_id": _us_add_trade_id,
-                    "reason": reason,
-                }
                 _us_add_reg = self._us_register_pending_order(
                     symbol         = symbol,
                     side           = "BUY",
                     order_qty      = add_qty,
                     order_response = result,
-                    lifecycle_id   = _us_add_lc.order_lifecycle_id,
+                    lifecycle_id   = _us_add_lc_id,
                     excd           = excd,
                     trade_id       = _us_add_trade_id,
                 )
-                if _us_add_reg == _US_REG_ROLLBACK:
-                    self._us_pending_buy_meta.pop(_us_add_lc.order_lifecycle_id, None)
-                    logger.error(
-                        "[US ADD_BUY] 등록 롤백 → meta 제거(ghost 방지): symbol=%s",
-                        symbol)
-                else:
-                    logger.info(
-                        "[US ADD_BUY ACCEPTED] lifecycle+PendingRegistry %s: "
-                        "order_lifecycle_id=%s symbol=%s qty=%s",
-                        _us_add_reg, _us_add_lc.order_lifecycle_id, symbol, add_qty)
+                logger.info(
+                    "[US ADD_BUY ACCEPTED] lifecycle+PendingRegistry %s: "
+                    "order_lifecycle_id=%s symbol=%s qty=%s",
+                    _us_add_reg, _us_add_lc_id, symbol, add_qty)
             except Exception as _us_add_le:
-                logger.warning("[US ADD_BUY Lifecycle] 등록 오류: %s", _us_add_le)
-                try:
-                    self._us_pending_buy_meta.pop(_us_add_lc.order_lifecycle_id, None)
-                except Exception:
-                    pass
+                logger.critical(
+                    "[US ADD_BUY] lifecycle/등록 예외 → 차단 유지(외부주문 보존, meta "
+                    "제거 안 함): symbol=%s error=%s", symbol, _us_add_le)
         logger.info(f"🟢 US추가매수 {symbol} {add_qty}주 ${cur_price:.2f} | {reason}")
         return self._buy_result(symbol, name, excd, cur_price, add_qty, 2, sess, iv,
                                 reason, "[모멘텀추가]")
@@ -3240,58 +3394,50 @@ class USStrategyManager:
             # ── [US 훅 K] SELL lifecycle + PendingRegistry (Phase 4 US Pipeline) ──
             # ★ rt_cd=0 은 접수 성공. SELL lifecycle을 ACCEPTED로 등록하고
             # FillObserver 폴링 대상으로 PendingRegistry에 추가한다.
+            # ★ rt_cd=0(외부 접수 성공) 이후 → create/register 실패해도 실주문 존재
+            #   가능 → 차단 meta 를 create 이전에 먼저 심고 어떤 실패에도 제거하지
+            #   않는다(이중 매도 방지). 사고의 핵심 재발 방지 지점.
             if _US_LIFECYCLE_ENABLED and self._us_lifecycle_mgr is not None:
+                _us_sell_lc_id = make_order_lifecycle_id("US", "SELL", symbol)
+                self._us_pending_sell_meta[_us_sell_lc_id] = {
+                    "code":      symbol,
+                    "name":      name,
+                    "qty":       qty,
+                    "price":     cur_price,
+                    "avg_price": avg_p,
+                    "trade_id":  _us_sell_trade_id,
+                    "reason":    reason,
+                    "is_full":   not is_partial,
+                }
                 try:
-                    _us_sell_lc_id = make_order_lifecycle_id("US", "SELL", symbol)
-                    _us_sell_lc = self._us_lifecycle_mgr.create(
-                        trade_id      = _us_sell_trade_id or _us_sell_lc_id,
-                        market        = "US",
-                        code          = symbol,
-                        side          = "SELL",
-                        strategy_name = "USStrategyManager",
-                        order_qty     = qty,
+                    self._us_lifecycle_mgr.create(
+                        trade_id           = _us_sell_trade_id or _us_sell_lc_id,
+                        market             = "US",
+                        code               = symbol,
+                        side               = "SELL",
+                        strategy_name      = "USStrategyManager",
+                        order_qty          = qty,
+                        order_lifecycle_id = _us_sell_lc_id,
                     )
-                    self._us_pending_sell_meta[_us_sell_lc.order_lifecycle_id] = {
-                        "code":      symbol,
-                        "name":      name,
-                        "qty":       qty,
-                        "price":     cur_price,
-                        "avg_price": avg_p,
-                        "trade_id":  _us_sell_trade_id,
-                        "reason":    reason,
-                        "is_full":   not is_partial,
-                    }
                     _us_sell_reg = self._us_register_pending_order(
                         symbol         = symbol,
                         side           = "SELL",
                         order_qty      = qty,
                         order_response = result,
-                        lifecycle_id   = _us_sell_lc.order_lifecycle_id,
+                        lifecycle_id   = _us_sell_lc_id,
                         excd           = excd,
                         trade_id       = _us_sell_trade_id,
                     )
-                    if _us_sell_reg == _US_REG_ROLLBACK:
-                        # ★ 등록 롤백 → meta 제거. registry·lifecycle 이 단말로 롤백돼
-                        #   ghost in-flight 로 후속 매도가 영구 차단되던 P0 를 방지
-                        #   (다음 회차 매도 재시도 허용).
-                        self._us_pending_sell_meta.pop(
-                            _us_sell_lc.order_lifecycle_id, None)
-                        logger.error(
-                            "[US SELL] 등록 롤백 → meta 제거(ghost in-flight 방지): "
-                            "symbol=%s", symbol)
-                    else:
-                        # REGISTERED 또는 HOLD(확인대기) → 차단 meta 유지(중복 매도 금지)
-                        logger.info(
-                            "[US SELL ACCEPTED] lifecycle+PendingRegistry %s: "
-                            "order_lifecycle_id=%s symbol=%s qty=%s",
-                            _us_sell_reg, _us_sell_lc.order_lifecycle_id, symbol, qty)
+                    # 모든 결과가 차단 유지(중복 매도 금지). meta 제거 없음.
+                    logger.info(
+                        "[US SELL ACCEPTED] lifecycle+PendingRegistry %s: "
+                        "order_lifecycle_id=%s symbol=%s qty=%s",
+                        _us_sell_reg, _us_sell_lc_id, symbol, qty)
                 except Exception as _us_sell_le:
-                    logger.warning("[US SELL Lifecycle] 등록 오류: %s", _us_sell_le)
-                    try:
-                        self._us_pending_sell_meta.pop(
-                            _us_sell_lc.order_lifecycle_id, None)
-                    except Exception:
-                        pass
+                    # 외부 매도주문 존재 가능 → meta 유지(차단), 절대 제거 금지.
+                    logger.critical(
+                        "[US SELL] lifecycle/등록 예외 → 차단 유지(외부주문 보존, meta "
+                        "제거 안 함): symbol=%s error=%s", symbol, _us_sell_le)
 
             return {
                 "action":      action_tag,

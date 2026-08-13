@@ -42,7 +42,7 @@ from phoenix.lifecycle import (  # noqa: E402
 )
 from strategies.us_strategy_manager import (  # noqa: E402
     USStrategyManager as _USM,
-    _US_REG_REGISTERED, _US_REG_HOLD, _US_REG_ROLLBACK,
+    _US_REG_REGISTERED, _US_REG_PENDING_CONFIRM, _US_REG_UNKNOWN_CONFIRM,
 )
 
 S = LifecycleState
@@ -82,6 +82,8 @@ class USFlow:
     _us_restore_pending_meta   = _USM._us_restore_pending_meta
     us_dispatch_fill           = _USM.us_dispatch_fill
     _us_apply_fill_delta       = _USM._us_apply_fill_delta
+    us_manual_release_pending  = _USM.us_manual_release_pending
+    us_list_pending_confirm    = _USM.us_list_pending_confirm
 
     def __init__(self, mgr, registry, outbox=None):
         self._us_lifecycle_mgr    = mgr
@@ -121,25 +123,24 @@ class USLifecycleTransitionP0Test(unittest.TestCase):
 
     # ── 헬퍼: 실제 caller(_do_buy/_do_sell 접수 경로)를 모사 ──────────────
     def _submit(self, side, symbol, qty, order_response, trade_id=""):
-        """create(UNKNOWN) → put meta → _us_register_pending_order → rollback 시 meta pop.
-        실제 caller 의 meta 처리 규약과 동일하게 동작한다."""
+        """실제 caller(_do_sell/_do_buy) 규약 모사: rt_cd=0 이후 차단 meta 를 create
+        이전에 심고, **어떤 결과에도 meta 를 제거하지 않는다**(외부 주문 존재 가능)."""
         lc_id = make_order_lifecycle_id("US", side, symbol)
-        lc = self.mgr.create(
-            trade_id=trade_id or lc_id, market="US", code=symbol,
-            side=side, strategy_name="T", order_qty=qty)
         meta = (self.flow._us_pending_buy_meta if side == "BUY"
                 else self.flow._us_pending_sell_meta)
-        meta[lc.order_lifecycle_id] = {
+        meta[lc_id] = {
             "code": symbol, "name": symbol, "qty": qty,
             "excd": "NASD", "reason": "t",
         }
+        self.mgr.create(
+            trade_id=trade_id or lc_id, market="US", code=symbol,
+            side=side, strategy_name="T", order_qty=qty,
+            order_lifecycle_id=lc_id)
         res = self.flow._us_register_pending_order(
             symbol=symbol, side=side, order_qty=qty,
-            order_response=order_response, lifecycle_id=lc.order_lifecycle_id,
+            order_response=order_response, lifecycle_id=lc_id,
             excd="NASD", trade_id=trade_id)
-        if res == _US_REG_ROLLBACK:
-            meta.pop(lc.order_lifecycle_id, None)
-        return lc.order_lifecycle_id, res
+        return lc_id, res
 
     def _state(self, lc_id):
         return self.mgr.load(lc_id).current_state
@@ -183,37 +184,66 @@ class USLifecycleTransitionP0Test(unittest.TestCase):
             self.mgr.accept(lc)
 
     # ══════════════════════════════════════════════════════════════
-    # 2~3. register/advance 실패 rollback → ghost 없음
+    # 2~3. 외부접수(ODNO/rt_cd=0) 후 로컬 실패 → 절대 종말화·해제 금지(fail-safe)
     # ══════════════════════════════════════════════════════════════
-    def test_register_row_reject_no_ghost(self):
-        """register row 거부 → ROLLBACK, registry·lifecycle·meta ghost 없음."""
-        # registry.register 를 거부(0 반환)로 강제
-        self.registry.register = MagicMock(return_value=0)
-        lc_id, res = self._submit(
-            "SELL", "RXRX", 8, {"rt_cd": "0", "output": {"ODNO": "OD-X"}})
-        self.assertEqual(res, _US_REG_ROLLBACK)
-        # lifecycle 단말(CANCELLED)
-        self.assertTrue(self.mgr.load(lc_id).is_terminal)
-        # meta 없음 → 후속 매도 차단 안 됨
-        self.assertNotIn(lc_id, self.flow._us_pending_sell_meta)
-        self.assertFalse(self.flow._us_has_active_order("RXRX", "SELL"))
-
-    def test_advance_failure_double_rollback(self):
-        """advance 전이 예외 → registry REJECTED + lifecycle CANCELLED 이중 rollback."""
-        # accept 단계에서 예외를 강제(전이는 submit 까지 진행됨)
+    def test_odno_present_advance_failure_no_reject_no_meta_removal(self):
+        """ODNO 존재 + lifecycle advance 실패 → PENDING_CONFIRM. registry 는 REJECTED
+        가 아니라 ACCEPTED 유지, lifecycle 미종말, 차단 meta 유지(외부 주문 보존)."""
         self.mgr.accept = MagicMock(side_effect=RuntimeError("boom"))
         lc_id, res = self._submit(
             "SELL", "QUBT", 12, {"rt_cd": "0", "output": {"ODNO": "OD-Q"}})
-        self.assertEqual(res, _US_REG_ROLLBACK)
-        # registry row 는 REJECTED 로 롤백
+        self.assertEqual(res, _US_REG_PENDING_CONFIRM)
+        # ★ registry 는 절대 REJECTED 아님 — ACCEPTED 유지(durable 확인대기)
         row = self.registry.get_by_trade_id(lc_id)
         self.assertIsNotNone(row)
-        self.assertEqual(row["status"], PendingStatus.REJECTED)
-        # lifecycle 단말
-        self.assertTrue(self.mgr.load(lc_id).is_terminal)
-        # meta 제거 → 미체결 매도 없음
-        self.assertFalse(self.registry.has_active_sell("US", "QUBT"))
-        self.assertFalse(self.flow._us_has_active_order("QUBT", "SELL"))
+        self.assertEqual(row["status"], PendingStatus.ACCEPTED)
+        self.assertEqual(row["odno"], "OD-Q")
+        # ★ lifecycle 미종말(취소 안 함)
+        self.assertFalse(self.mgr.load(lc_id).is_terminal)
+        # ★ 차단 유지 — 다음 회차 중복 매도 0회
+        self.assertIn(lc_id, self.flow._us_pending_sell_meta)
+        self.assertTrue(self.registry.has_active_sell("US", "QUBT"))
+        self.assertTrue(self.flow._us_has_active_order("QUBT", "SELL"))
+
+    def test_odno_present_register_failure_durable_confirmation(self):
+        """ODNO 존재 + registry.register 실패 → PENDING_CONFIRM. lifecycle 에 odno 가
+        durable 반영(확인대기), 차단 유지, 종말화·해제 없음."""
+        self.registry.register = MagicMock(return_value=0)  # 저장 실패
+        lc_id, res = self._submit(
+            "SELL", "RXRX", 8, {"rt_cd": "0", "output": {"ODNO": "OD-X"}})
+        self.assertEqual(res, _US_REG_PENDING_CONFIRM)
+        # registry 저장은 실패했지만 lifecycle 에 odno 가 durable 보존됨
+        lc = self.mgr.load(lc_id)
+        self.assertFalse(lc.is_terminal)
+        self.assertEqual(lc.odno, "OD-X")
+        # 차단 유지
+        self.assertIn(lc_id, self.flow._us_pending_sell_meta)
+        self.assertTrue(self.flow._us_has_active_order("RXRX", "SELL"))
+
+    def test_odno_present_all_durable_fail_still_blocks(self):
+        """ODNO 존재 + registry·lifecycle 저장 모두 실패 → PENDING_CONFIRM, in-memory
+        차단은 유지(fail-safe). 종말화·meta 제거 없음."""
+        self.registry.register = MagicMock(return_value=0)
+        self.mgr.accept = MagicMock(side_effect=RuntimeError("db"))
+        self.mgr.submit = MagicMock(side_effect=RuntimeError("db"))
+        self.mgr.confirm_signal = MagicMock(side_effect=RuntimeError("db"))
+        lc_id, res = self._submit(
+            "SELL", "ASTS", 4, {"rt_cd": "0", "output": {"ODNO": "OD-Z"}})
+        self.assertEqual(res, _US_REG_PENDING_CONFIRM)
+        # in-memory 차단 유지 → 중복 매도 0회
+        self.assertIn(lc_id, self.flow._us_pending_sell_meta)
+        self.assertTrue(self.flow._us_has_active_order("ASTS", "SELL"))
+
+    def test_cancel_local_only_refuses_when_odno_present(self):
+        """cancel_local_only 는 odno 보유 lifecycle 취소를 거부(외부 주문 보호)."""
+        lc = self.mgr.create(trade_id="t", market="US", code="QUBT",
+                             side="SELL", order_qty=5)
+        self.mgr.confirm_signal(lc); self.mgr.submit(lc); self.mgr.accept(lc, "OD-999")
+        self.assertEqual(lc.current_state, S.ORDER_ACCEPTED)
+        res = self.mgr.cancel_local_only(lc, reason="should be refused")
+        # 무변경(거부) — 여전히 ACCEPTED
+        self.assertEqual(res, S.ORDER_ACCEPTED)
+        self.assertFalse(self.mgr.load(lc.order_lifecycle_id).is_terminal)
 
     # ══════════════════════════════════════════════════════════════
     # 4. 실제 미체결 존재 → 중복 매도 차단(req6)
@@ -264,18 +294,27 @@ class USLifecycleTransitionP0Test(unittest.TestCase):
         self.assertTrue(self.flow._us_has_active_order("ASTS", "SELL"))
 
     # ══════════════════════════════════════════════════════════════
-    # 7. ODNO 없는 성공 → HOLD(확인대기), 차단 유지(req9)
+    # 7. ODNO 없는 성공 → UNKNOWN_CONFIRM(확인대기), 차단 유지(req9)
     # ══════════════════════════════════════════════════════════════
     def test_no_odno_success_holds(self):
-        """rt_cd=0 이나 ODNO 미수신 → HOLD, lifecycle ORDER_SUBMITTED, 차단 유지."""
+        """rt_cd=0 이나 ODNO 미수신 → UNKNOWN_CONFIRM, lifecycle ORDER_SUBMITTED, 차단."""
         lc_id, res = self._submit(
             "SELL", "CEG", 9, {"rt_cd": "0", "output": {}})
-        self.assertEqual(res, _US_REG_HOLD)
+        self.assertEqual(res, _US_REG_UNKNOWN_CONFIRM)
         # lifecycle 은 제출됨(ORDER_SUBMITTED) — 확인대기 durable
         self.assertEqual(self._state(lc_id), S.ORDER_SUBMITTED)
         # registry row 없음(odno 필수)
         self.assertIsNone(self.registry.get_by_trade_id(lc_id))
         # 차단 meta 유지 → 재주문 금지
+        self.assertIn(lc_id, self.flow._us_pending_sell_meta)
+        self.assertTrue(self.flow._us_has_active_order("CEG", "SELL"))
+
+    def test_no_odno_success_local_error_no_reorder(self):
+        """rt_cd=0 + ODNO 없음 + 로컬 전이 오류 → 여전히 UNKNOWN_CONFIRM, 차단 유지."""
+        self.mgr.confirm_signal = MagicMock(side_effect=RuntimeError("db"))
+        lc_id, res = self._submit(
+            "SELL", "CEG", 9, {"rt_cd": "0", "output": {}})
+        self.assertEqual(res, _US_REG_UNKNOWN_CONFIRM)
         self.assertIn(lc_id, self.flow._us_pending_sell_meta)
         self.assertTrue(self.flow._us_has_active_order("CEG", "SELL"))
 
@@ -361,6 +400,23 @@ class USLifecycleTransitionP0Test(unittest.TestCase):
         self.flow._us_restore_pending_meta()
         self.assertNotIn(lc_id, self.flow._us_pending_sell_meta)
 
+    def test_restart_keeps_block_on_registry_expired(self):
+        """재시작: registry EXPIRED(poll 소진 등 불명확) → 자동 해제 금지, 차단 유지."""
+        lc = self.mgr.create(trade_id="t-exp", market="US", code="IONQ",
+                             side="SELL", order_qty=5)
+        lc_id = lc.order_lifecycle_id
+        self.registry.register(
+            market="US", trade_id=lc_id, code="IONQ", side="SELL",
+            order_qty=5, submitted_at="2026-08-12T22:00:00", odno="OD-EXP",
+            currency="USD")
+        self.registry.set_status(lc_id, PendingStatus.EXPIRED)  # 불명확 단말
+        self.flow._us_restore_pending_meta()
+        # ★ EXPIRED 는 '주문 없음' 미증명 → 차단 유지(복원)
+        self.assertIn(lc_id, self.flow._us_pending_sell_meta)
+        self.assertTrue(self.flow._us_has_active_order("IONQ", "SELL"))
+        # 단순 조회로도 자동 해제되지 않음
+        self.assertFalse(self.flow._us_meta_is_stale(lc_id))
+
     def test_restart_load_all_active_failure_no_exception(self):
         """load_all_active 예외 → 예외 미전파(안전)."""
         self.mgr.load_all_active = MagicMock(side_effect=RuntimeError("db"))
@@ -368,6 +424,49 @@ class USLifecycleTransitionP0Test(unittest.TestCase):
             self.flow._us_restore_pending_meta()
         except Exception as e:
             self.fail(f"_us_restore_pending_meta raised: {e}")
+
+    # ══════════════════════════════════════════════════════════════
+    # 6-b. 운영자 수동 해제(안전 절차 + 감사기록) — req6
+    # ══════════════════════════════════════════════════════════════
+    def test_manual_release_requires_operator_reason_verified(self):
+        """수동 해제는 operator·reason·verified 모두 필수 — 미충족 시 거부(차단 유지)."""
+        lc_id, _ = self._submit(
+            "SELL", "SMCI", 10, {"rt_cd": "0", "output": {"ODNO": "OD-M"}})
+        for op, rs, ok in [("", "r", True), ("op", "", True), ("op", "r", False)]:
+            res = self.flow.us_manual_release_pending(
+                lc_id, operator=op, reason=rs, verified_no_open_order=ok)
+            self.assertFalse(res["ok"])
+        # 여전히 차단
+        self.assertTrue(self.flow._us_has_active_order("SMCI", "SELL"))
+
+    def test_manual_release_success_with_audit(self):
+        """운영자가 KIS 미체결없음 확인 후 수동 해제 → 차단 해제 + registry/lc CANCELLED."""
+        lc_id, _ = self._submit(
+            "SELL", "SMCI", 10, {"rt_cd": "0", "output": {"ODNO": "OD-M2"}})
+        self.assertTrue(self.flow._us_has_active_order("SMCI", "SELL"))
+        with self.assertLogs("USStrategy", level="WARNING") as cm:
+            res = self.flow.us_manual_release_pending(
+                lc_id, operator="alice", reason="KIS 앱 미체결 없음 확인",
+                verified_no_open_order=True)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["odno"], "OD-M2")
+        # 감사 로그
+        self.assertTrue(any("US AUDIT" in m and "alice" in m for m in cm.output))
+        # 차단 해제 + 단말화
+        self.assertNotIn(lc_id, self.flow._us_pending_sell_meta)
+        self.assertFalse(self.flow._us_has_active_order("SMCI", "SELL"))
+        self.assertEqual(self.registry.get_by_trade_id(lc_id)["status"],
+                         PendingStatus.CANCELLED)
+        self.assertTrue(self.mgr.load(lc_id).is_terminal)
+
+    def test_list_pending_confirm_reports_blocked(self):
+        """us_list_pending_confirm 이 차단 중 주문을 종목·side·odno 와 함께 보고."""
+        self._submit("SELL", "SMCI", 10, {"rt_cd": "0", "output": {"ODNO": "OD-L"}})
+        rows = self.flow.us_list_pending_confirm()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["symbol"], "SMCI")
+        self.assertEqual(rows[0]["side"], "SELL")
+        self.assertEqual(rows[0]["odno"], "OD-L")
 
     # ══════════════════════════════════════════════════════════════
     # 10. 사고 종목 시나리오 재현(SMCI/IONQ SELL_ALL + QUBT/RXRX trailing)
@@ -382,10 +481,44 @@ class USLifecycleTransitionP0Test(unittest.TestCase):
             self.assertEqual(self._state(lc_id), S.ORDER_ACCEPTED, sym)
             # 접수 직후 동일 종목 재매도는 정당하게 차단(req6)
             self.assertTrue(self.flow._us_has_active_order(sym, "SELL"), sym)
-            # 체결되면 차단 해소 → 다음 신호에 재매도 가능(영구차단 아님)
+            # 체결(KIS 증거)되면 차단 해소 → 다음 신호에 재매도 가능(영구차단 아님)
             self.flow.us_dispatch_fill(lc_id, filled_qty=qty, avg_fill_price=10.0, is_full=True)
             self.assertEqual(self._state(lc_id), S.FILLED, sym)
             self.assertFalse(self.flow._us_has_active_order(sym, "SELL"), sym)
+
+    def test_incident_residue_restart_recovers_and_blocks(self):
+        """4종목 사고 residue(registry ACCEPTED + lc UNKNOWN) 재시작 → 정합화·차단 유지.
+        보유수량 남고 상태 불명확이면 확인대기(차단) 유지, 단순 경과 자동해제 없음."""
+        residue = [("SMCI", 19), ("IONQ", 5), ("QUBT", 50), ("RXRX", 40)]
+        ids = {}
+        for sym, qty in residue:
+            lc = self.mgr.create(trade_id=f"t-{sym}", market="US", code=sym,
+                                 side="SELL", order_qty=qty)
+            ids[sym] = lc.order_lifecycle_id
+            self.registry.register(
+                market="US", trade_id=lc.order_lifecycle_id, code=sym, side="SELL",
+                order_qty=qty, submitted_at="2026-08-12T22:00:00",
+                odno=f"OD-{sym}", currency="USD")
+        # 재시작 정합화
+        self.flow._us_restore_pending_meta()
+        # 전부 ACCEPTED 로 복원 + 차단 유지(중복 매도 방지) + 리포트 가능
+        report = {r["symbol"]: r for r in self.flow.us_list_pending_confirm()}
+        for sym, _ in residue:
+            self.assertEqual(self._state(ids[sym]), S.ORDER_ACCEPTED, sym)
+            self.assertTrue(self.flow._us_has_active_order(sym, "SELL"), sym)
+            self.assertIn(sym, report)
+            self.assertEqual(report[sym]["odno"], f"OD-{sym}")
+        # IONQ: KIS 체결 증거 도착 → FILLED → 차단 해제(정당)
+        self.flow.us_dispatch_fill(ids["IONQ"], filled_qty=5, avg_fill_price=12.0, is_full=True)
+        self.assertFalse(self.flow._us_has_active_order("IONQ", "SELL"))
+        # QUBT: 운영자가 KIS 에서 미체결 없음 확인 → 감사기반 수동 해제
+        self.flow.us_manual_release_pending(
+            ids["QUBT"], operator="ops", reason="KIS 미체결 없음 확인",
+            verified_no_open_order=True)
+        self.assertFalse(self.flow._us_has_active_order("QUBT", "SELL"))
+        # SMCI/RXRX: 증거 없음 → 여전히 확인대기(영구차단 아님, 수동 해제 대기)
+        self.assertTrue(self.flow._us_has_active_order("SMCI", "SELL"))
+        self.assertTrue(self.flow._us_has_active_order("RXRX", "SELL"))
 
 
 if __name__ == "__main__":
