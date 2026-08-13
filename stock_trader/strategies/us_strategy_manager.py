@@ -125,6 +125,38 @@ _US_REG_REGISTERED      = "REGISTERED"
 _US_REG_PENDING_CONFIRM = "PENDING_CONFIRM"
 _US_REG_UNKNOWN_CONFIRM = "UNKNOWN_CONFIRM"
 
+# ── KIS 주문 응답 분류 결과(제출-의도 finalize) ────────────────────────
+#   ACCEPTED        : ODNO 수신 → 외부 접수 확정.
+#   UNKNOWN_CONFIRM : rt_cd=0·ODNO 미수신 / rt_cd=9(예외 래핑) / 알 수 없는 코드 /
+#                     ODNO 존재 rt_cd≠0 등 '접수 가능하나 불명확' → 확인대기(재주문 금지).
+#   REJECTED        : 명확 거절(ODNO 없음 + 정상 응답 + 예외/타임아웃/5xx/parse 아님 +
+#                     allowlist 코드/메시지) → 안전 종말화(차단 해제 가능).
+#   NOT_SENT        : dry-run/live-disabled 등 실제 미전송 → 차단 불필요(로컬 취소).
+_US_OUTCOME_ACCEPTED        = "ACCEPTED"
+_US_OUTCOME_UNKNOWN_CONFIRM = "UNKNOWN_CONFIRM"
+_US_OUTCOME_REJECTED        = "REJECTED"
+_US_OUTCOME_NOT_SENT        = "NOT_SENT"
+
+# 명확 거절로 인정할 KIS msg_cd allowlist(정상 응답·ODNO 없음일 때만 적용).
+#   불확실한 코드는 포함하지 않는다(미포함 = UNKNOWN_CONFIRM 로 안전 확인대기).
+_US_CLEAR_REJECT_CODES = frozenset({
+    "APBK0918",  # 매수가능금액(예수금) 부족
+    "APBK0919",  # 매도가능수량 부족
+    "APBK1664",  # 주문가능수량 초과
+    "APBK0656",  # 해당 종목 거래불가/종목정보 없음
+    "IGW00027",  # 장 운영시간 아님
+})
+# 명확 거절 메시지 substring allowlist(정상 응답·ODNO 없음일 때만 적용).
+#   ODNO 가 없고 rt_cd 가 0/9 도 아닌 '정상 거절 응답' 에서만 평가되므로, 잔액/
+#   수량 부족·거래불가 등 '주문 미체결이 확정' 되는 문구를 폭넓게 포함한다(안전:
+#   해당 응답엔 살아 있는 주문이 없다). 미포함 코드/문구는 UNKNOWN_CONFIRM.
+_US_CLEAR_REJECT_MSGS = (
+    "매도가능수량", "매수가능금액", "주문가능수량", "가능수량", "주문가능",
+    "잔고부족", "예수금", "부족", "초과", "금액", "한도",
+    "거래불가", "거래정지", "종목정보", "해당종목", "해당 종목",
+    "장운영", "장 운영", "장종료", "장 종료",
+)
+
 US_POSITIONS_FILE = os.path.join(
     os.path.dirname(__file__), "..", "data", "us_positions.json"
 )
@@ -1373,6 +1405,202 @@ class USStrategyManager:
                 odno, symbol, side, order_qty, lifecycle_id)
         return _US_REG_PENDING_CONFIRM
 
+    # ── 제출-의도(submit-intent) 크래시 안전 파이프라인 ────────────────
+    def _us_classify_order_outcome(self, result: dict) -> tuple[str, str]:
+        """KIS 주문 응답을 분류한다. 반환: (outcome, odno).
+
+        ★ rt_cd≠0 전체를 명확 거절로 취급하지 않는다. 명확 거절은 (ODNO 없음 +
+          정상 응답 수신 + 예외/타임아웃/HTTP5xx/parse 아님 + allowlist 코드·메시지)
+          를 모두 충족할 때만 인정한다. rt_cd=9(예외 래핑)·알 수 없는 코드·ODNO
+          존재 응답은 모두 UNKNOWN_CONFIRM(확인대기, 재주문 금지)으로 분류한다.
+        """
+        if not isinstance(result, dict):
+            return _US_OUTCOME_UNKNOWN_CONFIRM, ""   # parse 불가 → 확인대기
+        # dry-run / live-disabled(실주문 미전송) → 차단 불필요
+        if result.get("_dry_run") or result.get("_live_disabled"):
+            return _US_OUTCOME_NOT_SENT, ""
+        output = result.get("output", {}) or {}
+        if isinstance(output, list):
+            output = output[0] if output else {}
+        odno = str(output.get("ODNO", "") or output.get("odno", "") or "").strip()
+        rt_cd = str(result.get("rt_cd", "") or "").strip()
+
+        if odno:
+            # ODNO 존재 → rt_cd 와 무관하게 외부 접수 확정
+            return _US_OUTCOME_ACCEPTED, odno
+        if rt_cd == "0":
+            # rt_cd=0 이나 ODNO 미수신 → 불명확
+            return _US_OUTCOME_UNKNOWN_CONFIRM, ""
+        if rt_cd == "9":
+            # 예외 래핑(timeout/network/HTTP5xx/parse) → 불명확
+            return _US_OUTCOME_UNKNOWN_CONFIRM, ""
+        # rt_cd≠0, ODNO 없음 → 명확 거절 allowlist 인지 검사
+        msg_cd = str(result.get("msg_cd", "") or "").strip().upper()
+        msg1   = str(result.get("msg1", "") or "")
+        if msg_cd in _US_CLEAR_REJECT_CODES or any(
+                kw in msg1 for kw in _US_CLEAR_REJECT_MSGS):
+            return _US_OUTCOME_REJECTED, ""
+        # 알 수 없는 코드 → 보수적으로 확인대기(재주문 금지)
+        return _US_OUTCOME_UNKNOWN_CONFIRM, ""
+
+    def _us_begin_submit_intent(
+        self, intent_id: str, symbol: str, side: str, order_qty: int,
+        price: float, excd: str = "", trade_id: str = "",
+        meta_extra: dict = None,
+    ) -> bool:
+        """★ KIS 주문 API 호출 '전' 에 durable submit-intent 를 저장한다(crash 안전).
+
+        저장 성공 시에만 True 를 반환하며, 호출부는 True 일 때만 KIS 주문을 낸다.
+        순서(모두 docker volume ./data:/app/data 의 SQLite 에 영속):
+          1) PendingRegistry.register_intent → status=PENDING_SUBMIT(odno='') 저장.
+             (이게 실패하면 False → 주문 미제출)
+          2) OrderLifecycle create → ORDER_SUBMITTED 로 durable 전이(재시작 정합화용).
+          3) in-memory 차단 meta 등록(동일 세션 중복 주문 차단).
+        """
+        if self._us_lifecycle_mgr is None or self._us_pending_registry is None:
+            logger.critical(
+                "[US SubmitIntent] lifecycle/registry 미가용 → 주문 미제출(안전): "
+                "symbol=%s side=%s", symbol, side)
+            return False
+        from datetime import datetime as _dt
+        submitted_at = _dt.now().isoformat()
+
+        # 1) durable submit-intent (필수) — 실패 시 KIS 호출 금지
+        try:
+            _row = self._us_pending_registry.register_intent(
+                market="US", trade_id=intent_id, code=symbol, side=side,
+                order_qty=order_qty, price=price, submitted_at=submitted_at,
+                client_order_id=trade_id, exchange=excd or None, currency="USD")
+        except Exception as exc:
+            logger.critical(
+                "[US SubmitIntent] durable 저장 예외 → 주문 미제출(안전): "
+                "symbol=%s side=%s error=%s", symbol, side, exc)
+            return False
+        if not _row:
+            logger.critical(
+                "[US SubmitIntent] durable 저장 실패(row 0) → 주문 미제출(안전): "
+                "symbol=%s side=%s", symbol, side)
+            return False
+
+        # 2) lifecycle → ORDER_SUBMITTED (durable, 재시작 정합화 앵커)
+        try:
+            lc = self._us_lifecycle_mgr.create(
+                trade_id=trade_id or intent_id, market="US", code=symbol,
+                side=side, strategy_name="USStrategyManager",
+                order_qty=order_qty, order_lifecycle_id=intent_id)
+            s = LifecycleState
+            if lc.current_state == s.UNKNOWN:
+                self._us_lifecycle_mgr.confirm_signal(lc)
+            if lc.current_state == s.SIGNAL_CONFIRMED:
+                self._us_lifecycle_mgr.submit(lc, trade_id)
+        except Exception as exc:
+            logger.error(
+                "[US SubmitIntent] lifecycle 전이 예외(registry intent 로 차단 유지): "
+                "symbol=%s error=%s", symbol, exc)
+
+        # 3) in-memory 차단 meta
+        meta = {"code": symbol, "name": symbol, "qty": order_qty,
+                "price": price, "avg_price": price, "excd": excd,
+                "trade_id": trade_id, "reason": "us_submit_intent"}
+        if meta_extra:
+            meta.update(meta_extra)
+        (self._us_pending_buy_meta if side == "BUY"
+         else self._us_pending_sell_meta)[intent_id] = meta
+        logger.info(
+            "[US SubmitIntent] 저장 완료 → KIS 호출 허용: symbol=%s side=%s qty=%s "
+            "intent_id=%s", symbol, side, order_qty, intent_id)
+        return True
+
+    def _us_finalize_submit_intent(
+        self, intent_id: str, symbol: str, side: str, order_qty: int,
+        result: dict, excd: str = "", trade_id: str = "",
+    ) -> str:
+        """KIS 응답 분류 → durable submit-intent 를 확정 전이. 반환: outcome.
+
+        ACCEPTED/UNKNOWN_CONFIRM → 차단 유지(재주문 금지). REJECTED(명확 거절)/
+        NOT_SENT(미전송) → 안전하게 차단 해제. 어떤 경로에서도 ODNO 보유분을
+        로컬 취소하지 않는다(cancel_local_only 가 self-guard).
+        """
+        outcome, odno = self._us_classify_order_outcome(result)
+        reg = self._us_pending_registry
+        mgr = self._us_lifecycle_mgr
+        meta_map = (self._us_pending_buy_meta if side == "BUY"
+                    else self._us_pending_sell_meta)
+
+        if outcome == _US_OUTCOME_ACCEPTED:
+            # PENDING_SUBMIT → ACCEPTED(odno) 승격 + lifecycle accept. 차단 유지.
+            try:
+                if reg is not None:
+                    reg.update_odno(intent_id, odno)
+                    reg.set_status(intent_id, _USPendingStatus.ACCEPTED)
+            except Exception as exc:
+                logger.error("[US SubmitIntent] ACCEPTED 승격 실패(차단 유지): %s", exc)
+            try:
+                if mgr is not None:
+                    lc = mgr.load(intent_id)
+                    if lc is not None and not lc.is_terminal:
+                        mgr.advance_to_accepted(
+                            lc, client_order_id=trade_id, odno=odno)
+            except Exception as exc:
+                logger.error("[US SubmitIntent] lifecycle accept 실패(차단 유지): %s", exc)
+            logger.info(
+                "[US SubmitIntent] ACCEPTED: symbol=%s side=%s odno=%r intent_id=%s",
+                symbol, side, odno, intent_id)
+            return outcome
+
+        if outcome == _US_OUTCOME_UNKNOWN_CONFIRM:
+            # 불명확 → UNKNOWN_CONFIRM 영속. lifecycle 은 ORDER_SUBMITTED 유지. 차단 유지.
+            try:
+                if reg is not None:
+                    reg.set_status(intent_id, _USPendingStatus.UNKNOWN_CONFIRM)
+            except Exception as exc:
+                logger.error("[US SubmitIntent] UNKNOWN_CONFIRM 마킹 실패(차단 유지): %s", exc)
+            logger.error(
+                "[US SubmitIntent] UNKNOWN_CONFIRM(확인대기·재주문 금지): symbol=%s "
+                "side=%s rt_cd=%s msg=%s", symbol, side,
+                result.get("rt_cd"), result.get("msg1"))
+            return outcome
+
+        if outcome == _US_OUTCOME_REJECTED:
+            # 명확 거절(ODNO 없음·정상 응답·allowlist) → 안전 종말화 + 차단 해제.
+            try:
+                if reg is not None:
+                    reg.set_status(intent_id, _USPendingStatus.REJECTED)
+            except Exception as exc:
+                logger.error("[US SubmitIntent] REJECTED 마킹 실패: %s", exc)
+            try:
+                if mgr is not None:
+                    lc = mgr.load(intent_id)
+                    if lc is not None and not lc.is_terminal:
+                        mgr.reject(lc, reason=f"KIS 명확거절: {result.get('msg1')}")
+            except Exception as exc:
+                logger.error("[US SubmitIntent] lifecycle reject 실패: %s", exc)
+            meta_map.pop(intent_id, None)
+            logger.info(
+                "[US SubmitIntent] REJECTED(명확 거절) → 차단 해제: symbol=%s side=%s "
+                "msg=%s", symbol, side, result.get("msg1"))
+            return outcome
+
+        # NOT_SENT(dry-run/live-disabled): 실제 미전송 → 로컬 취소 + 차단 해제.
+        try:
+            if reg is not None:
+                reg.set_status(intent_id, _USPendingStatus.CANCELLED)
+        except Exception as exc:
+            logger.error("[US SubmitIntent] NOT_SENT 취소 마킹 실패: %s", exc)
+        try:
+            if mgr is not None:
+                lc = mgr.load(intent_id)
+                if lc is not None:
+                    mgr.cancel_local_only(
+                        lc, reason="not sent (dry-run/live-disabled)")
+        except Exception as exc:
+            logger.error("[US SubmitIntent] NOT_SENT lifecycle 취소 실패: %s", exc)
+        meta_map.pop(intent_id, None)
+        logger.warning(
+            "[US SubmitIntent] NOT_SENT(미전송) → 차단 해제: symbol=%s side=%s",
+            symbol, side)
+        return outcome
+
     def us_dispatch_fill(
         self,
         order_lifecycle_id: str,
@@ -1634,21 +1862,20 @@ class USStrategyManager:
         전이 예외로 UNKNOWN(lc.odno='') 에 멈춘' 이중 불일치이므로, **lifecycle 뿐
         아니라 registry row 도 함께 대사**해 다음과 같이 정합화한다:
 
-          - lifecycle 이 FILLED/CANCELLED(해소 확정): 복원 대상 아님 → 스킵.
-          - registry row 가 FILLED/CANCELLED(해소 확정): 이미 해소 → 차단 미복원(스킵).
-          - registry row 가 EXPIRED/REJECTED: US 체결조회 한계상 '주문 없음' 미증명
-            (불명확) → **차단 유지**(복원). 단순 경과로 자동 해제하지 않는다.
-          - ORDER_ACCEPTED / PARTIALLY_FILLED: 진짜 in-flight → 차단 meta 복원.
-          - pre-accepted 이나 (registry row 가 ACCEPTED/PARTIALLY_FILLED **또는** odno
-            근거 존재): 사고 ghost. registry 의 odno 로 advance_to_accepted 하여
-            lifecycle↔registry 를 일치시킨 뒤 차단 meta 복원(체결 부킹 정상화,
-            재시작 경로의 'UNKNOWN→ORDER_ACCEPTED 직접 전이' 오류 제거).
-          - ORDER_SUBMITTED 이나 odno·registry 근거 無: 주문시점 'rt_cd=0·ODNO 미수신'
-            확인대기(req9) 흔적 → 영속 확인대기. 차단 meta 복원(재주문 금지).
-          - UNKNOWN/SIGNAL_CONFIRMED 이고 odno·registry 근거 全無: 접수·제출 근거가
-            없는 orphan → cancel_local_only(로컬 CANCELLED) 로 정리하고 차단 meta
-            미복원(영구 차단 방지). ※ odno 보유 lifecycle 은 cancel_local_only 가
-            자체 거부하므로 여기 도달하지 않는다.
+          - lifecycle/registry 가 FILLED/CANCELLED/REJECTED(해소 확정): 차단 미복원.
+            (REJECTED 은 명확 거절 = 주문 없음. 신규 경로에서 REJECTED 는 오직
+             finalize 의 명확거절 분류로만 기록되므로 자동 해제가 안전하다.)
+          - registry row 가 PENDING_SUBMIT/UNKNOWN_CONFIRM/EXPIRED: 접수 가능하나
+            불명확 → **차단 유지**(복원). odno 없으므로 lifecycle 은 그대로 둔다.
+            (PENDING_SUBMIT = KIS 호출 직후 crash 등으로 finalize 미도달한 앵커 →
+             동일 symbol/side 재주문 차단.)
+          - ORDER_ACCEPTED / PARTIALLY_FILLED, 또는 odno 근거 존재: in-flight/사고
+            ghost → odno 로 advance_to_accepted 하여 lifecycle↔registry 일치 후 복원.
+          - ORDER_SUBMITTED 이나 odno 근거 無(단, registry PENDING_SUBMIT/UNKNOWN_CONFIRM
+            /EXPIRED): 영속 확인대기 → 차단 유지(재주문 금지).
+          - UNKNOWN/SIGNAL_CONFIRMED 이고 odno·registry 근거 全無: orphan →
+            cancel_local_only(로컬 CANCELLED)·차단 미복원. ※ odno 보유분은
+            cancel_local_only 가 자체 거부하므로 종말화되지 않는다.
         """
         if self._us_lifecycle_mgr is None:
             return
@@ -1693,27 +1920,30 @@ class USStrategyManager:
                     pass
             odno = str(getattr(lc, "odno", "") or "").strip() or row_odno
 
-            # registry 가 해소 확정(FILLED/CANCELLED) → 차단 미복원.
-            if row_status in _US_RESOLVED_PENDING:
+            # registry 가 해소 확정(FILLED/CANCELLED/REJECTED) → 차단 미복원.
+            if (row_status in _US_RESOLVED_PENDING
+                    or row_status == _USPendingStatus.REJECTED):
                 logger.info(
                     "[US RestoreMeta] registry 해소(%s) → 차단 미복원: "
                     "symbol=%s side=%s", row_status, lc.code, side)
                 continue
-            # registry EXPIRED/REJECTED(불명확) → 차단 유지(복원). odno 있으면 정합화.
-            if row_status in (_USPendingStatus.EXPIRED, _USPendingStatus.REJECTED):
+            # registry 불명확(PENDING_SUBMIT/UNKNOWN_CONFIRM/EXPIRED) → 차단 유지.
+            _row_blocking = row_status in (
+                _USPendingStatus.PENDING_SUBMIT, _USPendingStatus.UNKNOWN_CONFIRM,
+                _USPendingStatus.ACCEPTED, _USPendingStatus.PARTIALLY_FILLED,
+                _USPendingStatus.EXPIRED)
+            if row_status in (_USPendingStatus.PENDING_SUBMIT,
+                              _USPendingStatus.UNKNOWN_CONFIRM,
+                              _USPendingStatus.EXPIRED):
                 logger.warning(
                     "[US RestoreMeta] registry 불명확(%s) → 차단 유지(자동 해제 금지): "
                     "symbol=%s side=%s odno=%r", row_status, lc.code, side, odno)
 
-            _row_active = row_status in (
-                _USPendingStatus.ACCEPTED, _USPendingStatus.PARTIALLY_FILLED,
-                _USPendingStatus.EXPIRED, _USPendingStatus.REJECTED)
-
             # pre-accepted 정합화
             if state in _PRE_ACCEPTED:
-                if _row_active or odno:
-                    # 사고 ghost(registry ACCEPTED + lc pre-accepted) 또는 odno 근거
-                    #   존재 → registry odno 로 lifecycle 을 ACCEPTED 로 일치시킨다.
+                if odno:
+                    # odno 근거 존재(사고 ghost 등) → ACCEPTED 로 일치. odno 없는
+                    #   PENDING_SUBMIT/UNKNOWN_CONFIRM 은 여기 오지 않는다(아래 held).
                     try:
                         self._us_lifecycle_mgr.advance_to_accepted(lc, odno=odno)
                         advanced += 1
@@ -1727,14 +1957,14 @@ class USStrategyManager:
                             "[US RestoreMeta] 정합화 전이 실패(차단 유지): "
                             "lifecycle_id=%s error=%s", lc_id, _adv)
                         # 전이 실패해도 차단 meta 는 복원(보수적: 중복 방지)
-                elif state == s.ORDER_SUBMITTED:
-                    # odno·registry 근거 無 + 제출됨 = 주문시점 HOLD(req9) 흔적 →
-                    #   영속 확인대기. 실주문이 살아 있을 수 있어 차단 meta 복원.
+                elif _row_blocking or state == s.ORDER_SUBMITTED:
+                    # PENDING_SUBMIT/UNKNOWN_CONFIRM/EXPIRED 또는 제출됨(odno無) →
+                    #   영속 확인대기. lifecycle 그대로, 차단 meta 복원(재주문 금지).
                     held += 1
                     logger.info(
-                        "[US RestoreMeta] ODNO 미수신 제출 HOLD 복원(확인대기): "
+                        "[US RestoreMeta] 확인대기 복원(row=%s state=%s): "
                         "symbol=%s side=%s → 차단 유지(재주문 금지)",
-                        lc.code, side)
+                        row_status or "-", state.name, lc.code, side)
                 else:
                     # UNKNOWN/SIGNAL_CONFIRMED + 근거 全無 → 미제출 orphan.
                     #   cancel_local_only 는 odno 보유 시 자체 거부하므로 안전.
@@ -3086,10 +3316,31 @@ class USStrategyManager:
                        ("부족", "금액", "초과", "주문가능", "한도"))
 
         _resized_once = False
+        _us_lc_id = None
         while True:
+            # ★ KIS 호출 '전' durable submit-intent(매 시도마다 신규). 실패 시 미제출.
+            _us_lc_id = make_order_lifecycle_id("US", "BUY", symbol)
+            if _US_LIFECYCLE_ENABLED and self._us_lifecycle_mgr is not None:
+                if not self._us_begin_submit_intent(
+                        _us_lc_id, symbol, "BUY", qty, cur_price, excd, _us_trade_id,
+                        meta_extra={"name": name, "level": 1,
+                                    "reason": entry_reason}):
+                    return {"action": "BUY_FAIL", "symbol": symbol, "name": name,
+                            "reason": "submit-intent 저장 실패 — 주문 미제출(안전)",
+                            "session": sess["session"]}
+
             result   = self.api.buy_us(symbol, qty, cur_price, excd,
                                        allow_krw_order=True)
-            order_ok = result.get("rt_cd") == "0"
+
+            # 응답 분류 → durable intent 확정. REJECTED/NOT_SENT 만 차단 해제(재시도 허용).
+            if _US_LIFECYCLE_ENABLED and self._us_lifecycle_mgr is not None:
+                _buy_outcome = self._us_finalize_submit_intent(
+                    _us_lc_id, symbol, "BUY", qty, result, excd, _us_trade_id)
+            else:
+                _buy_outcome = (_US_OUTCOME_ACCEPTED if result.get("rt_cd") == "0"
+                                else _US_OUTCOME_REJECTED)
+            order_ok = _buy_outcome in (_US_OUTCOME_ACCEPTED,
+                                        _US_OUTCOME_UNKNOWN_CONFIRM)
             fail_msg = result.get("msg1", "")
             if order_ok or _resized_once:
                 break
@@ -3167,48 +3418,11 @@ class USStrategyManager:
                 )
             except Exception as _uje:
                 _us_jnl._inc_error("us_accepted", _uje)
-        # ★ Phase 4: US BUY lifecycle 등록 + PendingRegistry 자동 연결
-        #   rt_cd=0(외부 접수 성공) 이후이므로, create/register 가 실패해도 실주문이
-        #   살아 있을 수 있다 → 차단 meta 를 create 이전에 먼저 심고, 어떤 실패에도
-        #   제거하지 않는다(중복 매수 방지).
-        if _US_LIFECYCLE_ENABLED and self._us_lifecycle_mgr is not None:
-            _us_lc_id = make_order_lifecycle_id("US", "BUY", symbol)
-            self._us_pending_buy_meta[_us_lc_id] = {
-                "code": symbol, "name": name, "qty": qty,
-                "price": cur_price, "avg_price": cur_price,
-                "excd": excd, "level": 1,
-                "trade_id": _us_trade_id,
-                "reason": entry_reason,
-            }
-            try:
-                self._us_lifecycle_mgr.create(
-                    trade_id           = _us_trade_id or _us_lc_id,
-                    market             = "US",
-                    code               = symbol,
-                    side               = "BUY",
-                    strategy_name      = "USStrategyManager",
-                    order_qty          = qty,
-                    order_lifecycle_id = _us_lc_id,
-                )
-                _us_reg = self._us_register_pending_order(
-                    symbol         = symbol,
-                    side           = "BUY",
-                    order_qty      = qty,
-                    order_response = result,
-                    lifecycle_id   = _us_lc_id,
-                    excd           = excd,
-                    trade_id       = _us_trade_id,
-                )
-                # 모든 결과(REGISTERED/PENDING_CONFIRM/UNKNOWN_CONFIRM)가 차단 유지.
-                logger.info(
-                    "[US BUY ACCEPTED] lifecycle+PendingRegistry %s: "
-                    "order_lifecycle_id=%s symbol=%s qty=%s",
-                    _us_reg, _us_lc_id, symbol, qty)
-            except Exception as _us_le:
-                # 외부 주문 존재 가능 → meta 유지(차단), 절대 제거 금지.
-                logger.critical(
-                    "[US BUY] lifecycle/등록 예외 → 차단 유지(외부주문 보존, meta 제거 "
-                    "안 함): symbol=%s error=%s", symbol, _us_le)
+        # ★ durable submit-intent 는 이미 저장·확정됨(_us_begin/_us_finalize).
+        #   여기서는 별도 등록을 하지 않는다(차단 meta 는 finalize 가 유지).
+        logger.info(
+            "[US BUY ACCEPTED] %s: order_lifecycle_id=%s symbol=%s qty=%s",
+            _buy_outcome, _us_lc_id, symbol, qty)
         # ── [US OPEN SCAN] 첫 매수 기록 ──────────────────────
         self._record_first_buy()
         logger.info(
@@ -3251,9 +3465,32 @@ class USStrategyManager:
             except Exception as _uje:
                 _us_jnl._inc_error("us_add_signal", _uje)
 
+        reason = (f"모멘텀추가매수: 수익{pos.net_pct(cur_price):+.1f}% "
+                  f"vol{iv['vol_ratio']:.1f}x VWAP위 등락{iv['intraday_pct']:+.1f}%")
+        # ★ KIS 호출 '전' durable submit-intent 저장(crash 안전). 실패 시 미제출.
+        _us_add_lc_id = make_order_lifecycle_id("US", "BUY", symbol)
+        if _US_LIFECYCLE_ENABLED and self._us_lifecycle_mgr is not None:
+            if not self._us_begin_submit_intent(
+                    _us_add_lc_id, symbol, "BUY", add_qty, cur_price, excd,
+                    _us_add_trade_id,
+                    meta_extra={"name": name, "level": 2, "reason": reason}):
+                return {"action": "BUY_FAIL", "symbol": symbol, "name": name,
+                        "reason": "submit-intent 저장 실패 — 주문 미제출(안전)",
+                        "session": sess["session"]}
+
         result  = self.api.buy_us(symbol, add_qty, cur_price, excd, allow_krw_order=True)
-        if result.get("rt_cd") != "0":
-            # ── [US 훅 F] 추가매수 ORDER_REJECTED ──
+
+        # 응답 분류(rt_cd=9/알수없는코드/ODNO존재 → 확인대기, 명확거절만 REJECTED)
+        if _US_LIFECYCLE_ENABLED and self._us_lifecycle_mgr is not None:
+            _add_outcome = self._us_finalize_submit_intent(
+                _us_add_lc_id, symbol, "BUY", add_qty, result, excd,
+                _us_add_trade_id)
+        else:
+            _add_outcome = (_US_OUTCOME_ACCEPTED if result.get("rt_cd") == "0"
+                            else _US_OUTCOME_REJECTED)
+
+        if _add_outcome in (_US_OUTCOME_REJECTED, _US_OUTCOME_NOT_SENT):
+            # ── [US 훅 F] 추가매수 ORDER_REJECTED (명확 거절/미전송 — 주문 없음) ──
             if _US_JOURNAL_ENABLED and _us_add_trade_id:
                 try:
                     _us_jnl.record_order_rejected(
@@ -3265,12 +3502,9 @@ class USStrategyManager:
                     _us_jnl._inc_error("us_add_rejected", _uje)
             return {"action": "BUY_FAIL", "symbol": symbol, "name": name,
                     "reason": result.get("msg1", "추가매수실패"), "session": sess["session"]}
-        # ★ rt_cd=0 은 접수 — 포지션 수량/평단 갱신은 하지 않는다.
-        #   실체결 후 _us_handle_buy_filled 가 기존 포지션에 가중평균 병합한다.
-        reason = (f"모멘텀추가매수: 수익{pos.net_pct(cur_price):+.1f}% "
-                  f"vol{iv['vol_ratio']:.1f}x VWAP위 등락{iv['intraday_pct']:+.1f}%")
+
+        # ACCEPTED 또는 UNKNOWN_CONFIRM → 접수/확인대기(차단 유지). 포지션 갱신은 체결시.
         # ── [US 훅 G] 추가매수 ORDER_ACCEPTED (접수, 체결 미확인) ──
-        # ★ ORDER_FILLED 는 실체결 확인 훅에만 기록. US 체결조회 미연동 → 비워 둔.
         if _US_JOURNAL_ENABLED and _us_add_trade_id:
             try:
                 _us_jnl.record_order_accepted(
@@ -3280,45 +3514,8 @@ class USStrategyManager:
                 )
             except Exception as _uje:
                 _us_jnl._inc_error("us_add_accepted", _uje)
-        # ★ Phase 4: US ADD_BUY lifecycle 등록 + PendingRegistry 자동 연결
-        #   rt_cd=0 이후 → 실패해도 실주문 존재 가능 → 차단 meta 선(先)등록·비제거.
-        if _US_LIFECYCLE_ENABLED and self._us_lifecycle_mgr is not None:
-            _us_add_lc_id = make_order_lifecycle_id("US", "BUY", symbol)
-            self._us_pending_buy_meta[_us_add_lc_id] = {
-                "code": symbol, "name": name, "qty": add_qty,
-                "price": cur_price, "avg_price": cur_price,
-                "excd": excd, "level": 2,
-                "trade_id": _us_add_trade_id,
-                "reason": reason,
-            }
-            try:
-                self._us_lifecycle_mgr.create(
-                    trade_id           = _us_add_trade_id or _us_add_lc_id,
-                    market             = "US",
-                    code               = symbol,
-                    side               = "BUY",
-                    strategy_name      = "USStrategyManager_AddBuy",
-                    order_qty          = add_qty,
-                    order_lifecycle_id = _us_add_lc_id,
-                )
-                _us_add_reg = self._us_register_pending_order(
-                    symbol         = symbol,
-                    side           = "BUY",
-                    order_qty      = add_qty,
-                    order_response = result,
-                    lifecycle_id   = _us_add_lc_id,
-                    excd           = excd,
-                    trade_id       = _us_add_trade_id,
-                )
-                logger.info(
-                    "[US ADD_BUY ACCEPTED] lifecycle+PendingRegistry %s: "
-                    "order_lifecycle_id=%s symbol=%s qty=%s",
-                    _us_add_reg, _us_add_lc_id, symbol, add_qty)
-            except Exception as _us_add_le:
-                logger.critical(
-                    "[US ADD_BUY] lifecycle/등록 예외 → 차단 유지(외부주문 보존, meta "
-                    "제거 안 함): symbol=%s error=%s", symbol, _us_add_le)
-        logger.info(f"🟢 US추가매수 {symbol} {add_qty}주 ${cur_price:.2f} | {reason}")
+        logger.info("🟢 US추가매수 %s %d주 $%.2f | %s [%s]",
+                    symbol, add_qty, cur_price, reason, _add_outcome)
         return self._buy_result(symbol, name, excd, cur_price, add_qty, 2, sess, iv,
                                 reason, "[모멘텀추가]")
 
@@ -3364,8 +3561,37 @@ class USStrategyManager:
             except Exception as _uje:
                 _us_jnl._inc_error("us_sell_submitted", _uje)
 
+        # ★ KIS 호출 '전' durable submit-intent 저장(crash 안전). 실패 시 미제출.
+        pos    = self.pos_mgr.positions.get(symbol)
+        avg_p  = pos.avg_price if pos else cur_price
+        _us_sell_lc_id = make_order_lifecycle_id("US", "SELL", symbol)
+        if _US_LIFECYCLE_ENABLED and self._us_lifecycle_mgr is not None:
+            if not self._us_begin_submit_intent(
+                    _us_sell_lc_id, symbol, "SELL", qty, cur_price, excd,
+                    _us_sell_trade_id,
+                    meta_extra={"name": name, "avg_price": avg_p,
+                                "reason": reason, "is_full": not is_partial}):
+                logger.critical(
+                    "[US SELL] submit-intent 저장 실패 → 매도 미제출(안전): %s", symbol)
+                return {
+                    "action":  "HOLD", "symbol": symbol, "name": name, "excd": excd,
+                    "reason":  "submit-intent 저장 실패 — 매도 미제출(안전)",
+                    "session": sess.get("session", ""),
+                }
+
         result  = self.api.sell_us(symbol, qty, cur_price, excd)
-        if result.get("rt_cd") == "0":
+
+        # 응답 분류(rt_cd=9/알수없는코드/ODNO존재 → 확인대기, 명확거절만 REJECTED)
+        if _US_LIFECYCLE_ENABLED and self._us_lifecycle_mgr is not None:
+            _sell_outcome = self._us_finalize_submit_intent(
+                _us_sell_lc_id, symbol, "SELL", qty, result, excd,
+                _us_sell_trade_id)
+        else:
+            _sell_outcome = (_US_OUTCOME_ACCEPTED if result.get("rt_cd") == "0"
+                             else _US_OUTCOME_REJECTED)
+
+        if _sell_outcome in (_US_OUTCOME_ACCEPTED, _US_OUTCOME_UNKNOWN_CONFIRM):
+            # 접수/확인대기 — 포지션 감소·실현손익·재진입은 체결시에만(차단 유지).
             # ── [US 훅 J] SELL_ORDER_ACCEPTED ──
             if _US_JOURNAL_ENABLED:
                 try:
@@ -3376,79 +3602,25 @@ class USStrategyManager:
                     )
                 except Exception as _uje:
                     _us_jnl._inc_error("us_sell_accepted", _uje)
-
-            # ★ rt_cd=0 은 접수 — 포지션 감소/삭제·실현손익·재진입은 하지 않는다.
-            #   실체결 후 _us_handle_sell_filled 에서만 정확히 1회 반영한다.
-            pos         = self.pos_mgr.positions.get(symbol)
-            avg_p       = pos.avg_price if pos else cur_price
             est_pnl_usd = (cur_price - avg_p) * qty
             est_pnl_pct = (cur_price - avg_p) / avg_p * 100 if avg_p > 0 else 0.0
-            action_tag  = "SELL_ACCEPTED"
             logger.info(
-                "[US SELL ACCEPTED] %s(%s) $%.2f×%s주 접수 — 체결 대기 "
+                "[US SELL %s] %s(%s) $%.2f×%s주 접수 — 체결 대기 "
                 "(%s, 예상손익 $%+.2f) 사유=%s",
-                name, symbol, cur_price, qty,
+                _sell_outcome, name, symbol, cur_price, qty,
                 ("전량" if not is_partial else "부분"), est_pnl_usd, reason,
             )
-
-            # ── [US 훅 K] SELL lifecycle + PendingRegistry (Phase 4 US Pipeline) ──
-            # ★ rt_cd=0 은 접수 성공. SELL lifecycle을 ACCEPTED로 등록하고
-            # FillObserver 폴링 대상으로 PendingRegistry에 추가한다.
-            # ★ rt_cd=0(외부 접수 성공) 이후 → create/register 실패해도 실주문 존재
-            #   가능 → 차단 meta 를 create 이전에 먼저 심고 어떤 실패에도 제거하지
-            #   않는다(이중 매도 방지). 사고의 핵심 재발 방지 지점.
-            if _US_LIFECYCLE_ENABLED and self._us_lifecycle_mgr is not None:
-                _us_sell_lc_id = make_order_lifecycle_id("US", "SELL", symbol)
-                self._us_pending_sell_meta[_us_sell_lc_id] = {
-                    "code":      symbol,
-                    "name":      name,
-                    "qty":       qty,
-                    "price":     cur_price,
-                    "avg_price": avg_p,
-                    "trade_id":  _us_sell_trade_id,
-                    "reason":    reason,
-                    "is_full":   not is_partial,
-                }
-                try:
-                    self._us_lifecycle_mgr.create(
-                        trade_id           = _us_sell_trade_id or _us_sell_lc_id,
-                        market             = "US",
-                        code               = symbol,
-                        side               = "SELL",
-                        strategy_name      = "USStrategyManager",
-                        order_qty          = qty,
-                        order_lifecycle_id = _us_sell_lc_id,
-                    )
-                    _us_sell_reg = self._us_register_pending_order(
-                        symbol         = symbol,
-                        side           = "SELL",
-                        order_qty      = qty,
-                        order_response = result,
-                        lifecycle_id   = _us_sell_lc_id,
-                        excd           = excd,
-                        trade_id       = _us_sell_trade_id,
-                    )
-                    # 모든 결과가 차단 유지(중복 매도 금지). meta 제거 없음.
-                    logger.info(
-                        "[US SELL ACCEPTED] lifecycle+PendingRegistry %s: "
-                        "order_lifecycle_id=%s symbol=%s qty=%s",
-                        _us_sell_reg, _us_sell_lc_id, symbol, qty)
-                except Exception as _us_sell_le:
-                    # 외부 매도주문 존재 가능 → meta 유지(차단), 절대 제거 금지.
-                    logger.critical(
-                        "[US SELL] lifecycle/등록 예외 → 차단 유지(외부주문 보존, meta "
-                        "제거 안 함): symbol=%s error=%s", symbol, _us_sell_le)
-
             return {
-                "action":      action_tag,
+                "action":      "SELL_ACCEPTED",
                 "symbol":      symbol, "name": name, "excd": excd,
                 "price":       cur_price, "qty": qty,
                 "est_pnl_usd": round(est_pnl_usd, 2),
                 "est_pnl_pct": round(est_pnl_pct, 2),
                 "reason":      reason, "session": sess["session"], "currency": "USD",
             }
-        # ★ 매도 실패 시 — '가능수량보다 큽니다' 오류 = KIS에 실제 잔고 없음
-        # → 유령 포지션으로 판단하고 봇 포지션에서도 제거
+
+        # REJECTED(명확 거절) 또는 NOT_SENT(미전송) → 매도 실패/미제출(차단 해제됨).
+        # '가능수량보다 큽니다' = KIS 잔고 없음 → 유령 포지션 제거.
         fail_msg = result.get('msg1', '매도실패')
         # ── [US 훅 L] SELL_ORDER_REJECTED ──
         if _US_JOURNAL_ENABLED:
