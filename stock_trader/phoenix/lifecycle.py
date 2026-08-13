@@ -880,6 +880,52 @@ class OrderLifecycleManager:
         lc.accept(odno)
         self._persist_and_record(lc, f"lifecycle:accept:{lc.order_lifecycle_id}")
 
+    def advance_to_accepted(
+        self, lc: OrderLifecycle,
+        client_order_id: Optional[str] = None,
+        odno: Optional[str] = None,
+    ) -> LifecycleState:
+        """★ 단일 공용 helper: 정상 전이 순서를 '순서대로·멱등'으로 적용한다.
+
+        UNKNOWN → SIGNAL_CONFIRMED → ORDER_SUBMITTED → ORDER_ACCEPTED.
+        각 단계는 현재 상태에서 허용될 때만 수행하므로, 이미 진행된 lifecycle 은
+        남은 단계만 밟는다(중복 전이 없음). KR·US 주문 등록이 모두 이 helper 로
+        accept 에 도달해 'UNKNOWN → ORDER_ACCEPTED 직접 전이' 오류를 원천 차단한다.
+        반환: 최종 current_state.
+        """
+        s = LifecycleState
+        if lc.current_state == s.UNKNOWN:
+            self.confirm_signal(lc)
+        if lc.current_state == s.SIGNAL_CONFIRMED:
+            self.submit(lc, client_order_id)
+        if lc.current_state == s.ORDER_SUBMITTED:
+            self.accept(lc, odno)
+        return lc.current_state
+
+    def cancel_unaccepted(
+        self, lc: OrderLifecycle, reason: Optional[str] = None
+    ) -> LifecycleState:
+        """★ pre-accepted lifecycle 을 안전하게 단말(CANCELLED)로 종결한다.
+
+        UNKNOWN/SIGNAL_CONFIRMED/ORDER_SUBMITTED 처럼 아직 접수(ODNO)되지 않은
+        lifecycle 을 정리할 때 사용한다. EXPIRED 는 전이표상 접수 이후에만 도달
+        가능하므로, orphan 종결은 CANCELLED 로 한다. 상태 전이표를 준수해
+        (UNKNOWN → SIGNAL_CONFIRMED →) CANCELLED 로 밟아 내려간다. 이미 단말이거나
+        이미 접수(ORDER_ACCEPTED/PARTIALLY_FILLED)된 lifecycle 은 건드리지 않는다
+        (오사용 방지·멱등). 반환: 최종 current_state.
+        """
+        s = LifecycleState
+        if lc.is_terminal:
+            return lc.current_state
+        if lc.current_state in (s.ORDER_ACCEPTED, s.PARTIALLY_FILLED):
+            # 접수된 주문은 이 helper 로 종결하지 않는다(중복 방지·안전).
+            return lc.current_state
+        if lc.current_state == s.UNKNOWN:
+            self.confirm_signal(lc)
+        # SIGNAL_CONFIRMED / ORDER_SUBMITTED → CANCELLED
+        self.cancel(lc, reason)
+        return lc.current_state
+
     def partial_fill(
         self,
         lc: OrderLifecycle,
