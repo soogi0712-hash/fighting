@@ -47,7 +47,7 @@
 import os
 import json
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 from utils.logger             import get_logger
 from utils.market_session     import (
     us_session_info, is_us_tradeable,
@@ -164,6 +164,11 @@ _US_CLEAR_REJECT_MSGS = (
 US_POSITIONS_FILE = os.path.join(
     os.path.dirname(__file__), "..", "data", "us_positions.json"
 )
+
+# ★ 관리모드 SELL '명확 거절(clear-reject)' 후 재제출 쿨다운(초). 같은 루프/직후 루프의
+#   무한 재시도를 막는다. timeout/500/불명확(UNKNOWN_CONFIRM)은 EXIT_PENDING 유지라
+#   쿨다운 대상이 아니다(이미 재제출 차단).
+US_SELL_REJECT_COOLDOWN_SEC = 60
 
 # ── 기본 관심종목 풀 유니버스 ─────────────────────────────────
 DEFAULT_US_WATCHLIST = {
@@ -639,6 +644,25 @@ class USPosition:
     def management_mode(self) -> str:
         return self.mgmt.get("management_mode", USR.MODE_NORMAL)
 
+    # ── 격리(broker-absent quarantine) ──────────────────────
+    @property
+    def is_quarantined(self) -> bool:
+        return bool(self.mgmt.get("quarantined"))
+
+    def quarantine(self, reason: str, snapshot_id: str, now_iso: str):
+        """완전 KIS 스냅샷에서 broker 부재로 판정 → 격리(삭제하지 않고 감사정보만).
+        기록: symbol, quarantined_at, reason, snapshot_id (그 외 원문 없음)."""
+        self.mgmt["quarantined"] = True
+        self.mgmt["quarantine"] = {
+            "symbol": self.symbol, "quarantined_at": now_iso,
+            "reason": reason, "snapshot_id": snapshot_id,
+        }
+
+    def clear_quarantine(self):
+        """KIS 잔고에 재등장 → 즉시 정상 복구(격리 해제)."""
+        self.mgmt["quarantined"] = False
+        self.mgmt["quarantine"] = None
+
     def sync_mgmt_high(self):
         """highest_price 단일 진실원: pos.highest_price ↔ mgmt['highest_price'] 를
         max 로 양방향 동기화(절대 하락 없음 — 반복 복원·재시작 안전)."""
@@ -707,7 +731,8 @@ class USPositionManager:
 
     def save(self):
         try:
-            data = {sym: p.to_dict() for sym, p in self.positions.items()}
+            # 동시 mutation(정합화 잡) 과 경쟁해도 안전하게 스냅샷 후 직렬화
+            data = {sym: p.to_dict() for sym, p in self._snapshot()}
             self._store.save(data)   # 원자적(temp+fsync+os.replace) + .bak 보존
         except Exception as e:
             logger.error(f"[US포지션] 저장 실패: {e}")
@@ -725,6 +750,33 @@ class USPositionManager:
             p = self.positions[symbol]
             p.qty = qty;  p.avg_price = avg_price;  p.current_level = level
             self.save()
+
+    # ── 격리 인지 뷰(매도판정·집계·중복매수 판정은 active 만 사용) ──────────
+    def _snapshot(self) -> list:
+        """positions.items() 스냅샷 — 저빈도 정합화 잡의 동시 mutation 과 경쟁해도
+        'dictionary changed size during iteration' 로 죽지 않도록 방어 복사(재시도)."""
+        for _ in range(3):
+            try:
+                return list(self.positions.items())
+            except RuntimeError:
+                continue
+        return list(dict(self.positions).items())
+
+    def active_positions(self) -> dict:
+        """격리(BROKER_ABSENT_QUARANTINED)되지 않은 '실제 보유' 포지션만."""
+        return {s: p for s, p in self._snapshot() if not p.is_quarantined}
+
+    def quarantined_positions(self) -> dict:
+        """격리된 포지션(매도·판정·집계 제외, 감사·재등장 복구용)."""
+        return {s: p for s, p in self._snapshot() if p.is_quarantined}
+
+    def quarantine_audit(self) -> list:
+        """격리 감사정보 리스트(symbol/quarantined_at/reason/snapshot_id만; PII 없음)."""
+        out = []
+        for _s, p in self._snapshot():
+            if p.is_quarantined and p.mgmt.get("quarantine"):
+                out.append(dict(p.mgmt["quarantine"]))
+        return out
 
 
 # ════════════════════════════════════════════════════════════
@@ -981,19 +1033,23 @@ class USStrategyManager:
 
         # ── US 실보유 정합화(§4~§7) 상태 ─────────────────────────
         #   buy_gate_ok=False 면 '이번 스캔의 신규 BUY만' 스킵(기존 SELL/체결감시 계속).
-        #   비권위 잔고 조회 후에만 False 로 내려간다(§6 fail-safe).
+        #   ★ 기본 False: 완전·권위 스냅샷으로 복원+격리를 1회 마치기 전까지 신규 BUY
+        #     차단(startup 정합화 실패/미실행 시 첫 BUY 차단 — §7). 성공 시 True 로 승격.
         import threading as _th
         self._us_reconcile_lock   = _th.Lock()   # US 전용 비재진입 락(중복 실행 방지)
-        self._us_buy_gate_ok      = True
-        self._us_buy_gate_reason  = ""
+        self._us_buy_gate_ok      = False
+        self._us_buy_gate_reason  = "awaiting_first_authoritative_complete_reconcile"
+        self._us_snapshot_seq     = 0            # snapshot_id 생성용 시퀀스
         self._us_reconcile_health = {
             "ran": False, "last_run_at": None, "authoritative": None,
-            "buy_allowed": None, "complete": None, "restored": 0,
-            "reconciled": 0, "stale_removed": 0, "broker_count": 0,
-            "internal_count": 0, "reason": "not_run_yet", "error": None,
+            "buy_allowed": False, "complete": None, "authoritative_empty": None,
+            "restored": 0, "reconciled": 0, "quarantined": 0, "unquarantined": 0,
+            "stale_deleted": 0, "quarantined_total": 0, "broker_count": 0,
+            "internal_count": 0, "active_internal_count": 0,
+            "snapshot_id": None, "reason": "not_run_yet", "error": None,
         }
-        # ★ 라이브 stale 삭제 기본 비활성(안전): 완전 스냅샷이어도 운영자 승인 전까지
-        #   복원만 수행하고 삭제는 보류한다(거래소 누락에 의한 오삭제 방지).
+        # ★ 격리 포지션의 '최종 삭제'는 운영자 승인 + 완전 스냅샷일 때만 허용(기본 비활성).
+        #   미승인 시에는 삭제하지 않고 BROKER_ABSENT_QUARANTINED 로 격리만 한다(감사 유지).
         self._us_allow_stale_delete = bool(
             os.environ.get("US_RECONCILE_ALLOW_STALE_DELETE", "").lower()
             in ("1", "true", "yes", "on")
@@ -1064,6 +1120,16 @@ class USStrategyManager:
     # ── 포지션 저수준 헬퍼 (idempotent 적용에 사용) ──
     def _us_pos_add(self, symbol, name, excd, delta, delta_avg, level=1):
         existing = self.pos_mgr.positions.get(symbol)
+        # ★ 격리 포지션은 '실보유 아님' → 매수 체결 시 격리를 해제하고 신규 보유로 취급
+        #   (격리 qty 에 더하지 않는다; broker 부재였으므로 0에서 시작).
+        if existing is not None and existing.is_quarantined:
+            existing.clear_quarantine()
+            existing.qty = int(delta)
+            existing.avg_price = float(delta_avg)
+            existing.current_level = level
+            existing.recovered = False   # 신규 매수분 — 기존 익절/손절 정책 적용
+            self.pos_mgr.save()
+            return
         if existing is not None:
             new_qty = existing.qty + int(delta)
             new_avg = ((existing.avg_price * existing.qty + delta_avg * delta) / new_qty
@@ -2190,7 +2256,20 @@ class USStrategyManager:
 
     @property
     def positions(self) -> dict:
-        return {sym: p.to_dict() for sym, p in self.pos_mgr.positions.items()}
+        # ★ '실제 보유' 뷰 — 격리(BROKER_ABSENT_QUARANTINED)는 실보유가 아니므로 제외.
+        #   보유수·평가금액·중복매수 판정·외부 노출 모두 이 뷰를 쓴다(격리 미포함).
+        return {sym: p.to_dict()
+                for sym, p in self.pos_mgr.active_positions().items()}
+
+    @property
+    def quarantined(self) -> dict:
+        """격리 포지션 뷰(감사용, 실보유 아님)."""
+        return {sym: p.to_dict()
+                for sym, p in self.pos_mgr.quarantined_positions().items()}
+
+    def us_quarantine_audit(self) -> list:
+        """격리 감사정보(symbol/quarantined_at/reason/snapshot_id) — /api/status 노출."""
+        return self.pos_mgr.quarantine_audit()
 
     # ── [US OPEN SCAN] 개장 감지 및 초기 스캔 관리 ────────────
     def _check_open_scan(self, sess: dict) -> bool:
@@ -2303,7 +2382,8 @@ class USStrategyManager:
             # → 단, KIS 주문이 실제로 가능한 세션(미국정규장)이 아니면 SELL 불가
             # → 프리마켓/애프터/휴장 시간에는 손익 모니터링만 하고 SELL은 정규장에서만
             _can_sell_now = sess["session"] == "미국정규장"
-            pos_held = self.pos_mgr.positions.get(symbol)
+            # ★ 격리 포지션은 실보유가 아니므로 관리 대상에서 제외(active 만)
+            pos_held = self.pos_mgr.active_positions().get(symbol)
             if pos_held:
                 if not _can_sell_now:
                     # 프리마켓·애프터·휴장: 현재가 확인 후 손익 로그만 출력 (주문 없음)
@@ -2372,8 +2452,8 @@ class USStrategyManager:
             f"  상태=    {'거래중' if _g.state == 'TRADING' else '목표달성-매수차단' if _g.state == 'PROFIT_LOCK' else '손실한도-매수차단'}"
         )
 
-        # 보유 중이면 평가손익 계산 (USD→KRW 근사, 환율 조회 없이 상수 사용)
-        _pos_now = self.pos_mgr.positions.get(symbol)
+        # 보유 중이면 평가손익 계산 (USD→KRW 근사; 격리 제외 = active 만)
+        _pos_now = self.pos_mgr.active_positions().get(symbol)
         _unrealized_us = 0.0
         if _pos_now and _pos_now.avg_price > 0:
             # 현재가는 rt_cache에서 우선 취득
@@ -2431,7 +2511,9 @@ class USStrategyManager:
         # ③ 지표 계산
         iv = _calc_indicators(candles_live, realtime)
 
-        pos = self.pos_mgr.positions.get(symbol)
+        # ★ 격리 포지션은 실보유가 아니므로 매도판정 대상에서 제외(active 만).
+        #   (격리 심볼은 아래 미보유 경로로 흘러가 중복매수 판정에서도 실보유로 취급 안 됨)
+        pos = self.pos_mgr.active_positions().get(symbol)
 
         # ── 상태 로그 (매 루프) ───────────────────────────
         logger.info(
@@ -2479,6 +2561,11 @@ class USStrategyManager:
         # highest 단일화(하락 금지) 후 순수 판정
         pos.sync_mgmt_high()
         prev_mode = pos.mgmt.get("management_mode", USR.MODE_NORMAL)
+        # ★ 격리 포지션은 애초에 여기 도달하지 않지만(active 만 관리), 방어적으로 HOLD
+        if pos.is_quarantined:
+            return {"action": "HOLD", "symbol": symbol, "name": name, "excd": excd,
+                    "reason": "[관리] 격리 포지션 — 매도판정 제외",
+                    "session": sess.get("session", "")}
         d = USR.decide_management_action(dict(pos.mgmt), net_pct, cur_price, now)
         # 갱신 상태 반영(액션 무관하게 last_evaluated_at/회복상태 저장) + highest 재동기화
         pos.mgmt = d.state
@@ -2504,6 +2591,25 @@ class USStrategyManager:
 
         # ── SELL_ALL: EXIT_PENDING 전이·영속 후, 기존 crash-safe 제출경로로만 매도 ──
         if d.action == USR.ACT_SELL_ALL:
+            # ★ 명확 거절 쿨다운 중이면 재제출 금지(무한 재시도 방지, item5).
+            #   쿨다운은 '명확 거절' 후에만 설정된다. 판정 상태는 그대로 두고 HOLD 반환.
+            cd = pos.mgmt.get("sell_cooldown_until")
+            if cd:
+                try:
+                    if now < datetime.fromisoformat(cd):
+                        self.pos_mgr.save()
+                        logger.info(
+                            "[US관리] %s(%s) SELL 판정이나 명확거절 쿨다운(until=%s) → "
+                            "재제출 보류(HOLD)", name, symbol, cd)
+                        return {"action": "HOLD", "symbol": symbol, "name": name,
+                                "excd": excd, "reason": f"[관리] 매도 쿨다운(until={cd})",
+                                "session": sess.get("session", ""), "mode": d.mode}
+                except (TypeError, ValueError):
+                    pass
+
+            # ★ 되돌림용 스냅샷: 직전 판정상태(RECOVERY + started_at/high 포함)를 정확히 보존.
+            #   begin_submit_intent 실패로 KIS 미호출 시 이 상태로 원상복구한다(item4).
+            pre_exit_mgmt = dict(pos.mgmt)
             # 제출 '전' EXIT_PENDING 전이·영속(재시작/다음루프 재제출 방지, §2/§8)
             pos.mgmt["management_mode"] = USR.MODE_EXIT
             pos.mgmt["exit_pending_ref"] = {
@@ -2524,18 +2630,34 @@ class USStrategyManager:
             # 유령포지션 제거(체결 아님, KIS 잔고 없음)면 그대로 반환
             if symbol not in self.pos_mgr.positions:
                 return result
-            # ★ 실제 활성 매도주문이 존재해야만 EXIT_PENDING 유지. 미전송/명확거절/
-            #   submit-intent 실패(=활성주문 없음)면 되돌려 다음 루프 재판정(무한 잠금 방지).
             live_pos = self.pos_mgr.positions.get(symbol)
-            if live_pos is not None and not self._us_has_active_order(symbol, "SELL"):
-                live_pos.mgmt["management_mode"] = prev_mode
-                live_pos.mgmt["exit_pending_ref"] = None
-                self.pos_mgr.save()
+            if live_pos is None:
+                return result
+
+            _action = str(result.get("action") or "")
+            _has_order = self._us_has_active_order(symbol, "SELL")
+            if _has_order:
+                # 접수/확인대기(ACCEPTED·UNKNOWN_CONFIRM) 또는 in-flight → EXIT_PENDING 유지.
+                #   timeout/500/불명확도 여기(재제출 금지, §5). 아무것도 되돌리지 않는다.
+                return result
+
+            # ★ 활성 매도주문 없음 = 실제 미전송/명확거절/submit-intent 실패.
+            #   직전 판정상태(RECOVERY + started_at/high)를 '정확히' 원상복구(item4).
+            live_pos.mgmt = dict(pre_exit_mgmt)
+            # 명확 거절(SELL_FAIL)인 경우에만 쿨다운 설정(무한 재시도 방지, item5).
+            #   HOLD(submit-intent 실패 등)는 쿨다운 없이 다음 루프 재시도 허용.
+            if _action == "SELL_FAIL":
+                live_pos.mgmt["sell_cooldown_until"] = (
+                    now + timedelta(seconds=US_SELL_REJECT_COOLDOWN_SEC)).isoformat()
                 logger.info(
-                    "[US관리] %s(%s) 매도 미전송/거절(활성주문 없음) → "
-                    "EXIT_PENDING 해제(mode=%s 복귀, 다음 루프 재판정)",
-                    name, symbol, prev_mode,
-                )
+                    "[US관리] %s(%s) 명확거절 → mode=%s 원상복구 + 쿨다운 %ds",
+                    name, symbol, pre_exit_mgmt.get("management_mode"),
+                    US_SELL_REJECT_COOLDOWN_SEC)
+            else:
+                logger.info(
+                    "[US관리] %s(%s) 미전송(활성주문 없음) → mode=%s 원상복구(다음 루프 재판정)",
+                    name, symbol, pre_exit_mgmt.get("management_mode"))
+            self.pos_mgr.save()
             return result
 
         # 방어: 알 수 없는 액션 → 개입하지 않음
@@ -2545,20 +2667,33 @@ class USStrategyManager:
     # ══════════════════════════════════════════════════════════
     # US 실보유 정합화(§4~§7) — KIS 잔고 권위 기반 복원/정리
     # ══════════════════════════════════════════════════════════
+    def _next_snapshot_id(self) -> str:
+        """정합화 스냅샷 식별자(감사용). 시퀀스+타임스탬프(원문·계좌 없음)."""
+        self._us_snapshot_seq += 1
+        return f"us-snap-{datetime.now().strftime('%Y%m%dT%H%M%S')}-{self._us_snapshot_seq}"
+
     def us_reconcile_positions(self, snapshot: dict = None,
                                allow_stale_delete: bool = None) -> dict:
-        """KIS 해외 잔고를 '보유수량 권위값'으로 내부 원장을 복원/정합화한다(§4~§7).
+        """KIS 해외 잔고를 '보유수량 권위값'으로 내부 원장을 복원/정합/격리한다(§2/§4~§7).
 
         Args:
-          snapshot : {ok, source, complete, holdings} — None 이면 api.get_us_balance_full().
-          allow_stale_delete : 완전 스냅샷에서 stale 삭제 허용 여부(None=인스턴스 기본).
+          snapshot : {ok, source, complete, holdings, authoritative_empty} —
+                     None 이면 api.get_us_balance_full().
+          allow_stale_delete : 격리 포지션의 '최종 삭제' 허용 여부(None=인스턴스 기본,
+                     기본 False → 삭제 없이 격리만). 삭제는 완전 스냅샷 + 승인 동시 충족 시만.
 
         동작(순수판정 us_reconcile.reconcile_decision 위임 후 부수효과):
-          · 비권위(조회 실패/캐시/파싱실패) → 삭제·복원 안 함, **신규 BUY만 스킵**(§6).
+          · 비권위(조회 실패/캐시/파싱실패) → 삭제·격리·복원 안 함, **신규 BUY만 스킵**(§6).
           · 복원(to_restore) → USPosition(recovered=True), highest=max(avg,cur,기존),
-            즉시 매도 안 함(HOLD), 다음 US 루프부터 실매도 판정(§7).
+            즉시 매도 안 함(HOLD). 격리중 재등장이면 즉시 격리해제(§ 재등장).
           · 정합(to_reconcile) → qty/avg=KIS 권위 갱신, highest/recovery_high 하락 금지.
-          · stale(to_stale_remove) → **완전 스냅샷 + 삭제허용**일 때만 제거(§5).
+            손익은 임의 부킹하지 않는다(회계는 체결 파이프라인 전담).
+          · broker_absent(완전 스냅샷만) → **격리(BROKER_ABSENT_QUARANTINED)**. 삭제 아님.
+            운영자 승인(allow_stale_delete)+완전 스냅샷일 때만 최종 삭제.
+          · 불완전 스냅샷 → positive holding 복원만. broker 부재 판정·격리 금지(§1).
+
+        신규 BUY 게이트: 완전·권위 스냅샷 + 복원 완료 + 내부 stale 전부 격리(또는 삭제)
+          완료 시에만 허용. 불완전/실패면 이번 스캔 BUY 스킵(SELL·체결감시는 계속).
         비재진입 락으로 중복 실행을 막고, PII 없는 health 를 갱신한다.
         """
         if allow_stale_delete is None:
@@ -2568,6 +2703,7 @@ class USStrategyManager:
             return dict(self._us_reconcile_health)
         try:
             now_iso = datetime.now().isoformat()
+            snap_id = self._next_snapshot_id()
             # ── 브로커 스냅샷 취득 ──
             if snapshot is None:
                 try:
@@ -2576,52 +2712,71 @@ class USStrategyManager:
                     snapshot = {"ok": False, "source": None,
                                 "complete": False, "holdings": []}
                     logger.warning(f"[US정합화] 잔고 완전조회 예외: {e}")
-            ok       = bool(snapshot.get("ok"))
-            source   = snapshot.get("source")
-            complete = bool(snapshot.get("complete"))
-            holdings = snapshot.get("holdings")
+            ok        = bool(snapshot.get("ok"))
+            source    = snapshot.get("source")
+            complete  = bool(snapshot.get("complete"))
+            holdings  = snapshot.get("holdings")
+            auth_empty = bool(snapshot.get("authoritative_empty"))
 
             internal_syms = list(self.pos_mgr.positions.keys())
+            quarantined_syms = list(self.pos_mgr.quarantined_positions().keys())
             res = USRC.reconcile_decision(
                 ok=ok, source=source, holdings=holdings,
                 internal_symbols=internal_syms, complete=complete,
+                quarantined_symbols=quarantined_syms,
             )
 
-            # ── 비권위 → 삭제/복원 안 함. 신규 BUY 게이트만 내림(§6) ──
+            # ── 비권위 → 삭제/격리/복원 안 함. 신규 BUY 게이트만 내림(§6) ──
             if not res.authoritative:
                 self._us_buy_gate_ok     = False
                 self._us_buy_gate_reason = res.reason
                 self._us_reconcile_health.update({
-                    "ran": True, "last_run_at": now_iso,
+                    "ran": True, "last_run_at": now_iso, "snapshot_id": snap_id,
                     "authoritative": False, "buy_allowed": False,
-                    "complete": complete, "restored": 0, "reconciled": 0,
-                    "stale_removed": 0, "broker_count": res.broker_count,
+                    "complete": complete, "authoritative_empty": False,
+                    "restored": 0, "reconciled": 0, "quarantined": 0,
+                    "unquarantined": 0, "stale_deleted": 0,
+                    "quarantined_total": len(quarantined_syms),
+                    "broker_count": res.broker_count,
                     "internal_count": res.internal_count,
+                    "active_internal_count": res.active_internal_count,
                     "reason": res.reason, "error": None,
                 })
                 logger.warning(
-                    "[US정합화] 비권위 잔고(%s) → 삭제·복원 없음, 신규 BUY 스킵. "
+                    "[US정합화] 비권위 잔고(%s) → 삭제·격리·복원 없음, 신규 BUY 스킵. "
                     "기존 SELL/체결감시는 계속.", res.reason,
                 )
                 return dict(self._us_reconcile_health)
 
-            # ── 권위 성공 → 복원/정합. BUY 게이트 복구 ──
-            self._us_buy_gate_ok     = bool(res.buy_allowed)
-            self._us_buy_gate_reason = "" if res.buy_allowed else res.reason
-            restored = reconciled = stale_removed = 0
+            restored = reconciled = quarantined = unquarantined = stale_deleted = 0
 
-            # (1) 복원: 내부에 없던 실보유 → recovered=True 로 신규 등록(HOLD)
+            # (1) 복원/격리해제: broker 有·내부 active 無 → recovered=True HOLD 로 등록.
+            #     격리중 재등장이면 격리해제 + 권위 갱신(§ 재등장).
             for rec in res.to_restore:
                 sym = rec["symbol"]
-                if sym in self.pos_mgr.positions:
+                h = max(float(rec["avg_price"] or 0.0),
+                        float(rec.get("cur_price") or 0.0),
+                        float(rec.get("highest_price") or 0.0))
+                existing = self.pos_mgr.positions.get(sym)
+                if existing is not None:
+                    # 격리중 재등장 → 즉시 정상 복구(격리해제) + 권위 갱신, highest 하락 금지
+                    was_q = existing.is_quarantined
+                    existing.clear_quarantine()
+                    existing.qty       = int(rec["qty"])
+                    existing.avg_price = float(rec["avg_price"])
+                    existing.highest_price = max(float(existing.highest_price or 0.0), h)
+                    existing.recovered = True
+                    existing.sync_mgmt_high()
+                    if was_q:
+                        unquarantined += 1
+                        logger.info("♻️[US정합화] 격리해제(재등장) %s %s주 avg=$%.2f",
+                                    sym, rec["qty"], rec["avg_price"])
+                    else:
+                        reconciled += 1
                     continue
                 p = USPosition(sym, rec.get("name", sym), rec.get("excd", "NASD"),
                                int(rec["qty"]), float(rec["avg_price"]),
                                recovered=True)
-                # highest = max(avg, cur) — 낮게 잡히지 않도록(§B/§7)
-                h = max(float(rec["avg_price"] or 0.0),
-                        float(rec.get("cur_price") or 0.0),
-                        float(rec.get("highest_price") or 0.0))
                 p.highest_price = h
                 p.sync_mgmt_high()
                 p.mgmt["management_mode"] = USR.MODE_NORMAL   # 복원 직후 HOLD(즉시매도 금지)
@@ -2633,71 +2788,94 @@ class USStrategyManager:
                     sym, rec["qty"], rec["avg_price"], h,
                 )
 
-            # (2) 정합: 양쪽 존재 → qty/avg=KIS 권위 갱신, highest 하락 금지
+            # (2) 정합: 양쪽 active → qty/avg=KIS 권위 갱신, highest 하락 금지(손익 부킹 없음)
             for rec in res.to_reconcile:
                 sym = rec["symbol"]
                 p = self.pos_mgr.positions.get(sym)
                 if p is None:
                     continue
+                p.clear_quarantine()   # active 로 확인됨 — 혹시 남은 격리표식 해제
                 p.qty       = int(rec["qty"])
                 p.avg_price = float(rec["avg_price"])
                 newh = max(float(p.highest_price or 0.0),
                            float(rec["avg_price"] or 0.0),
                            float(rec.get("cur_price") or 0.0))
                 p.highest_price = newh
-                # recovery_high 도 절대 하락 금지
                 rhp = p.mgmt.get("recovery_high_price")
-                if rhp is not None:
+                if rhp is not None:   # recovery_high 도 절대 하락 금지
                     p.mgmt["recovery_high_price"] = max(
                         float(rhp), float(rec.get("cur_price") or 0.0))
                 p.sync_mgmt_high()
                 reconciled += 1
 
-            # (3) stale 정리: **완전 스냅샷 + 삭제 허용** 일 때만(§5)
+            # (3) broker_absent(완전 스냅샷만) → 격리 or (승인 시)최종 삭제. §5
+            #     불완전 스냅샷이면 res.broker_absent==[] 이므로 아무 것도 하지 않는다(§1).
             do_delete = complete and allow_stale_delete
-            if res.to_stale_remove and do_delete:
-                for sym in res.to_stale_remove:
-                    if sym in self.pos_mgr.positions:
-                        # 활성 매도주문 중이면 삭제 보류(체결경로가 처리)
-                        if self._us_has_active_order(sym, "SELL"):
-                            logger.info("[US정합화] %s 활성 매도주문 존재 → stale 삭제 보류", sym)
-                            continue
-                        self.pos_mgr.positions.pop(sym, None)
-                        stale_removed += 1
+            for sym in res.broker_absent:
+                p = self.pos_mgr.positions.get(sym)
+                if p is None:
+                    continue
+                # 활성 매도주문 중이면 격리·삭제 보류(체결경로가 처리)
+                if self._us_has_active_order(sym, "SELL"):
+                    logger.info("[US정합화] %s 활성 매도주문 존재 → 격리/삭제 보류", sym)
+                    continue
+                if do_delete:
+                    self.pos_mgr.positions.pop(sym, None)
+                    stale_deleted += 1
+                    logger.warning(
+                        "[US정합화] 최종삭제 %s (KIS 미보유·완전스냅샷·운영자승인)", sym)
+                else:
+                    if not p.is_quarantined:
+                        p.quarantine(reason="broker_absent(complete snapshot)",
+                                     snapshot_id=snap_id, now_iso=now_iso)
+                        quarantined += 1
                         logger.warning(
-                            "[US정합화] stale 제거 %s (KIS 미보유·완전스냅샷·삭제허용)", sym)
-            elif res.to_stale_remove:
-                logger.info(
-                    "[US정합화] stale 후보 %d개 보존(complete=%s, allow_delete=%s) "
-                    "— 삭제 금지(§5 오삭제 방지)",
-                    len(res.to_stale_remove), complete, allow_stale_delete,
-                )
+                            "🚧[US정합화] 격리 %s (KIS 완전스냅샷 미보유 → "
+                            "BROKER_ABSENT_QUARANTINED; 매도·판정·집계 제외, 감사 유지)",
+                            sym)
 
-            if restored or reconciled or stale_removed:
-                self.pos_mgr.save()
+            # ── 신규 BUY 게이트: 완전·권위 + 미해결 broker_absent 없음(전부 격리/삭제) ──
+            remaining_absent = [s for s in res.broker_absent
+                                if s in self.pos_mgr.positions
+                                and not self.pos_mgr.positions[s].is_quarantined
+                                and not do_delete]
+            buy_ok = bool(res.authoritative and complete and not remaining_absent)
+            self._us_buy_gate_ok = buy_ok
+            self._us_buy_gate_reason = (
+                "" if buy_ok else
+                ("incomplete_snapshot(buy skipped this scan)" if not complete
+                 else "stale_not_yet_quarantined"))
 
+            self.pos_mgr.save()   # 원자 저장(변경 없더라도 last_evaluated 등 안전 반영)
+
+            q_total = len(self.pos_mgr.quarantined_positions())
             self._us_reconcile_health.update({
-                "ran": True, "last_run_at": now_iso,
-                "authoritative": True, "buy_allowed": bool(res.buy_allowed),
-                "complete": complete, "restored": restored,
-                "reconciled": reconciled, "stale_removed": stale_removed,
+                "ran": True, "last_run_at": now_iso, "snapshot_id": snap_id,
+                "authoritative": True, "buy_allowed": buy_ok,
+                "complete": complete, "authoritative_empty": auth_empty,
+                "restored": restored, "reconciled": reconciled,
+                "quarantined": quarantined, "unquarantined": unquarantined,
+                "stale_deleted": stale_deleted, "quarantined_total": q_total,
                 "broker_count": res.broker_count,
                 "internal_count": res.internal_count,
+                "active_internal_count": res.active_internal_count,
                 "reason": res.reason, "error": None,
             })
             logger.info(
-                "[US정합화] 완료 authoritative=True complete=%s 복원=%d 정합=%d "
-                "stale제거=%d broker=%d internal=%d",
-                complete, restored, reconciled, stale_removed,
-                res.broker_count, res.internal_count,
+                "[US정합화] 완료 complete=%s 복원=%d 정합=%d 격리=%d 격리해제=%d "
+                "삭제=%d 격리총=%d broker=%d buy_ok=%s",
+                complete, restored, reconciled, quarantined, unquarantined,
+                stale_deleted, q_total, res.broker_count, buy_ok,
             )
             return dict(self._us_reconcile_health)
         except Exception as e:
+            self._us_buy_gate_ok = False   # 예외 시 안전하게 BUY 차단
+            self._us_buy_gate_reason = "reconcile_exception"
             self._us_reconcile_health.update({
                 "ran": True, "last_run_at": datetime.now().isoformat(),
-                "error": str(e), "reason": "reconcile_exception",
+                "buy_allowed": False, "error": str(e), "reason": "reconcile_exception",
             })
-            logger.error(f"[US정합화] 예외 — 삭제 없이 종료(안전): {e}")
+            logger.error(f"[US정합화] 예외 — 삭제·격리 없이 종료(안전): {e}")
             return dict(self._us_reconcile_health)
         finally:
             self._us_reconcile_lock.release()

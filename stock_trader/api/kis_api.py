@@ -2343,20 +2343,14 @@ class KISApi:
             logger.error(f"해외 잔고 조회 실패: {e}")
             return {"holdings": [], "total_eval": 0, "cash_usd": 0, "total_profit": 0}
 
-    def get_us_balance_full(self, max_pages: int = 20) -> dict:
-        """해외 잔고 '완전 스냅샷' 조회 — 포지션 정합화 전용(US 전용, 부수효과 없음).
+    def _fetch_us_balance_exchange(self, excd: str, max_pages: int = 20) -> dict:
+        """단일 거래소(excd)의 해외 잔고를 연속조회(pagination)로 완전 수신.
 
-        get_us_balance 와 달리 '권위/완전성 증거'를 함께 보고한다(정합화 §5):
-          ok       : 최소 1페이지 이상 정상 응답(예외/HTTP오류/rt_cd 실패 없음).
-          source   : 'api'(성공 시) / None(실패·예외 시). 캐시가 아님을 명시.
-          complete : **전 페이지(tr_cont 종료: D/E 또는 연속키 소진)까지 정상 수신**하고
-                     중간 페이지 실패·상한 초과가 없을 때만 True. §5 완전성 증거.
-          holdings : qty>0 보유 리스트(get_us_balance 와 동일 파싱).
-          pages    : 실제 수신 페이지 수(관측용).
-
-        ★ 부분 페이지 실패 / 상한 초과 / rate-limit / 예외 → complete=False(또는 ok=False).
-          호출부는 complete=False 이면 **복원만 하고 stale 삭제는 하지 않는다**(사고 방지).
-        ※ KR 잔고·주문 로직과 완전히 분리된 신규 US 전용 메서드다.
+        반환: {ok, complete, holdings, pages}
+          ok       : 최소 1페이지 정상 응답(예외/HTTP/rt_cd 실패 없음).
+          complete : 전 페이지(tr_cont 종료 D/E 또는 연속키 소진)까지 정상 수신 +
+                     상한 미초과 + 중간 페이지 오류 없음.
+          holdings : qty>0 보유 리스트.
         """
         url   = f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-balance"
         from config import Config as _cfg
@@ -2374,7 +2368,7 @@ class KISApi:
                 params = {
                     "CANO":           acc_no,
                     "ACNT_PRDT_CD":   acc_prod,
-                    "OVRS_EXCG_CD":   "NASD",   # 전체 조회용(KIS 전체 US 잔고 반환)
+                    "OVRS_EXCG_CD":   excd,
                     "TR_CRCY_CD":     "USD",
                     "CTX_AREA_FK200": fk,
                     "CTX_AREA_NK200": nk,
@@ -2387,8 +2381,7 @@ class KISApi:
                 resp.raise_for_status()
                 data = resp.json()
                 if str(data.get("rt_cd", "0")) not in ("0", ""):
-                    # 명확한 조회 실패 → 완전성 없음(이전 페이지까지만 ok 였을 수 있음)
-                    logger.warning("[US잔고full] rt_cd=%s msg=%s",
+                    logger.warning("[US잔고full:%s] rt_cd=%s msg=%s", excd,
                                    data.get("rt_cd"), data.get("msg1"))
                     complete = False
                     break
@@ -2410,7 +2403,7 @@ class KISApi:
                     holdings.append({
                         "symbol":    item.get("ovrs_pdno",      item.get("pdno", "")),
                         "name":      item.get("ovrs_item_name", item.get("prdt_name", "")),
-                        "excd":      item.get("ovrs_excg_cd", "NASD"),
+                        "excd":      item.get("ovrs_excg_cd", excd),
                         "qty":       qty,
                         "sell_qty":  sell_qty,
                         "avg_price": float(item.get("pchs_avg_pric", 0) or 0),
@@ -2427,21 +2420,64 @@ class KISApi:
                 if _cont in ("F", "M") and nk != "":
                     tr_cont = "N"
                     continue
-                # 마지막 페이지(D/E) 또는 연속키 없음 → 완전 수신
-                complete = True
+                complete = True   # 마지막 페이지(D/E) 또는 연속키 없음 → 완전 수신
                 break
             else:
-                # max_pages 소진(종료코드 미확인) → 완전성 없음
-                complete = False
-            return {
-                "ok": ok, "source": ("api" if ok else None),
-                "complete": bool(complete and ok), "holdings": holdings,
-                "pages": pages,
-            }
+                complete = False  # max_pages 소진(종료코드 미확인) → 미완전
+            return {"ok": ok, "complete": bool(complete and ok),
+                    "holdings": holdings, "pages": pages}
         except Exception as e:
-            logger.error(f"해외 잔고 완전조회 실패: {e}")
-            return {"ok": False, "source": None, "complete": False,
-                    "holdings": [], "pages": pages}
+            logger.error(f"해외 잔고 조회 실패(%s): {e}", excd)
+            return {"ok": False, "complete": False, "holdings": [], "pages": pages}
+
+    def get_us_balance_full(self, max_pages: int = 20) -> dict:
+        """해외 잔고 '완전 스냅샷' 조회 — 포지션 정합화 전용(US 전용, 부수효과 없음).
+
+        get_us_balance 와 달리 '권위/완전성 증거'를 함께 보고한다(정합화 §2/§5):
+          ok        : 최소 1개 거래소에서 정상 응답(예외/HTTP/rt_cd 실패 없음).
+          source    : 'api'(성공 시) / None(전 거래소 실패·예외 시).
+          complete  : **모든 대상 거래소 × 모든 페이지(continuation)** 를 오류 없이
+                      수신했을 때만 True. 일부 거래소 실패·중간 페이지 오류·상한 초과 중
+                      하나라도 있으면 False. §5 완전성 증거.
+          authoritative_empty : ok & complete & 보유 0 (정상 빈 잔고). 오류로 인한 빈
+                      응답(ok=False)과 구분된다(§2: 빈 응답 ≠ 실제 보유 0).
+          holdings  : qty>0 보유 리스트(거래소 간 symbol 기준 병합·중복 제거).
+          exchanges : 거래소별 {ok, complete, pages, count} (관측용, PII 없음).
+
+        대상 거래소: 환경변수 US_BALANCE_EXCHANGES(콤마구분) 우선, 기본 "NASD".
+          KIS TTTS3012R 는 NASD 조회로 전체 US 잔고를 반환(운영 검증된 집계 조회)하므로
+          기본은 NASD 1건이다. 운영자가 거래소 분리 조회를 원하면 "NASD,NYSE,AMEX" 로
+          확장할 수 있고, 이때 **어느 거래소라도 실패하면 complete=False** 가 된다.
+        ※ KR 잔고·주문 로직과 완전히 분리된 신규 US 전용 메서드다.
+        """
+        import os as _os
+        raw = _os.environ.get("US_BALANCE_EXCHANGES", "").strip()
+        exchanges = [e.strip().upper() for e in raw.split(",") if e.strip()] or ["NASD"]
+
+        merged: dict = {}          # symbol → holding(중복 제거)
+        ex_report: dict = {}
+        any_ok = False
+        all_complete = True
+        for excd in exchanges:
+            r = self._fetch_us_balance_exchange(excd, max_pages=max_pages)
+            ex_report[excd] = {"ok": r["ok"], "complete": r["complete"],
+                               "pages": r["pages"], "count": len(r["holdings"])}
+            any_ok = any_ok or r["ok"]
+            all_complete = all_complete and r["complete"]
+            for h in r["holdings"]:
+                sym = str(h.get("symbol") or "").upper()
+                if sym and sym not in merged:
+                    merged[sym] = h
+        holdings = list(merged.values())
+        complete = bool(any_ok and all_complete)   # 전 거래소·전 페이지 완전 + 실패 없음
+        return {
+            "ok": any_ok,
+            "source": ("api" if any_ok else None),
+            "complete": complete,
+            "authoritative_empty": bool(any_ok and complete and not holdings),
+            "holdings": holdings,
+            "exchanges": ex_report,
+        }
 
     def get_usd_exchange_rate(self) -> float:
         """

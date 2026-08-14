@@ -75,6 +75,12 @@ def default_state(recovered: bool = False, highest_price: float = 0.0,
         "profit_high_net_pct":   None,
         "last_evaluated_at":     (now.isoformat() if now else None),
         "exit_pending_ref":      None,
+        # ── 격리(broker-absent quarantine): 완전 KIS 스냅샷에서 broker 부재 판정된
+        #    내부 포지션. 삭제하지 않고 감사정보만 유지, 매도·판정·집계에서 제외.
+        "quarantined":           False,
+        "quarantine":            None,   # {symbol, quarantined_at, reason, snapshot_id}
+        # ── 명확 거절(clear-reject) 후 SELL 재제출 쿨다운(ISO). 무한 재시도 방지.
+        "sell_cooldown_until":   None,
     }
 
 
@@ -93,6 +99,7 @@ def merge_state(raw: Optional[dict]) -> dict:
     # 타입 보정
     out["recovered"] = bool(out.get("recovered"))
     out["profit_trail_active"] = bool(out.get("profit_trail_active"))
+    out["quarantined"] = bool(out.get("quarantined"))
     try:
         out["highest_price"] = float(out.get("highest_price") or 0.0)
     except (TypeError, ValueError):

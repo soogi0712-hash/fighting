@@ -1821,7 +1821,7 @@ def _us_trading_loop():
     #   → _manage_position 내 tradeable gate가 포지션 있을 때 손절/익절 허용
     has_positions = (
         _us_strategy is not None
-        and len(_us_strategy.pos_mgr.positions) > 0
+        and len(_us_strategy.pos_mgr.active_positions()) > 0   # 격리 제외(실보유만)
     )
     # ★ 실제 KIS 잔고 보유 여부도 확인 (내부 positions 미등록 유령 종목 대응)
     _has_real_holdings = False
@@ -1852,7 +1852,7 @@ def _us_trading_loop():
     if us_sess["tradeable"]:
         _log(f"🇺🇸 [{us_sess['time_et']}] 해외주식 신호 점검 ({len(symbols)}종목)...", "info")
     else:
-        _log(f"🇺🇸 [{us_sess['time_et']}] 해외주식 휴장중 — 보유{len(_us_strategy.pos_mgr.positions)}종목 포지션 관리 중...", "info")
+        _log(f"🇺🇸 [{us_sess['time_et']}] 해외주식 휴장중 — 보유{len(_us_strategy.pos_mgr.active_positions())}종목 포지션 관리 중...", "info")
 
     # ★ 전체 실시간 데이터 배치 프리페치 (yfinance 1회 묶음 호출)
     rt_cache = _us_prefetch_realtime(symbols)
@@ -3276,6 +3276,14 @@ def api_status():
         "us_reconcile_health": (
             _us_strategy.us_reconcile_health() if _us_strategy else {}
         ),
+        # ★ 격리(BROKER_ABSENT_QUARANTINED) 감사정보(symbol/quarantined_at/reason/snapshot_id)
+        "us_quarantine": (
+            _us_strategy.us_quarantine_audit() if _us_strategy else []
+        ),
+        "us_buy_gate": ({
+            "ok": _us_strategy._us_buy_gate_ok,
+            "reason": _us_strategy._us_buy_gate_reason,
+        } if _us_strategy else {}),
     })
 
 @app.route("/api/session")

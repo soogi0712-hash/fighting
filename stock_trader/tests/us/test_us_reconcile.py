@@ -1,4 +1,4 @@
-"""US 포지션 정합화 판정 테스트 (§6/§9A/§9B — 순수 로직, fail-safe)."""
+"""US 포지션 정합화 판정 테스트 (§6/§9A/§9B — 순수 로직, fail-safe, 격리)."""
 import os
 import sys
 import unittest
@@ -18,43 +18,43 @@ def _holdings(syms, qty=10, avg=50.0, cur=52.0):
 
 
 class ReconcileIncidentTest(unittest.TestCase):
-    # ── §9A 운영 사고 재현: 교집합 0, 7복원 / 9 stale ─────────
+    # ── §9A 운영 사고 재현: 교집합 0, 7복원 / 9 broker_absent(격리 후보) ─────
     def test_incident_7_vs_9(self):
-        # 완전 스냅샷(complete=True)에서만 stale 삭제 허용
+        # 완전 스냅샷(complete=True)에서만 broker_absent(격리 후보) 판정
         r = RC.reconcile_decision(ok=True, source="api",
                                   holdings=_holdings(KIS_7),
                                   internal_symbols=INTERNAL_9,
                                   complete=True)
         self.assertTrue(r.authoritative)
         self.assertTrue(r.buy_allowed)
-        # 교집합 0 → 7 전부 복원, 9 전부 stale
+        # 교집합 0 → 7 전부 복원, 9 전부 broker_absent(격리 후보 — 삭제 아님)
         self.assertEqual(sorted(x["symbol"] for x in r.to_restore), sorted(KIS_7))
-        self.assertEqual(r.to_stale_remove, sorted(INTERNAL_9))
+        self.assertEqual(r.broker_absent, sorted(INTERNAL_9))
         self.assertEqual(r.to_reconcile, [])   # 교집합 없음
         self.assertEqual(r.broker_count, 7)
         self.assertEqual(r.internal_count, 9)
 
-    def test_incomplete_snapshot_restore_only_no_delete(self):
-        # §5: 완전성 증거 없음(complete=False, 기본) → 복원만, stale 삭제 0
+    def test_incomplete_snapshot_restore_only_no_broker_absent(self):
+        # §5/§1: 완전성 증거 없음(complete=False, 기본) → positive holding 복원만,
+        #        broker 부재 판정·격리 금지(broker_absent=[])
         r = RC.reconcile_decision(ok=True, source="api",
                                   holdings=_holdings(KIS_7),
                                   internal_symbols=INTERNAL_9)  # complete 기본 False
         self.assertTrue(r.authoritative)
         self.assertTrue(r.buy_allowed)
-        # 7 전부 복원은 그대로 허용
         self.assertEqual(sorted(x["symbol"] for x in r.to_restore), sorted(KIS_7))
-        # 그러나 stale 삭제는 금지(부분 스냅샷일 수 있음)
-        self.assertEqual(r.to_stale_remove, [])
-        self.assertIn("restore-only", r.reason)
+        self.assertEqual(r.broker_absent, [])     # 격리 금지
+        self.assertFalse(r.complete)
+        self.assertIn("restore positive holdings only", r.reason)
 
-    def test_incomplete_snapshot_intersection_reconcile_no_delete(self):
-        # 부분 스냅샷이라도 교집합 정합(qty/avg 갱신)은 허용, stale 삭제만 금지
+    def test_incomplete_snapshot_intersection_reconcile_no_broker_absent(self):
+        # 부분 스냅샷이라도 교집합 정합(qty/avg 갱신)은 허용, broker_absent 만 금지
         r = RC.reconcile_decision(ok=True, source="api",
                                   holdings=_holdings(["IONQ", "NNE"]),
                                   internal_symbols=["IONQ", "ASTS"])  # complete=False
         self.assertEqual([x["symbol"] for x in r.to_reconcile], ["IONQ"])
         self.assertEqual([x["symbol"] for x in r.to_restore], ["NNE"])
-        self.assertEqual(r.to_stale_remove, [])   # ASTS 삭제 금지
+        self.assertEqual(r.broker_absent, [])   # ASTS 격리/삭제 금지(불완전)
 
     def test_restore_highest_is_max_avg_cur(self):
         r = RC.reconcile_decision(ok=True, source="api",
@@ -62,32 +62,70 @@ class ReconcileIncidentTest(unittest.TestCase):
                                              "avg_price": 40.0, "cur_price": 38.0}],
                                   internal_symbols=[])
         rec = r.to_restore[0]
-        # highest_price = max(avg, cur) = 40 (현재가가 더 낮아도 avg 로)
-        self.assertEqual(rec["highest_price"], 40.0)
+        self.assertEqual(rec["highest_price"], 40.0)   # max(avg, cur)=40
 
     def test_qty_zero_not_restored(self):
         r = RC.reconcile_decision(ok=True, source="api",
                                   holdings=_holdings(["ACHR"], qty=0),
                                   internal_symbols=[])
-        self.assertEqual(r.to_restore, [])   # qty<=0 은 보유 아님
+        self.assertEqual(r.to_restore, [])
 
-    def test_intersection_reconcile_not_restore_or_stale(self):
+    def test_intersection_reconcile_not_restore_or_absent(self):
         r = RC.reconcile_decision(ok=True, source="api",
                                   holdings=_holdings(["IONQ", "NNE"]),
                                   internal_symbols=["IONQ", "ASTS"],
                                   complete=True)
         self.assertEqual([x["symbol"] for x in r.to_reconcile], ["IONQ"])
         self.assertEqual([x["symbol"] for x in r.to_restore], ["NNE"])
-        self.assertEqual(r.to_stale_remove, ["ASTS"])
+        self.assertEqual(r.broker_absent, ["ASTS"])
+
+    # ── 격리(quarantine) 인지 판정 ──────────────────────────────
+    def test_quarantined_excluded_from_broker_absent(self):
+        # 이미 격리된 심볼은 broker_absent 재판정에서 제외
+        r = RC.reconcile_decision(ok=True, source="api",
+                                  holdings=_holdings(["IONQ"]),
+                                  internal_symbols=["IONQ", "GONE", "QUAR"],
+                                  complete=True,
+                                  quarantined_symbols=["QUAR"])
+        # GONE 은 active-broker부재 → 격리후보 / QUAR 은 이미 격리 → 제외
+        self.assertEqual(r.broker_absent, ["GONE"])
+        self.assertEqual(r.active_internal_count, 2)   # IONQ, GONE
+        self.assertEqual(r.quarantined_count, 1)       # QUAR
+
+    def test_quarantined_reappears_in_broker(self):
+        # 격리중 심볼이 broker 잔고에 재등장 → reappeared + to_restore(격리해제 대상)
+        r = RC.reconcile_decision(ok=True, source="api",
+                                  holdings=_holdings(["QUAR"]),
+                                  internal_symbols=["IONQ", "QUAR"],
+                                  complete=True,
+                                  quarantined_symbols=["QUAR"])
+        self.assertEqual(r.reappeared, ["QUAR"])
+        self.assertEqual([x["symbol"] for x in r.to_restore], ["QUAR"])
+        self.assertEqual(r.broker_absent, ["IONQ"])   # IONQ active·broker부재 → 격리후보
+
+    def test_authoritative_empty_complete(self):
+        # 완전·권위·보유 0 → authoritative_empty=True, 내부 active 전부 broker_absent
+        r = RC.reconcile_decision(ok=True, source="api", holdings=[],
+                                  internal_symbols=["AAA", "BBB"], complete=True)
+        self.assertTrue(r.authoritative)
+        self.assertTrue(r.authoritative_empty)
+        self.assertEqual(r.broker_absent, ["AAA", "BBB"])
+
+    def test_incomplete_empty_not_authoritative_empty(self):
+        # 불완전 빈 잔고 → authoritative_empty=False, broker_absent 없음(격리 금지)
+        r = RC.reconcile_decision(ok=True, source="api", holdings=[],
+                                  internal_symbols=["AAA"], complete=False)
+        self.assertFalse(r.authoritative_empty)
+        self.assertEqual(r.broker_absent, [])
 
 
 class ReconcileFailSafeTest(unittest.TestCase):
-    # ── §9B 조회 실패/불명확 → 삭제·복원 금지, BUY만 스킵 ─────
+    # ── §9B 조회 실패/불명확 → 삭제·격리·복원 금지, BUY만 스킵 ─────
     def _assert_failsafe(self, **kw):
         r = RC.reconcile_decision(internal_symbols=INTERNAL_9, **kw)
         self.assertFalse(r.authoritative)
         self.assertFalse(r.buy_allowed)          # 신규 BUY 스킵
-        self.assertEqual(r.to_stale_remove, [])  # 삭제 금지
+        self.assertEqual(r.broker_absent, [])    # 격리/삭제 금지
         self.assertEqual(r.to_restore, [])       # 복원 강제 안 함
         self.assertEqual(r.internal_count, 9)    # 내부 보존
         return r
@@ -105,11 +143,10 @@ class ReconcileFailSafeTest(unittest.TestCase):
         self._assert_failsafe(ok=True, source="api", holdings=None)
 
     def test_empty_dict_response(self):
-        # 빈/불명확 응답(형태 이상) → 비권위
         self._assert_failsafe(ok=True, source="api", holdings={"unexpected": 1})
 
     def test_is_authoritative_matrix(self):
-        self.assertTrue(RC.is_authoritative(True, "api", []))
+        self.assertTrue(RC.is_authoritative(True, "api", []))       # 빈 리스트=정상 빈 잔고
         self.assertFalse(RC.is_authoritative(True, "API_CACHE", []))
         self.assertFalse(RC.is_authoritative(False, "api", []))
         self.assertFalse(RC.is_authoritative(True, "api", None))
@@ -121,8 +158,7 @@ class ReconcileFailSafeTest(unittest.TestCase):
                                   complete=True)
         h = r.health()
         self.assertEqual(h["restored_count"], 7)
-        self.assertEqual(h["stale_removed_count"], 9)
-        # PII 필드 부재
+        self.assertEqual(h["broker_absent_count"], 9)
         blob = str(h)
         for pii in ("token", "account", "cano", "acnt", "odno"):
             self.assertNotIn(pii, blob.lower())
