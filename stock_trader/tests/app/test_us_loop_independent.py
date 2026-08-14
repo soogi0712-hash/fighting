@@ -72,6 +72,7 @@ class RegistrationTest(unittest.TestCase):
         "_daily_screen_job", "_weekly_lab_ranking_job", "_us_market_job",
         "_us_intraday_job", "_cancel_pending_buy_orders",
         "_kr_unknown_reconcile_job", "_kr_position_restore_job",
+        "_us_reconcile_job",
     ]
 
     def _ns(self):
@@ -93,6 +94,14 @@ class RegistrationTest(unittest.TestCase):
         self.assertTrue(us["coalesce"])
         # US 잡 함수는 독립 잡 래퍼(_us_trading_job)
         self.assertIs(us["func"], ns["_us_trading_job"])
+        # ── ★ US 실보유 정합화 독립 잡: 120초 interval, max_instances=1, coalesce ──
+        self.assertEqual(ids.count("us_position_reconcile"), 1)
+        rec = sched.jobs["us_position_reconcile"]
+        self.assertEqual(rec["trigger"], "interval")
+        self.assertEqual(rec["seconds"], 120)
+        self.assertEqual(rec["max_instances"], 1)
+        self.assertTrue(rec["coalesce"])
+        self.assertIs(rec["func"], ns["_us_reconcile_job"])
 
     def test_double_registration_no_duplicates(self):
         """두 시작 경로(자동시작·/api/bot/start) 연속 호출 모사 → 중복 잡 없음."""
@@ -365,6 +374,7 @@ class SelfHealAndConfigTest(unittest.TestCase):
         "_daily_screen_job", "_weekly_lab_ranking_job", "_us_market_job",
         "_us_intraday_job", "_cancel_pending_buy_orders",
         "_kr_unknown_reconcile_job", "_kr_position_restore_job",
+        "_us_reconcile_job",
     ]
 
     def _reg_ns(self):

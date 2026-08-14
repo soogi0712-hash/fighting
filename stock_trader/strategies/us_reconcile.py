@@ -70,6 +70,7 @@ def reconcile_decision(
     source: Optional[str],
     holdings,
     internal_symbols,
+    complete: bool = False,
 ) -> ReconcileResult:
     """정합화 판정.
 
@@ -78,6 +79,9 @@ def reconcile_decision(
       source    : 데이터 출처('api' 만 권위; 'cache'/None → 비권위)
       holdings  : broker 보유 리스트 [{symbol, qty, avg_price, cur_price, name, excd}, ...]
       internal_symbols : 내부 원장 보유 심볼 집합/리스트
+      complete  : **완전한 스냅샷 증거**(전 거래소·전 페이지 조회 완료). §5:
+                  완전성 증거가 없으면(complete=False) **복원만 허용, stale 삭제 금지**.
+                  일부 거래소/일부 페이지 응답으로 실보유를 삭제하는 사고를 막는다.
 
     Returns: ReconcileResult
     """
@@ -123,9 +127,18 @@ def reconcile_decision(
         else:
             to_restore.append(rec)
 
-    # 내부에만 존재 → stale (권위 성공이므로 정리 허용)
-    to_stale_remove = sorted(internal - broker_syms)
-    mismatch = len(to_restore) + len(to_stale_remove)
+    # 내부에만 존재 → stale 후보. 단, §5: **완전성 증거(complete)가 있을 때만 삭제 허용**.
+    #   complete=False(부분 거래소/부분 페이지/증거없음) → stale 삭제 금지, 복원만 수행.
+    stale_candidates = sorted(internal - broker_syms)
+    if complete:
+        to_stale_remove = stale_candidates
+        reason = "authoritative_reconcile(complete: stale cleanup allowed)"
+    else:
+        to_stale_remove = []
+        reason = ("authoritative_reconcile(incomplete_snapshot: restore-only, "
+                  "stale delete forbidden; %d stale candidate(s) preserved)"
+                  % len(stale_candidates))
+    mismatch = len(to_restore) + len(stale_candidates)
 
     return ReconcileResult(
         authoritative=True, buy_allowed=True,
@@ -133,5 +146,5 @@ def reconcile_decision(
         to_stale_remove=to_stale_remove,
         broker_count=len(broker_syms), internal_count=len(internal),
         mismatch_count=mismatch,
-        reason="authoritative_reconcile",
+        reason=reason,
     )

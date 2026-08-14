@@ -2343,6 +2343,106 @@ class KISApi:
             logger.error(f"해외 잔고 조회 실패: {e}")
             return {"holdings": [], "total_eval": 0, "cash_usd": 0, "total_profit": 0}
 
+    def get_us_balance_full(self, max_pages: int = 20) -> dict:
+        """해외 잔고 '완전 스냅샷' 조회 — 포지션 정합화 전용(US 전용, 부수효과 없음).
+
+        get_us_balance 와 달리 '권위/완전성 증거'를 함께 보고한다(정합화 §5):
+          ok       : 최소 1페이지 이상 정상 응답(예외/HTTP오류/rt_cd 실패 없음).
+          source   : 'api'(성공 시) / None(실패·예외 시). 캐시가 아님을 명시.
+          complete : **전 페이지(tr_cont 종료: D/E 또는 연속키 소진)까지 정상 수신**하고
+                     중간 페이지 실패·상한 초과가 없을 때만 True. §5 완전성 증거.
+          holdings : qty>0 보유 리스트(get_us_balance 와 동일 파싱).
+          pages    : 실제 수신 페이지 수(관측용).
+
+        ★ 부분 페이지 실패 / 상한 초과 / rate-limit / 예외 → complete=False(또는 ok=False).
+          호출부는 complete=False 이면 **복원만 하고 stale 삭제는 하지 않는다**(사고 방지).
+        ※ KR 잔고·주문 로직과 완전히 분리된 신규 US 전용 메서드다.
+        """
+        url   = f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-balance"
+        from config import Config as _cfg
+        tr_id = "TTTS3012R" if _cfg.KIS_IS_REAL else "VTTS3012R"
+        acc_no, acc_prod = self.account_no.split("-") \
+            if "-" in self.account_no else (self.account_no, "01")
+        holdings: list = []
+        fk, nk   = "", ""
+        tr_cont  = ""
+        ok       = False
+        complete = False
+        pages    = 0
+        try:
+            while pages < max_pages:
+                params = {
+                    "CANO":           acc_no,
+                    "ACNT_PRDT_CD":   acc_prod,
+                    "OVRS_EXCG_CD":   "NASD",   # 전체 조회용(KIS 전체 US 잔고 반환)
+                    "TR_CRCY_CD":     "USD",
+                    "CTX_AREA_FK200": fk,
+                    "CTX_AREA_NK200": nk,
+                }
+                headers = self._headers(tr_id)
+                if tr_cont:
+                    headers["tr_cont"] = tr_cont   # 연속 조회
+                self._rate_limit()
+                resp = requests.get(url, headers=headers, params=params, timeout=10)
+                resp.raise_for_status()
+                data = resp.json()
+                if str(data.get("rt_cd", "0")) not in ("0", ""):
+                    # 명확한 조회 실패 → 완전성 없음(이전 페이지까지만 ok 였을 수 있음)
+                    logger.warning("[US잔고full] rt_cd=%s msg=%s",
+                                   data.get("rt_cd"), data.get("msg1"))
+                    complete = False
+                    break
+                ok = True
+                pages += 1
+                for item in data.get("output1", []):
+                    qty = int(
+                        item.get("ovrs_cblc_qty",
+                        item.get("ccld_qty_smtl",
+                        item.get("ord_psbl_qty", 0))) or 0
+                    )
+                    if qty <= 0:
+                        continue
+                    _raw_psbl = item.get("ord_psbl_qty", None)
+                    if _raw_psbl is None:
+                        sell_qty = qty
+                    else:
+                        sell_qty = int(_raw_psbl) if str(_raw_psbl).strip() != "" else qty
+                    holdings.append({
+                        "symbol":    item.get("ovrs_pdno",      item.get("pdno", "")),
+                        "name":      item.get("ovrs_item_name", item.get("prdt_name", "")),
+                        "excd":      item.get("ovrs_excg_cd", "NASD"),
+                        "qty":       qty,
+                        "sell_qty":  sell_qty,
+                        "avg_price": float(item.get("pchs_avg_pric", 0) or 0),
+                        "cur_price": float(item.get("now_pric2",     0) or 0),
+                        "pnl_pct":   float(item.get("evlu_pfls_rt",  0) or 0),
+                        "currency":  "USD",
+                        "is_overseas": True,
+                    })
+                # 다음 페이지 판정: 응답 헤더 tr_cont(F/M=더있음, D/E=마지막)
+                _cont = (resp.headers.get("tr_cont")
+                         or resp.headers.get("tr_cont".upper()) or "").strip().upper()
+                fk = str(data.get("ctx_area_fk200", "") or "").strip()
+                nk = str(data.get("ctx_area_nk200", "") or "").strip()
+                if _cont in ("F", "M") and nk != "":
+                    tr_cont = "N"
+                    continue
+                # 마지막 페이지(D/E) 또는 연속키 없음 → 완전 수신
+                complete = True
+                break
+            else:
+                # max_pages 소진(종료코드 미확인) → 완전성 없음
+                complete = False
+            return {
+                "ok": ok, "source": ("api" if ok else None),
+                "complete": bool(complete and ok), "holdings": holdings,
+                "pages": pages,
+            }
+        except Exception as e:
+            logger.error(f"해외 잔고 완전조회 실패: {e}")
+            return {"ok": False, "source": None, "complete": False,
+                    "holdings": [], "pages": pages}
+
     def get_usd_exchange_rate(self) -> float:
         """
         USD/KRW 환율 조회 (KST 기준 당일 환율)

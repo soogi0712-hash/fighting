@@ -58,6 +58,10 @@ from utils.market_session     import (
 from strategies.daily_pnl_guard import DailyPnLGuard
 from strategies.reentry_guard   import ReentryGuard, _is_stoploss_reason
 from utils.order_sizing        import finalize_order_qty, qty_from_cash
+# ── US 손실회복 트레일링 + 복원 포지션 정합화(순수 로직) + 원자 저장소 ──
+import strategies.us_recovery      as USR
+import strategies.us_reconcile     as USRC
+from strategies.us_position_store  import AtomicPositionStore, CorruptStoreError
 
 # ── Trading Journal (선택적 로드 — 실패 시 매매 루프 중단 없음) ──
 try:
@@ -605,7 +609,7 @@ def _calc_indicators(candles: list[dict], realtime: dict = None) -> dict:
 # ════════════════════════════════════════════════════════════
 
 class USPosition:
-    def __init__(self, symbol, name, excd, qty, avg_price):
+    def __init__(self, symbol, name, excd, qty, avg_price, recovered: bool = False):
         self.symbol        = symbol
         self.name          = name
         self.excd          = excd
@@ -615,10 +619,39 @@ class USPosition:
         self.current_level = 1
         self.created_at    = datetime.now().isoformat()
         self.trade_id: str = ""   # ★ journal 연결용 (재시작 후 매수-매도 연결 유지)
+        # ── 관리 상태(손실회복·복원 트레일링) — us_recovery 스키마(단일 진실원) ──
+        #   management_mode / recovered / highest_price / recovery_* / profit_* /
+        #   last_evaluated_at / exit_pending_ref 를 보관. 원자 저장으로 영속된다.
+        self.mgmt: dict = USR.default_state(
+            recovered=recovered, highest_price=avg_price
+        )
+
+    # ── 관리 상태 편의 접근자 ────────────────────────────────
+    @property
+    def recovered(self) -> bool:
+        return bool(self.mgmt.get("recovered"))
+
+    @recovered.setter
+    def recovered(self, v: bool):
+        self.mgmt["recovered"] = bool(v)
+
+    @property
+    def management_mode(self) -> str:
+        return self.mgmt.get("management_mode", USR.MODE_NORMAL)
+
+    def sync_mgmt_high(self):
+        """highest_price 단일 진실원: pos.highest_price ↔ mgmt['highest_price'] 를
+        max 로 양방향 동기화(절대 하락 없음 — 반복 복원·재시작 안전)."""
+        h = max(float(self.highest_price or 0.0),
+                float(self.mgmt.get("highest_price") or 0.0))
+        self.highest_price = h
+        self.mgmt["highest_price"] = h
 
     def update_high(self, price: float):
         if price > self.highest_price:
             self.highest_price = price
+        # 관리 상태의 최고가도 함께(절대 낮아지지 않음)
+        USR.bump_highest_price(self.mgmt, price)
 
     def net_pct(self, cur_price: float) -> float:
         if self.avg_price <= 0:
@@ -637,6 +670,7 @@ class USPosition:
             "created_at":    self.created_at,
             "is_overseas":   True,
             "trade_id":      self.trade_id,   # ★ 재시작 후 journal 연결 유지
+            "mgmt":          dict(self.mgmt),  # ★ 관리 상태 영속(§3)
         }
 
 
@@ -644,28 +678,37 @@ class USPositionManager:
     def __init__(self):
         self.positions: dict[str, USPosition] = {}
         os.makedirs(os.path.dirname(US_POSITIONS_FILE), exist_ok=True)
+        # ★ 원자 저장소(temp+fsync+os.replace, .bak 폴백, 손상안전) — §5/§9D
+        self._store = AtomicPositionStore(US_POSITIONS_FILE)
         self._load()
 
     def _load(self):
         try:
-            if os.path.exists(US_POSITIONS_FILE):
-                data = json.load(open(US_POSITIONS_FILE, encoding="utf-8"))
-                for sym, d in data.items():
-                    p = USPosition(sym, d["name"], d["excd"], d["qty"], d["avg_price"])
-                    p.highest_price = d.get("highest_price", d["avg_price"])
-                    p.current_level = d.get("current_level", 1)
-                    p.created_at    = d.get("created_at", "")
-                    p.trade_id      = d.get("trade_id", "")  # ★ 하위호환
-                    self.positions[sym] = p
-                logger.info(f"[US포지션] {len(self.positions)}개 로드")
-        except Exception as e:
-            logger.warning(f"[US포지션] 로드 실패: {e}")
+            data = self._store.load()   # 본→.bak 폴백. 없으면 {}. 둘 다 손상이면 예외.
+        except CorruptStoreError as e:
+            # ★ 본·백업 모두 손상 → 빈 dict 로 덮어써 '전체 삭제'하는 사고를 막는다.
+            #   기존 self.positions 를 그대로 유지(비우지 않음).
+            logger.error(f"[US포지션] 본·백업 모두 손상 — 로드 보류(전체삭제 방지): {e}")
+            return
+        for sym, d in data.items():
+            try:
+                p = USPosition(sym, d["name"], d["excd"], d["qty"], d["avg_price"])
+                p.highest_price = d.get("highest_price", d["avg_price"])
+                p.current_level = d.get("current_level", 1)
+                p.created_at    = d.get("created_at", "")
+                p.trade_id      = d.get("trade_id", "")  # ★ 하위호환
+                # ★ 관리 상태 병합(구버전 JSON=mgmt 없음 → 안전 기본값). highest 는 하락 금지.
+                p.mgmt = USR.merge_state(d.get("mgmt"))
+                p.sync_mgmt_high()
+                self.positions[sym] = p
+            except Exception as e:
+                logger.warning(f"[US포지션] {sym} 복원 실패(건너뜀): {e}")
+        logger.info(f"[US포지션] {len(self.positions)}개 로드")
 
     def save(self):
         try:
             data = {sym: p.to_dict() for sym, p in self.positions.items()}
-            with open(US_POSITIONS_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            self._store.save(data)   # 원자적(temp+fsync+os.replace) + .bak 보존
         except Exception as e:
             logger.error(f"[US포지션] 저장 실패: {e}")
 
@@ -935,6 +978,26 @@ class USStrategyManager:
 
         # ★ 재진입 차단 (국내장/미국장 공통 파일 기반)
         self.reentry = ReentryGuard()
+
+        # ── US 실보유 정합화(§4~§7) 상태 ─────────────────────────
+        #   buy_gate_ok=False 면 '이번 스캔의 신규 BUY만' 스킵(기존 SELL/체결감시 계속).
+        #   비권위 잔고 조회 후에만 False 로 내려간다(§6 fail-safe).
+        import threading as _th
+        self._us_reconcile_lock   = _th.Lock()   # US 전용 비재진입 락(중복 실행 방지)
+        self._us_buy_gate_ok      = True
+        self._us_buy_gate_reason  = ""
+        self._us_reconcile_health = {
+            "ran": False, "last_run_at": None, "authoritative": None,
+            "buy_allowed": None, "complete": None, "restored": 0,
+            "reconciled": 0, "stale_removed": 0, "broker_count": 0,
+            "internal_count": 0, "reason": "not_run_yet", "error": None,
+        }
+        # ★ 라이브 stale 삭제 기본 비활성(안전): 완전 스냅샷이어도 운영자 승인 전까지
+        #   복원만 수행하고 삭제는 보류한다(거래소 누락에 의한 오삭제 방지).
+        self._us_allow_stale_delete = bool(
+            os.environ.get("US_RECONCILE_ALLOW_STALE_DELETE", "").lower()
+            in ("1", "true", "yes", "on")
+        )
 
         # ── [US OPEN SCAN] 인스턴스 레벨 추적 ──────────────
         self._us_open_scan: dict = {
@@ -2396,6 +2459,253 @@ class USStrategyManager:
         return self._check_entry(symbol, name, excd, cur_price, iv,
                                  candles_live, realtime, sess)
 
+    # ══════════════════════════════════════════════════════════
+    # US 복원/손실회복 관리 (§2/§3/§4/§8) — 기존 매도 로직보다 먼저 개입
+    # ══════════════════════════════════════════════════════════
+    def _us_apply_management(self, pos, symbol, name, excd, cur_price, net_pct,
+                             pnl_usd, pnl_krw_approx, sess):
+        """복원/손실회복 관리 판정을 기존 ①~⑩ 매도 로직보다 '먼저' 적용(§8).
+
+        반환:
+          None  → DEFER: 관리 개입 없음 → 호출부가 기존 ①~⑩ 수행(신규·NORMAL·net>-5).
+          dict  → HOLD(기존 로직 스킵) 또는 SELL 결과. SELL 은 **오직 _do_sell 경유**
+                  (crash-safe submit-intent → KIS SELL → lifecycle/registry). 별도
+                  주문 경로 없음. 타임아웃/불명확 시 재제출 없음(EXIT_PENDING 유지).
+
+        부수효과: pos.mgmt 갱신 + pos_mgr.save()(원자적 영속). 포지션 제거는 하지 않음
+                 (실제 체결 시 execution-driven 경로가 제거).
+        """
+        now = datetime.now()
+        # highest 단일화(하락 금지) 후 순수 판정
+        pos.sync_mgmt_high()
+        prev_mode = pos.mgmt.get("management_mode", USR.MODE_NORMAL)
+        d = USR.decide_management_action(dict(pos.mgmt), net_pct, cur_price, now)
+        # 갱신 상태 반영(액션 무관하게 last_evaluated_at/회복상태 저장) + highest 재동기화
+        pos.mgmt = d.state
+        pos.sync_mgmt_high()
+
+        # ── DEFER: 관리 개입 없음 — 상태만 저장하고 기존 ①~⑩ 로 위임 ──
+        if d.action == USR.ACT_DEFER:
+            self.pos_mgr.save()
+            return None
+
+        # ── HOLD: 관리모드가 HOLD 강제(복원 면제/회복 유지) → 기존 로직 스킵 ──
+        if d.action == USR.ACT_HOLD:
+            self.pos_mgr.save()
+            logger.info(
+                "[US관리] %s(%s) HOLD mode=%s reason=%s net=%+.2f%% "
+                "(복원=%s) — 기존 익절/시간/추세매도 스킵",
+                name, symbol, d.mode, d.reason, net_pct, pos.recovered,
+            )
+            return {"action": "HOLD", "symbol": symbol, "name": name, "excd": excd,
+                    "reason": f"[관리:{d.mode}] {d.reason}",
+                    "session": sess.get("session", ""),
+                    "net_pct": net_pct, "mode": d.mode}
+
+        # ── SELL_ALL: EXIT_PENDING 전이·영속 후, 기존 crash-safe 제출경로로만 매도 ──
+        if d.action == USR.ACT_SELL_ALL:
+            # 제출 '전' EXIT_PENDING 전이·영속(재시작/다음루프 재제출 방지, §2/§8)
+            pos.mgmt["management_mode"] = USR.MODE_EXIT
+            pos.mgmt["exit_pending_ref"] = {
+                "reason": d.reason, "submitted_at": now.isoformat(),
+                "prev_mode": prev_mode, "lifecycle_id": None, "odno": None,
+            }
+            self.pos_mgr.save()
+            logger.info(
+                "[US관리] %s(%s) SELL_ALL → EXIT_PENDING reason=%s net=%+.2f%%",
+                name, symbol, d.reason, net_pct,
+            )
+            result = self._do_sell(
+                symbol, name, excd, pos.qty, cur_price,
+                f"[관리:{d.reason}] net={net_pct:+.2f}% "
+                f"(${pnl_usd:+.2f}≈{pnl_krw_approx:,.0f}원)",
+                sess,
+            )
+            # 유령포지션 제거(체결 아님, KIS 잔고 없음)면 그대로 반환
+            if symbol not in self.pos_mgr.positions:
+                return result
+            # ★ 실제 활성 매도주문이 존재해야만 EXIT_PENDING 유지. 미전송/명확거절/
+            #   submit-intent 실패(=활성주문 없음)면 되돌려 다음 루프 재판정(무한 잠금 방지).
+            live_pos = self.pos_mgr.positions.get(symbol)
+            if live_pos is not None and not self._us_has_active_order(symbol, "SELL"):
+                live_pos.mgmt["management_mode"] = prev_mode
+                live_pos.mgmt["exit_pending_ref"] = None
+                self.pos_mgr.save()
+                logger.info(
+                    "[US관리] %s(%s) 매도 미전송/거절(활성주문 없음) → "
+                    "EXIT_PENDING 해제(mode=%s 복귀, 다음 루프 재판정)",
+                    name, symbol, prev_mode,
+                )
+            return result
+
+        # 방어: 알 수 없는 액션 → 개입하지 않음
+        self.pos_mgr.save()
+        return None
+
+    # ══════════════════════════════════════════════════════════
+    # US 실보유 정합화(§4~§7) — KIS 잔고 권위 기반 복원/정리
+    # ══════════════════════════════════════════════════════════
+    def us_reconcile_positions(self, snapshot: dict = None,
+                               allow_stale_delete: bool = None) -> dict:
+        """KIS 해외 잔고를 '보유수량 권위값'으로 내부 원장을 복원/정합화한다(§4~§7).
+
+        Args:
+          snapshot : {ok, source, complete, holdings} — None 이면 api.get_us_balance_full().
+          allow_stale_delete : 완전 스냅샷에서 stale 삭제 허용 여부(None=인스턴스 기본).
+
+        동작(순수판정 us_reconcile.reconcile_decision 위임 후 부수효과):
+          · 비권위(조회 실패/캐시/파싱실패) → 삭제·복원 안 함, **신규 BUY만 스킵**(§6).
+          · 복원(to_restore) → USPosition(recovered=True), highest=max(avg,cur,기존),
+            즉시 매도 안 함(HOLD), 다음 US 루프부터 실매도 판정(§7).
+          · 정합(to_reconcile) → qty/avg=KIS 권위 갱신, highest/recovery_high 하락 금지.
+          · stale(to_stale_remove) → **완전 스냅샷 + 삭제허용**일 때만 제거(§5).
+        비재진입 락으로 중복 실행을 막고, PII 없는 health 를 갱신한다.
+        """
+        if allow_stale_delete is None:
+            allow_stale_delete = self._us_allow_stale_delete
+        if not self._us_reconcile_lock.acquire(blocking=False):
+            logger.info("[US정합화] 이미 실행 중 — 이번 호출 스킵(비재진입)")
+            return dict(self._us_reconcile_health)
+        try:
+            now_iso = datetime.now().isoformat()
+            # ── 브로커 스냅샷 취득 ──
+            if snapshot is None:
+                try:
+                    snapshot = self.api.get_us_balance_full()
+                except Exception as e:
+                    snapshot = {"ok": False, "source": None,
+                                "complete": False, "holdings": []}
+                    logger.warning(f"[US정합화] 잔고 완전조회 예외: {e}")
+            ok       = bool(snapshot.get("ok"))
+            source   = snapshot.get("source")
+            complete = bool(snapshot.get("complete"))
+            holdings = snapshot.get("holdings")
+
+            internal_syms = list(self.pos_mgr.positions.keys())
+            res = USRC.reconcile_decision(
+                ok=ok, source=source, holdings=holdings,
+                internal_symbols=internal_syms, complete=complete,
+            )
+
+            # ── 비권위 → 삭제/복원 안 함. 신규 BUY 게이트만 내림(§6) ──
+            if not res.authoritative:
+                self._us_buy_gate_ok     = False
+                self._us_buy_gate_reason = res.reason
+                self._us_reconcile_health.update({
+                    "ran": True, "last_run_at": now_iso,
+                    "authoritative": False, "buy_allowed": False,
+                    "complete": complete, "restored": 0, "reconciled": 0,
+                    "stale_removed": 0, "broker_count": res.broker_count,
+                    "internal_count": res.internal_count,
+                    "reason": res.reason, "error": None,
+                })
+                logger.warning(
+                    "[US정합화] 비권위 잔고(%s) → 삭제·복원 없음, 신규 BUY 스킵. "
+                    "기존 SELL/체결감시는 계속.", res.reason,
+                )
+                return dict(self._us_reconcile_health)
+
+            # ── 권위 성공 → 복원/정합. BUY 게이트 복구 ──
+            self._us_buy_gate_ok     = bool(res.buy_allowed)
+            self._us_buy_gate_reason = "" if res.buy_allowed else res.reason
+            restored = reconciled = stale_removed = 0
+
+            # (1) 복원: 내부에 없던 실보유 → recovered=True 로 신규 등록(HOLD)
+            for rec in res.to_restore:
+                sym = rec["symbol"]
+                if sym in self.pos_mgr.positions:
+                    continue
+                p = USPosition(sym, rec.get("name", sym), rec.get("excd", "NASD"),
+                               int(rec["qty"]), float(rec["avg_price"]),
+                               recovered=True)
+                # highest = max(avg, cur) — 낮게 잡히지 않도록(§B/§7)
+                h = max(float(rec["avg_price"] or 0.0),
+                        float(rec.get("cur_price") or 0.0),
+                        float(rec.get("highest_price") or 0.0))
+                p.highest_price = h
+                p.sync_mgmt_high()
+                p.mgmt["management_mode"] = USR.MODE_NORMAL   # 복원 직후 HOLD(즉시매도 금지)
+                self.pos_mgr.positions[sym] = p
+                restored += 1
+                logger.info(
+                    "🔄[US정합화] 복원 %s %s주 avg=$%.2f highest=$%.2f "
+                    "(recovered=True, 복원직후 HOLD)",
+                    sym, rec["qty"], rec["avg_price"], h,
+                )
+
+            # (2) 정합: 양쪽 존재 → qty/avg=KIS 권위 갱신, highest 하락 금지
+            for rec in res.to_reconcile:
+                sym = rec["symbol"]
+                p = self.pos_mgr.positions.get(sym)
+                if p is None:
+                    continue
+                p.qty       = int(rec["qty"])
+                p.avg_price = float(rec["avg_price"])
+                newh = max(float(p.highest_price or 0.0),
+                           float(rec["avg_price"] or 0.0),
+                           float(rec.get("cur_price") or 0.0))
+                p.highest_price = newh
+                # recovery_high 도 절대 하락 금지
+                rhp = p.mgmt.get("recovery_high_price")
+                if rhp is not None:
+                    p.mgmt["recovery_high_price"] = max(
+                        float(rhp), float(rec.get("cur_price") or 0.0))
+                p.sync_mgmt_high()
+                reconciled += 1
+
+            # (3) stale 정리: **완전 스냅샷 + 삭제 허용** 일 때만(§5)
+            do_delete = complete and allow_stale_delete
+            if res.to_stale_remove and do_delete:
+                for sym in res.to_stale_remove:
+                    if sym in self.pos_mgr.positions:
+                        # 활성 매도주문 중이면 삭제 보류(체결경로가 처리)
+                        if self._us_has_active_order(sym, "SELL"):
+                            logger.info("[US정합화] %s 활성 매도주문 존재 → stale 삭제 보류", sym)
+                            continue
+                        self.pos_mgr.positions.pop(sym, None)
+                        stale_removed += 1
+                        logger.warning(
+                            "[US정합화] stale 제거 %s (KIS 미보유·완전스냅샷·삭제허용)", sym)
+            elif res.to_stale_remove:
+                logger.info(
+                    "[US정합화] stale 후보 %d개 보존(complete=%s, allow_delete=%s) "
+                    "— 삭제 금지(§5 오삭제 방지)",
+                    len(res.to_stale_remove), complete, allow_stale_delete,
+                )
+
+            if restored or reconciled or stale_removed:
+                self.pos_mgr.save()
+
+            self._us_reconcile_health.update({
+                "ran": True, "last_run_at": now_iso,
+                "authoritative": True, "buy_allowed": bool(res.buy_allowed),
+                "complete": complete, "restored": restored,
+                "reconciled": reconciled, "stale_removed": stale_removed,
+                "broker_count": res.broker_count,
+                "internal_count": res.internal_count,
+                "reason": res.reason, "error": None,
+            })
+            logger.info(
+                "[US정합화] 완료 authoritative=True complete=%s 복원=%d 정합=%d "
+                "stale제거=%d broker=%d internal=%d",
+                complete, restored, reconciled, stale_removed,
+                res.broker_count, res.internal_count,
+            )
+            return dict(self._us_reconcile_health)
+        except Exception as e:
+            self._us_reconcile_health.update({
+                "ran": True, "last_run_at": datetime.now().isoformat(),
+                "error": str(e), "reason": "reconcile_exception",
+            })
+            logger.error(f"[US정합화] 예외 — 삭제 없이 종료(안전): {e}")
+            return dict(self._us_reconcile_health)
+        finally:
+            self._us_reconcile_lock.release()
+
+    def us_reconcile_health(self) -> dict:
+        """PII 없는 정합화 health 스냅샷(/api/status 노출용)."""
+        return dict(self._us_reconcile_health)
+
     # ── 포지션 관리 (보유 중) ──────────────────────────────
     def _manage_position(self, pos, symbol, name, excd, cur_price, iv, sess):
         pos.update_high(cur_price)
@@ -2443,6 +2753,20 @@ class USStrategyManager:
             f"익절기준={_us_basis} | SELL_SCORE={iv.get('sell_score',0)} | "
             f"경과={elapsed_min:.0f}분 | PnL=${pnl_usd:+.2f}≈{pnl_krw_approx:,.0f}원"
         )
+
+        # ════════════════════════════════════════════════════
+        # [관리모드 개입] 복원/손실회복 트레일링 — 기존 ①~⑩보다 '먼저'(§8)
+        #   · EXIT_PENDING → HOLD(재제출 금지)
+        #   · RECOVERY_TRAILING/진입(net≤-5) → 손실회복 판정 우선(⑧⑨⑩보다 앞)
+        #   · recovered=True(복원) → 고정익절·시간청산·MA매도 면제, 수익 트레일링만
+        #   · 그 외(신규·NORMAL·net>-5) → None 반환 → 아래 기존 ①~⑩ 그대로 수행
+        # ════════════════════════════════════════════════════
+        _mgmt_result = self._us_apply_management(
+            pos, symbol, name, excd, cur_price, net_pct,
+            pnl_usd, pnl_krw_approx, sess
+        )
+        if _mgmt_result is not None:
+            return _mgmt_result
 
         # ════════════════════════════════════════════════════
         # 청산 우선순위: ①+2.5% → ②+2.0% → ③+1.5%+SCORE≥4
@@ -2688,6 +3012,19 @@ class USStrategyManager:
                 "intraday_pct": iv["intraday_pct"], "vol_ratio": iv["vol_ratio"],
                 "rsi": iv["rsi"], "session": sess["session"], "reason": reason,
             }
+
+        # ── ★ 정합화 fail-safe(§6): 최근 잔고조회가 '비권위'면 신규 BUY만 스킵 ──
+        #   (기존 SELL/체결감시/보유관리는 이 게이트와 무관하게 계속된다.)
+        if not self._us_buy_gate_ok:
+            logger.info(
+                "[US정합화] 신규 진입 스킵 %s — 잔고 비권위(%s). "
+                "기존 보유 SELL/관리는 계속.",
+                symbol, self._us_buy_gate_reason or "unauthoritative",
+            )
+            return _hold(
+                f"정합화 비권위로 신규매수 보류({self._us_buy_gate_reason or 'unauthoritative'})",
+                "HOLD",
+            )
 
         # ── 현재 운영 단계 확인 ──────────────────────────────
         phase_info  = us_phase_info()
