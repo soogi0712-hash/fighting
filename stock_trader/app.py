@@ -74,6 +74,17 @@ _us_loop_health = {
 # ★ US 잡이 스케줄러에 (재)등록된 epoch 시각 — heartbeat 시작 유예 판정용.
 _us_registered_ts = None
 
+# ★ US 실보유 정합화(복원/손실회복) 독립 잡 관찰성(health) — /api/status 노출.
+#   JSON 직렬화 가능한 원시타입만. 계좌·토큰·원문 미포함(PII-free).
+#   실제 정합화 결과 상세는 _us_strategy.us_reconcile_health() 에서 병합해 노출.
+_us_reconcile_job_health = {
+    "last_started_at":  None,
+    "last_finished_at": None,
+    "last_result":      None,   # "ok" | "skip: ..." | "error: <ExcType>"
+    "last_duration_sec": None,
+    "run_count":        0,
+}
+
 # ★ KR 포지션 복원(KIS 잔고→pyramid 원장) 독립 잡 전용 비재진입 락.
 #   국내 매매 루프(_trading_loop_lock)와 절대 공유하지 않는다 — KR 루프가 지연·정지해도
 #   복원 대사는 저빈도 잡으로 계속 실행돼야 한다(P0: 빈 원장 → 트레일링 미작동 방지).
@@ -228,6 +239,12 @@ def _register_all_scheduled_jobs(scheduler, sess):
     # ── ★ KR 포지션 복원(KIS 잔고→pyramid 원장) 독립 잡 (30초, 국내 루프 무관) ──
     scheduler.add_job(_kr_position_restore_job, "interval", seconds=30,
                       id="kr_position_restore", replace_existing=True,
+                      max_instances=1, coalesce=True)
+    # ── ★ US 실보유 정합화(복원/손실회복) 독립 저빈도 잡 (120초, 매매 루프 무관) ──
+    #   국내·미국 매매 루프와 완전히 분리. US 전용 비재진입 락 + max_instances=1.
+    #   misfire_grace_time(job_defaults=30s) 로 밀린 실행도 유실 없이 수행(self-recovery).
+    scheduler.add_job(_us_reconcile_job, "interval", seconds=120,
+                      id="us_position_reconcile", replace_existing=True,
                       max_instances=1, coalesce=True)
 
 
@@ -444,11 +461,29 @@ def _init_api() -> bool:
                 _us_watch_list.append({"symbol": sym, **info})
         _log(f"✅ 미국 관심종목 로드 완료: {len(_us_watch_list)}개 (풀 유니버스)", "info")
 
-        # ★ 해외주식 잔고 기반 포지션 자동 복원 (실패해도 watchlist는 유지)
+        # ★ 해외주식 실보유 정합화 1회(§4): KIS 잔고 권위 기반 복원(recovered=True)
+        #   + (완전스냅샷 한정) 정리. 비권위면 삭제·복원 없이 신규 BUY만 스킵(fail-safe).
+        #   복원된 실보유는 즉시매도 없이 다음 US 루프부터 실매도 판정에 진입한다(§7).
         try:
-            _us_strategy.sync_from_balance()
+            _rec_health = _us_strategy.us_reconcile_positions()
+            _log(
+                "✅ US 실보유 정합화(startup): "
+                f"authoritative={_rec_health.get('authoritative')} "
+                f"복원={_rec_health.get('restored')} 정합={_rec_health.get('reconciled')} "
+                f"stale제거={_rec_health.get('stale_removed')} "
+                f"broker={_rec_health.get('broker_count')} "
+                f"internal={_rec_health.get('internal_count')}",
+                "info",
+            )
+            # 비권위(조회 실패/캐시)면 구식 복원으로 폴백(최소 복원 시도 — 삭제 없음)
+            if not _rec_health.get("authoritative"):
+                _us_strategy.sync_from_balance()
         except Exception as e_sync:
-            _log(f"⚠️ US 잔고 동기화 스킵 (비정규장 시간): {e_sync}", "warning")
+            _log(f"⚠️ US 잔고 정합화 스킵 (비정규장/조회실패): {e_sync}", "warning")
+            try:
+                _us_strategy.sync_from_balance()
+            except Exception:
+                pass
         _log(f"✅ 해외주식 초기화 완료 — 관심종목 {len(_us_watch_list)}개", "info")
 
         # ★ API 초기화 후 오늘 스크리닝 후보 관심종목에 자동 반영
@@ -1682,6 +1717,38 @@ def _us_trading_job():
         _us_loop_health["last_duration_sec"] = round(time.time() - _start, 2)
         _us_loop_health["run_count"] += 1
         _us_trading_loop_lock.release()
+
+
+def _us_reconcile_job():
+    """미국 실보유 정합화 '독립' 저빈도 잡 (§4).
+
+    ★ 국내 루프·미국 매매 루프와 완전히 분리된 경로:
+      - 정합화는 USStrategyManager 내부 '미국 전용 비재진입 락'으로 보호되며,
+        본 잡도 APScheduler max_instances=1 + coalesce 로 중복 실행을 막는다.
+      - KIS 잔고 완전조회 → reconcile_decision → 복원/정합/(완전스냅샷 한정)정리.
+      - 비권위 잔고면 삭제·복원 없이 신규 BUY 게이트만 내린다(§6 fail-safe).
+      - 전체 try/except 격리 → 정합화 오류가 KR/US 매매를 막지 않는다.
+      - misfire_grace_time(스케줄러)로 밀린 실행도 유실 없이 수행(self-recovery).
+    """
+    if _us_strategy is None:
+        _us_reconcile_job_health["last_result"] = "skip: us_strategy 미초기화"
+        return
+    _start = time.time()
+    try:
+        _us_reconcile_job_health["last_started_at"] = datetime.now().isoformat()
+        _us_reconcile_job_health["last_result"]     = "running"
+        _us_strategy.us_reconcile_positions()   # 내부 비재진입 락으로 중복 방지
+        _us_reconcile_job_health["last_result"] = "ok"
+    except Exception as _e:
+        _us_reconcile_job_health["last_result"] = f"error: {type(_e).__name__}"
+        try:
+            _log(f"❌ [US정합화잡] 오류(격리 — 매매 영향 없음): {_e}", "error")
+        except Exception:
+            logger.error(f"[US정합화잡] 오류(격리): {_e}")
+    finally:
+        _us_reconcile_job_health["last_finished_at"]  = datetime.now().isoformat()
+        _us_reconcile_job_health["last_duration_sec"] = round(time.time() - _start, 2)
+        _us_reconcile_job_health["run_count"] += 1
 
 
 def _us_heartbeat_check():
@@ -3204,6 +3271,11 @@ def api_status():
         "us_loop_health":    dict(_us_loop_health),
         # ★ KR 포지션 복원 잡 관찰성(코드만; 계좌·원문 없음)
         "kr_restore_health": dict(_kr_restore_health),
+        # ★ US 실보유 정합화 잡 관찰성 + 최근 정합화 결과(PII-free)
+        "us_reconcile_job_health": dict(_us_reconcile_job_health),
+        "us_reconcile_health": (
+            _us_strategy.us_reconcile_health() if _us_strategy else {}
+        ),
     })
 
 @app.route("/api/session")
