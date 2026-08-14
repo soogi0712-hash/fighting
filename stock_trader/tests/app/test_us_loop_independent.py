@@ -275,7 +275,12 @@ class IndependentJobTest(unittest.TestCase):
 class _FakeUsStrategy:
     def __init__(self):
         self.run_calls = []
+        # 격리 제외 뷰 active_positions() 도 제공(격리 없음 → positions 와 동일)
         self.pos_mgr = types.SimpleNamespace(positions={})
+        self.pos_mgr.active_positions = lambda: {
+            s: p for s, p in self.pos_mgr.positions.items()
+            if not getattr(p, "is_quarantined", False)
+        }
 
     def set_realtime_cache(self, c):
         pass

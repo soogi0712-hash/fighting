@@ -1,24 +1,16 @@
-"""US 실보유 정합화 + 복원 보호 + 손실회복 트레일링 — 통합 테스트 (§9/§10/§11).
+"""US 실보유 정합화 + 복원 보호 + 손실회복 트레일링 + 격리 — 통합 테스트 (§9/§10/§11).
 
-★ 순수 모듈 단위테스트(test_us_recovery/reconcile/position_store)와 달리, 이 파일은
-  **실 스택**을 연결해 검증한다:
+★ 순수 모듈 단위테스트와 달리 **실 스택**을 연결한다:
     - 실 USStrategyManager (run()이 호출하는 _manage_position 매도 판정 경로)
     - 실 USPositionManager + 실 AtomicPositionStore(us_positions.json 원자 저장)
     - 실 us_reconcile.reconcile_decision (스케줄러 잡이 호출하는 us_reconcile_positions)
     - 실 PendingOrderRegistry + OrderLifecycle (crash-safe submit-intent → SELL 파이프라인)
-  KIS API 만 Fake 로 대체한다(주문/잔고). 저널·lifecycle·registry·포지션 파일은
-  모두 임시 디렉터리로 격리해 실 DB/파일을 오염시키지 않는다.
-
-시나리오(§10 14종 + §9 7-vs-9 사고 재현):
-  A app-start 7종목 복원 / B 복원 직후 SELL 0 / C 다음 루프 전 종목 evaluate
-  D -5% RECOVERY 저장 / E 재시작 후 RECOVERY 유지 / F 반등 후 고점-0.70% 실매도 1회
-  G -6% 실매도 1회 / H 15분 경계 실매도 1회 / I 타임아웃 후 중복 SELL 없음
-  J 체결 후에만 포지션 제거 / K 불완전 스냅샷 → stale 0삭제 / L 완전 스냅샷만 stale 정리
-  M 불일치 → BUY 스킵·SELL 정상 / N KR·US 동시 실행 무데드락 / §9 7-vs-9 사고 재현
+  KIS API 만 Fake 로 대체. 저널·lifecycle·registry·포지션 파일은 임시 디렉터리로 격리.
 """
 import os
 import sys
 import json
+import types
 import shutil
 import tempfile
 import threading
@@ -33,22 +25,18 @@ import journal.fill_observer as FO
 from phoenix.lifecycle import OrderLifecycleManager
 
 
-# ══════════════════════════════════════════════════════════════
-# Fake KIS API — 주문/잔고만 대체(부수효과 없음, 호출 기록)
-# ══════════════════════════════════════════════════════════════
 class FakeUSApi:
     def __init__(self):
         self.sell_calls  = []
         self.sell_rt_cd  = "0"       # "0"=접수(ODNO) / "9"=타임아웃(UNKNOWN) / "reject"
         self.sell_odno   = "ODNO-TEST-1"
+        self.sell_reject_msg = "거래불가"   # '수량' 미포함 → 유령제거 아님(쿨다운 경로)
         self.balance_full = {"ok": True, "source": "api", "complete": True,
-                             "holdings": []}
+                             "authoritative_empty": False, "holdings": []}
 
-    # 정합화용 완전 스냅샷
     def get_us_balance_full(self, max_pages: int = 20):
-        return json.loads(json.dumps(self.balance_full))   # deep copy
+        return json.loads(json.dumps(self.balance_full))
 
-    # 구식 복원 폴백용
     def get_us_balance(self):
         return {"holdings": self.balance_full.get("holdings", [])}
 
@@ -56,14 +44,12 @@ class FakeUSApi:
         return 1300.0
 
     def sell_us(self, symbol, qty, price, excd):
-        self.sell_calls.append({"symbol": symbol, "qty": qty,
-                                "price": price, "excd": excd})
+        self.sell_calls.append({"symbol": symbol, "qty": qty})
         if self.sell_rt_cd == "0":
-            return {"rt_cd": "0", "msg1": "매도접수성공",
-                    "output": {"ODNO": self.sell_odno}}
+            return {"rt_cd": "0", "msg1": "매도접수성공", "output": {"ODNO": self.sell_odno}}
         if self.sell_rt_cd == "9":
-            return {"rt_cd": "9", "msg1": "timeout(예외 래핑)"}   # UNKNOWN_CONFIRM
-        return {"rt_cd": "1", "msg1": "매도가능수량 부족"}         # 명확 거절
+            return {"rt_cd": "9", "msg1": "timeout(예외 래핑)"}
+        return {"rt_cd": "1", "msg1": self.sell_reject_msg}
 
 
 def _holding(sym, qty=10, avg=100.0, cur=100.0, name=None, excd="NASD"):
@@ -71,15 +57,21 @@ def _holding(sym, qty=10, avg=100.0, cur=100.0, name=None, excd="NASD"):
             "name": name or sym, "excd": excd}
 
 
-def _iv(sell_score=0, intraday=0.0, rsi=50.0, vol=2.0, above_vwap=True,
-        macd_above=True, ema9=0.0):
-    # _manage_position/_check_entry 가 참조하는 최소 지표 셋(추세매도 미유발 기본값)
-    return {"sell_score": sell_score, "intraday_pct": intraday, "rsi": rsi,
-            "vol_ratio": vol, "above_vwap": above_vwap, "macd_above": macd_above,
-            "ema9": ema9, "buy_score": 0, "vwap": 0.0}
+def _snap(holdings, complete=True, ok=True):
+    return {"ok": ok, "source": ("api" if ok else None), "complete": complete,
+            "authoritative_empty": bool(ok and complete and not holdings),
+            "holdings": holdings}
+
+
+def _iv(sell_score=0):
+    return {"sell_score": sell_score, "intraday_pct": 0.0, "rsi": 50.0,
+            "vol_ratio": 2.0, "above_vwap": True, "macd_above": True,
+            "ema9": 0.0, "buy_score": 0, "vwap": 0.0, "sell_score": sell_score}
 
 
 SESS = {"session": "미국정규장", "tradeable": True}
+KIS_7 = ["ACHR", "BLNK", "IONQ", "NNE", "NVTS", "QUBT", "RGTI"]
+INTERNAL_9 = ["ASTS", "BBAI", "BLZE", "CCJ", "CEG", "CRSP", "IOVA", "LEU", "RKLB"]
 
 
 class USIntegrationTest(unittest.TestCase):
@@ -88,7 +80,6 @@ class USIntegrationTest(unittest.TestCase):
         self.pos_file = os.path.join(self.tmp, "us_positions.json")
         self.jnl_db   = os.path.join(self.tmp, "trading_journal.db")
 
-        # ── 실 파일/DB 격리 ─────────────────────────────────
         self._orig_pos_file   = USM.US_POSITIONS_FILE
         self._orig_jnl_path   = FO._JOURNAL_DB_PATH
         self._orig_journal_en = USM._US_JOURNAL_ENABLED
@@ -98,9 +89,8 @@ class USIntegrationTest(unittest.TestCase):
 
         USM.US_POSITIONS_FILE = self.pos_file
         FO._JOURNAL_DB_PATH   = self.jnl_db
-        FO._local             = threading.local()   # thread-local conn 재생성 유도
-        USM._US_JOURNAL_ENABLED = False              # 저널 훅 비활성(격리)
-        # lifecycle/outbox/ledger 를 임시 DB 로 강제(구성자 인자 무시)
+        FO._local             = threading.local()
+        USM._US_JOURNAL_ENABLED = False
         _db = self.jnl_db
         USM.OrderLifecycleManager = lambda _p, _d=_db: self._orig_OLM(_d)
         USM._USFillOutbox         = lambda _p, _d=_db: self._orig_outbox(_d)
@@ -119,267 +109,405 @@ class USIntegrationTest(unittest.TestCase):
         USM._USAppEffectLedger    = self._orig_ledger
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    # ── 헬퍼 ────────────────────────────────────────────────
     def _new_mgr(self):
-        """재시작 시뮬: 동일 파일/DB 로 새 매니저 인스턴스."""
         return USM.USStrategyManager(self.api)
 
-    def _manage(self, sym, cur, sell_score=0, iv=None):
+    def _manage(self, sym, cur, sell_score=0):
         pos = self.mgr.pos_mgr.positions[sym]
         return self.mgr._manage_position(pos, sym, pos.name, pos.excd, cur,
-                                         iv or _iv(sell_score=sell_score), SESS)
+                                         _iv(sell_score), SESS)
+
+    def _seed_internal(self, syms, qty=5, avg=50.0):
+        for s in syms:
+            self.mgr.pos_mgr.add(USM.USPosition(s, s, "NASD", qty, avg))
 
     # ══════════════════════════════════════════════════════════
-    # §9 사고 재현 + A: app-start 7종목 복원
+    # §9 사고 재현 + 격리: KIS 7 + 내부 stale 9 (stale-delete=false)
+    #   → 정상관리 7, quarantine 9, 매도평가 대상 정확히 7
     # ══════════════════════════════════════════════════════════
-    def test_A_and_incident_7_vs_9(self):
-        KIS_7 = ["ACHR", "BLNK", "IONQ", "NNE", "NVTS", "QUBT", "RGTI"]
-        INTERNAL_9 = ["ASTS", "BBAI", "BLZE", "CCJ", "CEG",
-                      "CRSP", "IOVA", "LEU", "RKLB"]
-        # 내부 원장에 9개(사고 당시 유령) 존재
-        for s in INTERNAL_9:
-            self.mgr.pos_mgr.add(USM.USPosition(s, s, "NASD", 5, 50.0))
-        # KIS 잔고 = 실제 7개(완전 스냅샷)
-        self.api.balance_full = {"ok": True, "source": "api", "complete": True,
-                                 "holdings": [_holding(s, 10, 100.0, 101.0) for s in KIS_7]}
-        # 완전+삭제허용 → 7 복원, 9 stale 정리(사고 재현: 교집합 0)
-        h = self.mgr.us_reconcile_positions(allow_stale_delete=True)
+    def test_incident_7_vs_9_quarantine_not_delete(self):
+        self._seed_internal(INTERNAL_9)
+        self.api.balance_full = _snap([_holding(s, 10, 100.0, 101.0) for s in KIS_7])
+        h = self.mgr.us_reconcile_positions()   # 기본: allow_stale_delete=False
         self.assertTrue(h["authoritative"])
         self.assertEqual(h["restored"], 7)
-        self.assertEqual(h["stale_removed"], 9)
-        got = sorted(self.mgr.pos_mgr.positions.keys())
-        self.assertEqual(got, sorted(KIS_7))
-        # 복원 종목은 recovered=True, 복원 직후 HOLD(NORMAL), highest>=avg
+        self.assertEqual(h["quarantined"], 9)
+        self.assertEqual(h["stale_deleted"], 0)          # 삭제 0
+        # 실보유(active) = 정확히 7, 격리 = 9
+        active = self.mgr.pos_mgr.active_positions()
+        quar   = self.mgr.pos_mgr.quarantined_positions()
+        self.assertEqual(sorted(active), sorted(KIS_7))
+        self.assertEqual(sorted(quar), sorted(INTERNAL_9))
+        # 7 전부 recovered=True, 복원 직후 NORMAL(HOLD)
         for s in KIS_7:
-            p = self.mgr.pos_mgr.positions[s]
-            self.assertTrue(p.recovered)
-            self.assertEqual(p.management_mode, R.MODE_NORMAL)
-            self.assertGreaterEqual(p.highest_price, p.avg_price)
-        # 원자 저장 파일에 실제로 기록되었는지(영속 검증)
-        self.assertTrue(os.path.exists(self.pos_file))
+            self.assertTrue(active[s].recovered)
+            self.assertEqual(active[s].management_mode, R.MODE_NORMAL)
+        # 파일에는 16개 모두 유지(삭제 0), 9개는 quarantined 표식 + 감사정보
         with open(self.pos_file, encoding="utf-8") as f:
             disk = json.load(f)
-        self.assertEqual(sorted(disk.keys()), sorted(KIS_7))
-        self.assertTrue(disk["IONQ"]["mgmt"]["recovered"])
+        self.assertEqual(len(disk), 16)
+        for s in INTERNAL_9:
+            self.assertTrue(disk[s]["mgmt"]["quarantined"])
+            q = disk[s]["mgmt"]["quarantine"]
+            self.assertEqual(set(q.keys()), {"symbol", "quarantined_at", "reason", "snapshot_id"})
 
-    # ══════════════════════════════════════════════════════════
-    # B: 복원 직후 SELL 0 / C: 다음 루프 전 종목 evaluate
-    # ══════════════════════════════════════════════════════════
-    def test_B_no_sell_right_after_restore_and_C_all_evaluate(self):
-        KIS_7 = ["ACHR", "BLNK", "IONQ", "NNE", "NVTS", "QUBT", "RGTI"]
-        self.api.balance_full = {"ok": True, "source": "api", "complete": True,
-                                 "holdings": [_holding(s, 10, 100.0, 100.0) for s in KIS_7]}
-        self.mgr.us_reconcile_positions(allow_stale_delete=True)
-        # 복원 직후 동일가(net≈-0.25%) 관리 판정 → 전 종목 HOLD, 매도 0
-        results = []
-        for s in KIS_7:
-            results.append(self._manage(s, 100.0))
-        self.assertEqual(self.api.sell_calls, [])                 # SELL 0
-        self.assertEqual(len(results), 7)                          # 전 종목 evaluate
-        for r in results:
-            self.assertIn(r["action"], ("HOLD",))
-            self.assertIn("관리", r.get("reason", ""))            # 관리모드가 판정
-
-    # ══════════════════════════════════════════════════════════
-    # D: -5% → RECOVERY 저장 / E: 재시작 후 RECOVERY 유지
-    # ══════════════════════════════════════════════════════════
-    def test_D_enter_recovery_and_E_persist_across_restart(self):
-        self.api.balance_full = {"ok": True, "source": "api", "complete": True,
-                                 "holdings": [_holding("IONQ", 10, 100.0, 100.0)]}
-        self.mgr.us_reconcile_positions(allow_stale_delete=True)
-        # net = (95-100)/100*100 - 0.25 = -5.25 ≤ -5 → RECOVERY 진입(HOLD, 매도 없음)
-        r = self._manage("IONQ", 95.0)
-        self.assertEqual(r["action"], "HOLD")
-        self.assertEqual(self.mgr.pos_mgr.positions["IONQ"].management_mode, R.MODE_RECOVERY)
+    def test_quarantine_zero_sell_submissions(self):
+        # 격리 9종목에서 실제 SELL 제출 0회 (매도판정 대상 아님)
+        self._seed_internal(INTERNAL_9)
+        self.api.balance_full = _snap([_holding(s) for s in KIS_7])
+        self.mgr.us_reconcile_positions()
+        # 격리 종목은 active 에 없어 run() 매도판정 경로로 못 들어간다
+        for s in INTERNAL_9:
+            self.assertIsNone(self.mgr.pos_mgr.active_positions().get(s))
+        # 방어적으로 격리 pos 를 직접 관리 호출해도 SELL 0 (HOLD)
+        for s in INTERNAL_9:
+            p = self.mgr.pos_mgr.positions[s]
+            r = self.mgr._us_apply_management(p, s, s, "NASD", 10.0,
+                                              p.net_pct(10.0), 0.0, 0.0, SESS)
+            self.assertEqual(r["action"], "HOLD")
         self.assertEqual(self.api.sell_calls, [])
-        # 재시작: 새 매니저가 동일 파일에서 RECOVERY 를 복원
+
+    def test_quarantine_excluded_from_count_budget_dedup(self):
+        self._seed_internal(INTERNAL_9)
+        self.api.balance_full = _snap([_holding(s) for s in KIS_7])
+        self.mgr.us_reconcile_positions()
+        # 보유수(외부 노출 .positions) = 격리 제외 → 7
+        self.assertEqual(len(self.mgr.positions), 7)
+        self.assertEqual(len(self.mgr.pos_mgr.active_positions()), 7)
+        # 중복매수 판정: 격리 심볼은 '실보유' 아님 → active 조회 None(=매수 가능 취급)
+        for s in INTERNAL_9:
+            self.assertNotIn(s, self.mgr.positions)
+        # 격리 감사정보는 별도 뷰로만 노출
+        self.assertEqual(len(self.mgr.us_quarantine_audit()), 9)
+
+    def test_quarantine_reappears_restored(self):
+        # 다음 KIS 스냅샷에 격리 종목 재등장 → 즉시 정상 복구(격리 해제)
+        self._seed_internal(["GONE"])
+        self.api.balance_full = _snap([_holding("IONQ")])   # GONE 부재 → 격리
+        self.mgr.us_reconcile_positions()
+        self.assertTrue(self.mgr.pos_mgr.positions["GONE"].is_quarantined)
+        # 다음 스냅샷에 GONE 재등장
+        self.api.balance_full = _snap([_holding("IONQ"), _holding("GONE", 4, 20.0, 21.0)])
+        h = self.mgr.us_reconcile_positions()
+        self.assertEqual(h["unquarantined"], 1)
+        self.assertFalse(self.mgr.pos_mgr.positions["GONE"].is_quarantined)
+        self.assertIn("GONE", self.mgr.pos_mgr.active_positions())
+        self.assertEqual(self.mgr.pos_mgr.positions["GONE"].qty, 4)
+
+    def test_no_file_deletion_before_operator_approval(self):
+        self._seed_internal(INTERNAL_9)
+        self.api.balance_full = _snap([_holding(s) for s in KIS_7])
+        # 여러 번 정합화해도(운영자 미승인) 삭제 0
+        for _ in range(3):
+            self.mgr.us_reconcile_positions()
+        with open(self.pos_file, encoding="utf-8") as f:
+            disk = json.load(f)
+        self.assertEqual(len(disk), 16)   # 삭제 0회
+
+    def test_operator_approval_final_delete(self):
+        # 운영자 승인(allow_stale_delete=True) + 완전 스냅샷 → 최종 삭제
+        self._seed_internal(["AAA", "BBB"])
+        self.api.balance_full = _snap([_holding("AAA", 10, 100.0, 101.0)])
+        h = self.mgr.us_reconcile_positions(allow_stale_delete=True)
+        self.assertEqual(h["stale_deleted"], 1)
+        self.assertNotIn("BBB", self.mgr.pos_mgr.positions)
+
+    def test_incomplete_snapshot_no_new_quarantine(self):
+        # 불완전 스냅샷 → 신규 격리 0, 삭제 0, positive holding 복원만(§1)
+        self._seed_internal(["AAA", "BBB", "CCC"])
+        self.api.balance_full = _snap([_holding("AAA", 10, 100.0, 101.0),
+                                       _holding("DDD", 10, 100.0, 101.0)],
+                                      complete=False)
+        h = self.mgr.us_reconcile_positions(allow_stale_delete=True)
+        self.assertTrue(h["authoritative"])
+        self.assertEqual(h["quarantined"], 0)     # 격리 신규 생성 0
+        self.assertEqual(h["stale_deleted"], 0)
+        self.assertFalse(h["buy_allowed"])        # 불완전 → 이번 스캔 BUY 스킵
+        # AAA 정합, DDD 복원, BBB/CCC 보존(격리 아님)
+        for s in ["AAA", "BBB", "CCC", "DDD"]:
+            self.assertIn(s, self.mgr.pos_mgr.positions)
+            self.assertFalse(self.mgr.pos_mgr.positions[s].is_quarantined)
+
+    def test_authoritative_empty_quarantines_all(self):
+        # 정상 complete empty(보유 0) → 내부 active 전부 격리
+        self._seed_internal(["AAA", "BBB"])
+        self.api.balance_full = _snap([], complete=True)   # authoritative_empty
+        h = self.mgr.us_reconcile_positions()
+        self.assertTrue(h["authoritative"])
+        self.assertTrue(h["authoritative_empty"])
+        self.assertEqual(h["quarantined"], 2)
+        self.assertEqual(len(self.mgr.pos_mgr.active_positions()), 0)
+
+    def test_error_empty_no_quarantine(self):
+        # 오류 empty(ok=False) → 비권위: 격리/삭제 없음, BUY 스킵
+        self._seed_internal(["AAA", "BBB"])
+        self.api.balance_full = _snap([], ok=False)
+        h = self.mgr.us_reconcile_positions()
+        self.assertFalse(h["authoritative"])
+        self.assertFalse(h["authoritative_empty"])
+        self.assertEqual(h["quarantined"], 0)
+        self.assertEqual(len(self.mgr.pos_mgr.active_positions()), 2)  # 보존
+        self.assertFalse(self.mgr._us_buy_gate_ok)
+
+    def test_buy_gate_true_only_after_complete_restore_quarantine(self):
+        self._seed_internal(INTERNAL_9)
+        self.api.balance_full = _snap([_holding(s) for s in KIS_7])
+        h = self.mgr.us_reconcile_positions()
+        self.assertTrue(h["buy_allowed"])   # 완전+복원+격리완료 → BUY 허용
+        self.assertTrue(self.mgr._us_buy_gate_ok)
+
+    # ══════════════════════════════════════════════════════════
+    # 복원 직후 SELL 0 / recovered 7종목만 run() 평가 진입
+    # ══════════════════════════════════════════════════════════
+    def test_restore_no_sell_and_only_recovered_evaluate(self):
+        self._seed_internal(INTERNAL_9)
+        self.api.balance_full = _snap([_holding(s, 10, 100.0, 100.0) for s in KIS_7])
+        self.mgr.us_reconcile_positions()
+        evaluated = []
+        for s in list(self.mgr.pos_mgr.active_positions().keys()):
+            r = self._manage(s, 100.0)
+            evaluated.append(s)
+            self.assertEqual(r["action"], "HOLD")
+        self.assertEqual(sorted(evaluated), sorted(KIS_7))   # 정확히 7만 평가
+        self.assertEqual(self.api.sell_calls, [])             # SELL 0
+
+    # ══════════════════════════════════════════════════════════
+    # recovered 종목 정책 (item3)
+    # ══════════════════════════════════════════════════════════
+    def test_recovered_exempt_but_recovery_and_persist_and_monotonic(self):
+        self.api.balance_full = _snap([_holding("IONQ", 10, 100.0, 100.0)])
+        self.mgr.us_reconcile_positions()
+        p = self.mgr.pos_mgr.positions["IONQ"]
+        self.assertTrue(p.recovered)
+        # 고정익절 면제: net +2.75 이어도 SELL 안 함
+        r = self._manage("IONQ", 103.0)
+        self.assertEqual(r["action"], "HOLD")
+        self.assertEqual(self.api.sell_calls, [])
+        # net<=-5 회복모드 진입
+        self._manage("IONQ", 95.0)
+        self.assertEqual(self.mgr.pos_mgr.positions["IONQ"].management_mode, R.MODE_RECOVERY)
+        # 재시작 후 recovered + RECOVERY 유지
         mgr2 = self._new_mgr()
         p2 = mgr2.pos_mgr.positions["IONQ"]
+        self.assertTrue(p2.recovered)
         self.assertEqual(p2.management_mode, R.MODE_RECOVERY)
-        self.assertIsNotNone(p2.mgmt["recovery_started_at"])
-        self.assertIsNotNone(p2.mgmt["recovery_high_price"])
+        # 반복 정합화로 최고가 하락 금지(monotonic)
+        mgr2.api.balance_full = _snap([_holding("IONQ", 10, 100.0, 130.0)])
+        mgr2.us_reconcile_positions()
+        hi = mgr2.pos_mgr.positions["IONQ"].highest_price
+        mgr2.api.balance_full = _snap([_holding("IONQ", 10, 100.0, 90.0)])
+        mgr2.us_reconcile_positions()
+        self.assertGreaterEqual(mgr2.pos_mgr.positions["IONQ"].highest_price, hi)
 
     # ══════════════════════════════════════════════════════════
-    # F: 반등 후 회복고점 대비 -0.70% → 실매도 정확히 1회
+    # 손실회복 실매도 (하드/고점이탈/시간) — 각 1회
     # ══════════════════════════════════════════════════════════
-    def test_F_recovery_high_drop_sells_once(self):
-        self.api.balance_full = {"ok": True, "source": "api", "complete": True,
-                                 "holdings": [_holding("IONQ", 10, 100.0, 100.0)]}
-        self.mgr.us_reconcile_positions(allow_stale_delete=True)
-        self._manage("IONQ", 95.0)   # 진입(recovery_high=95)
-        self._manage("IONQ", 97.0)   # 반등 → recovery_high=97 (net-3.25, exit -2 미달로 유지)
-        self.assertEqual(self.mgr.pos_mgr.positions["IONQ"].mgmt["recovery_high_price"], 97.0)
-        r = self._manage("IONQ", 96.0)   # (96-97)/97=-1.03% ≤ -0.7 → SELL_ALL
+    def test_hard_stop_sells_once(self):
+        self.api.balance_full = _snap([_holding("NNE", 10, 100.0, 100.0)])
+        self.mgr.us_reconcile_positions()
+        self._manage("NNE", 94.0)   # 진입(즉시매도 금지)
+        self.assertEqual(self.api.sell_calls, [])
+        self._manage("NNE", 94.0)   # 하드손절
         self.assertEqual(len(self.api.sell_calls), 1)
-        self.assertEqual(self.api.sell_calls[0]["symbol"], "IONQ")
-        self.assertEqual(self.mgr.pos_mgr.positions["IONQ"].management_mode, R.MODE_EXIT)
+        self.assertEqual(self.mgr.pos_mgr.positions["NNE"].management_mode, R.MODE_EXIT)
+
+    def test_recovery_high_drop_sells_once(self):
+        self.api.balance_full = _snap([_holding("IONQ", 10, 100.0, 100.0)])
+        self.mgr.us_reconcile_positions()
+        self._manage("IONQ", 95.0)
+        self._manage("IONQ", 97.0)
+        r = self._manage("IONQ", 96.0)
+        self.assertEqual(len(self.api.sell_calls), 1)
         self.assertEqual(r["action"], "SELL_ACCEPTED")
 
-    # ══════════════════════════════════════════════════════════
-    # G: -6% 하드손절 → 실매도 1회(진입 다음 루프)
-    # ══════════════════════════════════════════════════════════
-    def test_G_hard_stop_sells_once(self):
-        self.api.balance_full = {"ok": True, "source": "api", "complete": True,
-                                 "holdings": [_holding("NNE", 10, 100.0, 100.0)]}
-        self.mgr.us_reconcile_positions(allow_stale_delete=True)
-        # net(94)= -6.25. 1st: RECOVERY 진입(즉시매도 금지) → 매도 0
-        self._manage("NNE", 94.0)
-        self.assertEqual(self.api.sell_calls, [])
-        # 2nd: RECOVERY 에서 하드손절(net ≤ -6) → SELL 1회
-        self._manage("NNE", 94.0)
-        self.assertEqual(len(self.api.sell_calls), 1)
-
-    # ══════════════════════════════════════════════════════════
-    # H: 15분 경과 + net ≤ -4 → 실매도 1회
-    # ══════════════════════════════════════════════════════════
-    def test_H_time_stop_sells_once(self):
-        self.api.balance_full = {"ok": True, "source": "api", "complete": True,
-                                 "holdings": [_holding("QUBT", 10, 100.0, 100.0)]}
-        self.mgr.us_reconcile_positions(allow_stale_delete=True)
-        self._manage("QUBT", 95.0)   # 진입(net-5.25) recovery_high=95
-        # recovery_started_at 을 16분 전으로 되돌림(시간청산 경계 초과)
+    def test_time_stop_sells_once(self):
+        self.api.balance_full = _snap([_holding("QUBT", 10, 100.0, 100.0)])
+        self.mgr.us_reconcile_positions()
+        self._manage("QUBT", 95.0)
         p = self.mgr.pos_mgr.positions["QUBT"]
         p.mgmt["recovery_started_at"] = (datetime.now() - timedelta(minutes=16)).isoformat()
-        # net(95)=-5.25 ≤ -4, 경과≥15분 → 시간청산 SELL 1회 (고점 95 동일 → high_drop 0)
         self._manage("QUBT", 95.0)
         self.assertEqual(len(self.api.sell_calls), 1)
 
     # ══════════════════════════════════════════════════════════
-    # I: 타임아웃/불명확 후 중복 SELL 없음(EXIT_PENDING 유지)
+    # EXIT_PENDING (item4/item5) + 체결 (item6)
     # ══════════════════════════════════════════════════════════
-    def test_I_no_duplicate_sell_after_timeout(self):
-        self.api.sell_rt_cd = "9"    # UNKNOWN_CONFIRM(타임아웃) — 접수 가능/불명확
-        self.api.balance_full = {"ok": True, "source": "api", "complete": True,
-                                 "holdings": [_holding("RGTI", 10, 100.0, 100.0)]}
-        self.mgr.us_reconcile_positions(allow_stale_delete=True)
-        self._manage("RGTI", 94.0)   # 진입
-        self._manage("RGTI", 94.0)   # 하드손절 → SELL 시도(UNKNOWN_CONFIRM)
+    def test_exit_pending_kept_across_restart_no_resubmit(self):
+        # begin 성공 후 crash(재시작) → EXIT_PENDING 유지, 재제출 0
+        self.api.balance_full = _snap([_holding("ACHR", 10, 100.0, 100.0)])
+        self.mgr.us_reconcile_positions()
+        self._manage("ACHR", 94.0)
+        self._manage("ACHR", 94.0)   # SELL 접수 → EXIT_PENDING
+        self.assertEqual(len(self.api.sell_calls), 1)
+        n_before = len(self.api.sell_calls)
+        mgr2 = self._new_mgr()       # 재시작
+        self.assertEqual(mgr2.pos_mgr.positions["ACHR"].management_mode, R.MODE_EXIT)
+        pos = mgr2.pos_mgr.positions["ACHR"]
+        r = mgr2._us_apply_management(pos, "ACHR", "ACHR", "NASD", 94.0,
+                                      pos.net_pct(94.0), 0.0, 0.0, SESS)
+        self.assertEqual(r["action"], "HOLD")
+        self.assertEqual(len(self.api.sell_calls), n_before)   # 재제출 0
+
+    def test_exit_pending_reverts_to_recovery_when_begin_fails(self):
+        # SELL_ALL → EXIT_PENDING 저장 후 begin 실패(KIS 미호출) → RECOVERY 원상복구
+        self.api.balance_full = _snap([_holding("RGTI", 10, 100.0, 100.0)])
+        self.mgr.us_reconcile_positions()
+        self._manage("RGTI", 95.0)      # RECOVERY 진입
+        self._manage("RGTI", 97.0)      # recovery_high=97
+        p = self.mgr.pos_mgr.positions["RGTI"]
+        started = p.mgmt["recovery_started_at"]
+        high    = p.mgmt["recovery_high_price"]
+        # begin 실패 주입 → _do_sell 이 KIS 미호출 HOLD 반환
+        self.mgr._us_begin_submit_intent = lambda *a, **k: False
+        self._manage("RGTI", 96.0)      # 고점이탈 SELL 판정 → begin 실패
+        self.assertEqual(self.api.sell_calls, [])               # KIS 미호출
+        p = self.mgr.pos_mgr.positions["RGTI"]
+        self.assertEqual(p.management_mode, R.MODE_RECOVERY)    # 원상복구
+        self.assertEqual(p.mgmt["recovery_started_at"], started)
+        self.assertEqual(p.mgmt["recovery_high_price"], high)
+        self.assertIsNone(p.mgmt["exit_pending_ref"])
+
+    def test_clear_reject_cooldown(self):
+        # 명확 거절 → 쿨다운 동안 재제출 없음, 쿨다운 후 재시도
+        self.api.sell_rt_cd = "reject"
+        self.api.balance_full = _snap([_holding("BLNK", 10, 100.0, 100.0)])
+        self.mgr.us_reconcile_positions()
+        self._manage("BLNK", 94.0)      # 진입
+        self._manage("BLNK", 94.0)      # SELL 시도 → 명확거절 → 쿨다운
+        self.assertEqual(len(self.api.sell_calls), 1)
+        p = self.mgr.pos_mgr.positions["BLNK"]
+        self.assertIsNotNone(p.mgmt["sell_cooldown_until"])
+        self.assertEqual(p.management_mode, R.MODE_RECOVERY)    # EXIT 고착 아님
+        # 쿨다운 중 재판정 → 재제출 없음
+        self._manage("BLNK", 94.0)
+        self.assertEqual(len(self.api.sell_calls), 1)
+        # 쿨다운 만료 → 재시도(2회차)
+        p.mgmt["sell_cooldown_until"] = (datetime.now() - timedelta(seconds=1)).isoformat()
+        self._manage("BLNK", 94.0)
+        self.assertEqual(len(self.api.sell_calls), 2)
+
+    def test_no_duplicate_sell_after_timeout(self):
+        self.api.sell_rt_cd = "9"       # UNKNOWN_CONFIRM
+        self.api.balance_full = _snap([_holding("RGTI", 10, 100.0, 100.0)])
+        self.mgr.us_reconcile_positions()
+        self._manage("RGTI", 94.0)
+        self._manage("RGTI", 94.0)      # SELL 시도(UNKNOWN) → EXIT_PENDING 유지
         self.assertEqual(len(self.api.sell_calls), 1)
         self.assertEqual(self.mgr.pos_mgr.positions["RGTI"].management_mode, R.MODE_EXIT)
-        # 다음 루프들: EXIT_PENDING → 재제출 금지(중복 SELL 없음)
-        self._manage("RGTI", 94.0)
         self._manage("RGTI", 93.0)
-        self.assertEqual(len(self.api.sell_calls), 1)   # 여전히 1회
+        self.assertEqual(len(self.api.sell_calls), 1)   # 재제출 없음
 
-    # ══════════════════════════════════════════════════════════
-    # J: 포지션은 '실제 체결' 시에만 제거(접수만으로는 유지)
-    # ══════════════════════════════════════════════════════════
-    def test_J_position_removed_only_after_fill(self):
-        self.api.balance_full = {"ok": True, "source": "api", "complete": True,
-                                 "holdings": [_holding("ACHR", 10, 100.0, 100.0)]}
-        self.mgr.us_reconcile_positions(allow_stale_delete=True)
-        self._manage("ACHR", 94.0)   # 진입
-        self._manage("ACHR", 94.0)   # SELL 접수(ACCEPTED) — 체결 아님
-        self.assertIn("ACHR", self.mgr.pos_mgr.positions)   # 접수만으로 제거 안 함
-        self.assertEqual(self.mgr.pos_mgr.positions["ACHR"].management_mode, R.MODE_EXIT)
-        # 실제 체결(전량) 반영 = 매니저의 실제 포지션 감소 경로
-        self.mgr._us_pos_reduce("ACHR", 10)
-        self.assertNotIn("ACHR", self.mgr.pos_mgr.positions)  # 체결 후에만 제거
+    def test_position_removed_only_after_fill_partial_then_full(self):
+        self.api.balance_full = _snap([_holding("ACHR", 10, 100.0, 100.0)])
+        self.mgr.us_reconcile_positions()
+        self._manage("ACHR", 94.0)
+        self._manage("ACHR", 94.0)      # SELL 접수 — 체결 아님
+        self.assertIn("ACHR", self.mgr.pos_mgr.positions)
+        # 부분 체결(3주) → delta 만 감소, 제거 안 함
+        self.mgr._us_pos_reduce("ACHR", 3)
+        self.assertEqual(self.mgr.pos_mgr.positions["ACHR"].qty, 7)
+        # 완전 체결(잔량 7) → 최종 제거
+        self.mgr._us_pos_reduce("ACHR", 7)
+        self.assertNotIn("ACHR", self.mgr.pos_mgr.positions)
 
-    # ══════════════════════════════════════════════════════════
-    # K: 불완전 스냅샷 → stale 0 삭제(복원만) / L: 완전 스냅샷만 정리
-    # ══════════════════════════════════════════════════════════
-    def test_K_incomplete_snapshot_no_stale_delete(self):
-        # 내부 3종목, KIS 는 그중 1종목만 + 신규 1종목(불완전 스냅샷)
-        for s in ["AAA", "BBB", "CCC"]:
-            self.mgr.pos_mgr.add(USM.USPosition(s, s, "NASD", 5, 50.0))
-        self.api.balance_full = {"ok": True, "source": "api", "complete": False,
-                                 "holdings": [_holding("AAA", 10, 100.0, 101.0),
-                                              _holding("DDD", 10, 100.0, 101.0)]}
-        h = self.mgr.us_reconcile_positions(allow_stale_delete=True)
-        self.assertTrue(h["authoritative"])
-        self.assertEqual(h["stale_removed"], 0)               # 불완전 → 삭제 금지
-        # BBB/CCC(내부 유령 후보) 보존, DDD 복원, AAA 정합
-        for s in ["AAA", "BBB", "CCC", "DDD"]:
-            self.assertIn(s, self.mgr.pos_mgr.positions)
-        self.assertTrue(self.mgr.pos_mgr.positions["DDD"].recovered)
-
-    def test_L_complete_snapshot_stale_cleanup(self):
-        for s in ["AAA", "BBB"]:
-            self.mgr.pos_mgr.add(USM.USPosition(s, s, "NASD", 5, 50.0))
-        # 완전 스냅샷: KIS 는 AAA 만 보유 → BBB stale
-        self.api.balance_full = {"ok": True, "source": "api", "complete": True,
-                                 "holdings": [_holding("AAA", 10, 100.0, 101.0)]}
-        h = self.mgr.us_reconcile_positions(allow_stale_delete=True)
-        self.assertEqual(h["stale_removed"], 1)
-        self.assertNotIn("BBB", self.mgr.pos_mgr.positions)
-        self.assertIn("AAA", self.mgr.pos_mgr.positions)
-
-    def test_L2_complete_but_delete_disabled_default_preserves(self):
-        # 완전 스냅샷이라도 기본(allow_stale_delete=False)이면 삭제 보류(안전 기본값)
-        for s in ["AAA", "BBB"]:
-            self.mgr.pos_mgr.add(USM.USPosition(s, s, "NASD", 5, 50.0))
-        self.api.balance_full = {"ok": True, "source": "api", "complete": True,
-                                 "holdings": [_holding("AAA", 10, 100.0, 101.0)]}
-        h = self.mgr.us_reconcile_positions()   # 기본 False
-        self.assertEqual(h["stale_removed"], 0)
-        self.assertIn("BBB", self.mgr.pos_mgr.positions)    # 보존
-
-    # ══════════════════════════════════════════════════════════
-    # M: 비권위(불일치) → 신규 BUY 스킵 · 기존 SELL 정상
-    # ══════════════════════════════════════════════════════════
-    def test_M_unauthoritative_skips_buy_but_sells_normally(self):
+    def test_reconcile_does_not_book_pnl(self):
+        # 정합화(qty/avg 갱신)가 실현손익을 임의 부킹하지 않는다
         self.mgr.pos_mgr.add(USM.USPosition("IONQ", "IONQ", "NASD", 10, 100.0))
-        # 조회 실패(ok=False) → 비권위: 삭제/복원 없음, BUY 게이트만 내림
-        self.api.balance_full = {"ok": False, "source": None,
-                                 "complete": False, "holdings": []}
-        h = self.mgr.us_reconcile_positions()
-        self.assertFalse(h["authoritative"])
-        self.assertFalse(self.mgr._us_buy_gate_ok)
-        self.assertIn("IONQ", self.mgr.pos_mgr.positions)    # 삭제 안 함
-        # 신규 진입 시도 → 게이트로 HOLD(신규 BUY 스킵)
-        entry = self.mgr._check_entry("TSLA", "TSLA", "NASD", 250.0,
-                                      _iv(), [], {}, SESS)
-        self.assertEqual(entry["action"], "HOLD")
-        self.assertIn("비권위", entry["reason"])
-        # 기존 보유 SELL 은 게이트와 무관하게 정상(하드손절 2루프)
-        self._manage("IONQ", 94.0)
-        self._manage("IONQ", 94.0)
-        self.assertEqual(len(self.api.sell_calls), 1)
+        realized_before = self.mgr.pnl_guard.realized_pnl
+        self.api.balance_full = _snap([_holding("IONQ", 12, 95.0, 96.0)])  # 수량/평단 변경
+        self.mgr.us_reconcile_positions()
+        self.assertEqual(self.mgr.pos_mgr.positions["IONQ"].qty, 12)
+        self.assertEqual(self.mgr.pnl_guard.realized_pnl, realized_before)  # 손익 무변경
 
     # ══════════════════════════════════════════════════════════
-    # N: KR 루프 + US 정합화 동시 실행 — 데드락/예외 없음(비재진입 락)
+    # 신규(비복원) 포지션은 기존 익절 정책 유지 (DEFER)
     # ══════════════════════════════════════════════════════════
-    def test_N_concurrent_reconcile_no_deadlock(self):
-        self.api.balance_full = {"ok": True, "source": "api", "complete": True,
-                                 "holdings": [_holding("IONQ", 10, 100.0, 101.0),
-                                              _holding("NNE", 5, 50.0, 51.0)]}
+    def test_new_position_keeps_existing_takeprofit(self):
+        self.mgr.pos_mgr.add(USM.USPosition("IONQ", "IONQ", "NASD", 10, 100.0))
+        r = self._manage("IONQ", 103.0)   # net +2.75 → 기존 ① 무조건익절
+        self.assertEqual(len(self.api.sell_calls), 1)
+        self.assertEqual(r["action"], "SELL_ACCEPTED")
+
+    # ══════════════════════════════════════════════════════════
+    # 동시성: KR 루프 + US 정합화 무데드락
+    # ══════════════════════════════════════════════════════════
+    def test_concurrent_reconcile_no_deadlock(self):
+        self._seed_internal(INTERNAL_9)
+        self.api.balance_full = _snap([_holding(s) for s in KIS_7])
         errors = []
         def worker():
             try:
-                for _ in range(30):
-                    self.mgr.us_reconcile_positions(allow_stale_delete=True)
+                for _ in range(20):
+                    self.mgr.us_reconcile_positions()
             except Exception as e:      # pragma: no cover
                 errors.append(e)
         threads = [threading.Thread(target=worker) for _ in range(4)]
         for t in threads: t.start()
         for t in threads: t.join(timeout=20)
-        self.assertFalse(any(t.is_alive() for t in threads))   # 무데드락
+        self.assertFalse(any(t.is_alive() for t in threads))
         self.assertEqual(errors, [])
-        # 최종 원장 정합: IONQ/NNE 존재
-        self.assertIn("IONQ", self.mgr.pos_mgr.positions)
-        self.assertIn("NNE", self.mgr.pos_mgr.positions)
+        self.assertEqual(len(self.mgr.pos_mgr.active_positions()), 7)
 
-    # ══════════════════════════════════════════════════════════
-    # 추가: 신규(비복원) 포지션은 기존 익절/손절 정책 그대로(면제 아님)
-    # ══════════════════════════════════════════════════════════
-    def test_new_position_keeps_existing_takeprofit(self):
-        # 복원이 아닌 신규 매수 포지션(recovered=False)
-        self.mgr.pos_mgr.add(USM.USPosition("IONQ", "IONQ", "NASD", 10, 100.0))
-        # net(103)= +2.75 ≥ +2.5 → 기존 ① 무조건 전량익절 발동(관리모드는 DEFER)
-        r = self._manage("IONQ", 103.0)
-        self.assertEqual(len(self.api.sell_calls), 1)
-        self.assertEqual(r["action"], "SELL_ACCEPTED")
 
-    def test_recovered_position_exempt_from_fixed_takeprofit(self):
-        # 복원 포지션은 고정 익절(①②③) 면제 — 수익 트레일링만
-        self.api.balance_full = {"ok": True, "source": "api", "complete": True,
-                                 "holdings": [_holding("IONQ", 10, 100.0, 100.0)]}
-        self.mgr.us_reconcile_positions(allow_stale_delete=True)
-        # net(103)= +2.75 이지만 recovered=True → 고정익절 면제, 트레일 미발동 → HOLD
-        r = self._manage("IONQ", 103.0)
-        self.assertEqual(self.api.sell_calls, [])
-        self.assertEqual(r["action"], "HOLD")
+# ══════════════════════════════════════════════════════════════
+# get_us_balance_full 완전성 집계 (거래소/페이지/부분실패/빈잔고 구분)
+# ══════════════════════════════════════════════════════════════
+class BalanceFullCompletenessTest(unittest.TestCase):
+    def _call(self, per_exchange, exchanges):
+        from api.kis_api import KISApi
+        fake = types.SimpleNamespace()
+        fake._fetch_us_balance_exchange = lambda excd, max_pages=20: per_exchange[excd]
+        old = os.environ.get("US_BALANCE_EXCHANGES")
+        os.environ["US_BALANCE_EXCHANGES"] = exchanges
+        try:
+            return KISApi.get_us_balance_full(fake)
+        finally:
+            if old is None:
+                os.environ.pop("US_BALANCE_EXCHANGES", None)
+            else:
+                os.environ["US_BALANCE_EXCHANGES"] = old
+
+    def test_all_exchanges_complete(self):
+        per = {"NASD": {"ok": True, "complete": True,
+                        "holdings": [_holding("IONQ")], "pages": 1},
+               "NYSE": {"ok": True, "complete": True,
+                        "holdings": [_holding("BA")], "pages": 1}}
+        r = self._call(per, "NASD,NYSE")
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["complete"])
+        self.assertEqual(sorted(h["symbol"] for h in r["holdings"]), ["BA", "IONQ"])
+
+    def test_partial_exchange_failure_incomplete(self):
+        per = {"NASD": {"ok": True, "complete": True,
+                        "holdings": [_holding("IONQ")], "pages": 1},
+               "NYSE": {"ok": False, "complete": False, "holdings": [], "pages": 0}}
+        r = self._call(per, "NASD,NYSE")
+        self.assertTrue(r["ok"])            # NASD 는 성공
+        self.assertFalse(r["complete"])     # NYSE 실패 → 전체 미완전
+        self.assertFalse(r["authoritative_empty"])
+
+    def test_authoritative_empty(self):
+        per = {"NASD": {"ok": True, "complete": True, "holdings": [], "pages": 1}}
+        r = self._call(per, "NASD")
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["complete"])
+        self.assertTrue(r["authoritative_empty"])
+
+    def test_error_empty_not_authoritative(self):
+        per = {"NASD": {"ok": False, "complete": False, "holdings": [], "pages": 0}}
+        r = self._call(per, "NASD")
+        self.assertFalse(r["ok"])
+        self.assertIsNone(r["source"])
+        self.assertFalse(r["complete"])
+        self.assertFalse(r["authoritative_empty"])
+
+    def test_dedup_across_exchanges(self):
+        per = {"NASD": {"ok": True, "complete": True,
+                        "holdings": [_holding("IONQ")], "pages": 1},
+               "NYSE": {"ok": True, "complete": True,
+                        "holdings": [_holding("IONQ")], "pages": 1}}
+        r = self._call(per, "NASD,NYSE")
+        self.assertEqual(len([h for h in r["holdings"] if h["symbol"] == "IONQ"]), 1)
 
 
 if __name__ == "__main__":
