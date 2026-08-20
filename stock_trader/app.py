@@ -3284,6 +3284,15 @@ def api_status():
             "ok": _us_strategy._us_buy_gate_ok,
             "reason": _us_strategy._us_buy_gate_reason,
         } if _us_strategy else {}),
+        # ★ 보유종목별 관리 관찰(net_pct·미실현손실·max_loss·ATR·구조카운트·5m·모드·decision)
+        #   계좌·토큰·ODNO 미포함(PII-free).
+        "us_position_health": (
+            _us_strategy.us_position_health() if _us_strategy else []
+        ),
+        # ★ 종목 max_loss 한도 무결성(누락/손상 시 신규 BUY 차단 + CRITICAL)
+        "us_maxloss_health": (
+            _us_strategy.us_maxloss_health() if _us_strategy else {}
+        ),
     })
 
 @app.route("/api/session")

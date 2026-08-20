@@ -117,6 +117,13 @@ def default_state(recovered: bool = False, highest_price: float = 0.0,
         "last_profit_breach_bar_at": None,
         "last_evaluated_at":     (now.isoformat() if now else None),
         "exit_pending_ref":      None,
+        # ── 종목별 최대허용 금액손실($, 진입 시 확정·영속. 매 루프 재계산/확대 금지) ──
+        "max_loss_usd_at_entry": None,
+        # ── /api/status·로그 노출용 관찰 스냅샷(휘발성; 매 루프 갱신) ──
+        "last_net_pct":          None,
+        "last_unrealized_usd":   None,
+        "last_atr_pct":          None,
+        "last_decision":         None,
         # ── 격리(broker-absent quarantine) ──
         "quarantined":           False,
         "quarantine":            None,
@@ -149,6 +156,14 @@ def merge_state(raw: Optional[dict]) -> dict:
         out["highest_price"] = float(out.get("highest_price") or 0.0)
     except (TypeError, ValueError):
         out["highest_price"] = 0.0
+    # max_loss_usd_at_entry: 숫자로 파싱 불가하거나 <=0 이면 None(손상 → 호출부가 fail-safe).
+    _ml = out.get("max_loss_usd_at_entry")
+    if _ml is not None:
+        try:
+            _mlf = float(_ml)
+            out["max_loss_usd_at_entry"] = _mlf if _mlf > 0 else None
+        except (TypeError, ValueError):
+            out["max_loss_usd_at_entry"] = None
     # 구버전 RECOVERY_TRAILING → RECOVERY_WAIT 로 병합
     if out.get("management_mode") == _LEGACY_RECOVERY:
         out["management_mode"] = MODE_RECOVERY_WAIT
