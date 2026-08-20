@@ -1,4 +1,11 @@
-"""US 손실 회복 트레일링 상태기계 경계 테스트 (§4/§9C/§9D — 결정론적, 부수효과 없음)."""
+"""US 손실 회복 + 수익 트레일링 상태기계 경계 테스트 (결정론적, 부수효과 없음).
+
+새 규칙:
+  수익 트레일링: +1.5% 활성 / ATR 동적 폭 clamp(1.0~2.5) / 종가 2회 확정 /
+                 EMA9 상승+위 HOLD / 트레일이탈+EMA9 하향이탈 → SELL.
+  손실 회복    : -5 진입 / -0.7 즉시매도 삭제 / -3.5 회복해야 트레일 활성 /
+                 활성 후 고점 -1.2%(또는 ATR) 이탈 → SELL / -6 하드손절 / -2 NORMAL.
+"""
 import os
 import sys
 import unittest
@@ -8,239 +15,313 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 import strategies.us_recovery as R
 
-T0 = datetime(2026, 8, 14, 22, 40, 0)  # 고정 기준시각(주입)
+T0 = datetime(2026, 8, 14, 22, 40, 0)
+T1 = T0 + timedelta(minutes=1)
+T2 = T0 + timedelta(minutes=2)
 
 
-def _recovery_state(high_price=100.0, high_net=-5.0, started=T0, recovered=False):
-    """RECOVERY_TRAILING 상태 dict 생성 헬퍼."""
+def _recovery_state(high_price=100.0, high_net=-5.0, armed=False, recovered=False):
     s = R.default_state(recovered=recovered)
     s["management_mode"]       = R.MODE_RECOVERY
-    s["recovery_started_at"]   = started.isoformat()
+    s["recovery_started_at"]   = T0.isoformat()
     s["recovery_high_price"]   = high_price
     s["recovery_high_net_pct"] = high_net
+    s["recovery_trail_armed"]  = armed
     return s
 
 
-class RecoveryEntryBoundaryTest(unittest.TestCase):
-    # ── §9C 진입 경계 ─────────────────────────────────────────
-    def test_enter_at_minus_4_99_stays_normal(self):
-        s = R.default_state()
-        d = R.evaluate(s, net_pct=-4.99, cur_price=95.01, now=T0)
+def _profit_state(highest=100.0, active=False, high_net=None, closes=0, recovered=False):
+    s = R.default_state(recovered=recovered, highest_price=highest)
+    s["profit_trail_active"]  = active
+    s["profit_high_net_pct"]  = high_net
+    s["profit_breach_closes"] = closes
+    return s
+
+
+# ══════════════════════════════════════════════════════════════
+# 손실 회복 — 진입/활성/트레일/하드/복귀
+# ══════════════════════════════════════════════════════════════
+class RecoveryEntryTest(unittest.TestCase):
+    def test_enter_minus_4_99_stays_normal(self):
+        d = R.evaluate(R.default_state(), net_pct=-4.99, cur_price=95.01, now=T0)
         self.assertEqual(d.mode, R.MODE_NORMAL)
         self.assertFalse(d.sell)
 
-    def test_enter_at_exactly_minus_5_00(self):
-        s = R.default_state()
-        d = R.evaluate(s, net_pct=-5.00, cur_price=95.0, now=T0)
+    def test_enter_exactly_minus_5_enters_recovery_no_sell(self):
+        d = R.evaluate(R.default_state(highest_price=100.0), net_pct=-5.0,
+                       cur_price=95.0, now=T0)
         self.assertEqual(d.mode, R.MODE_RECOVERY)
-        self.assertFalse(d.sell)  # 즉시매도 금지
-        self.assertEqual(d.state["recovery_started_at"], T0.isoformat())
+        self.assertFalse(d.sell)                       # 즉시매도 금지
+        self.assertFalse(d.state["recovery_trail_armed"])
         self.assertEqual(d.state["recovery_high_price"], 95.0)
 
-    def test_enter_then_same_price_no_immediate_high_drop(self):
-        # 진입 직후 동일가 재평가 — -0.7% 조건 오발동 금지
-        s = R.default_state()
-        d1 = R.evaluate(s, net_pct=-5.0, cur_price=95.0, now=T0)
-        d2 = R.evaluate(d1.state, net_pct=-5.0, cur_price=95.0,
-                        now=T0 + timedelta(seconds=5))
+    def test_no_immediate_high_drop_sell_after_entry(self):
+        # 진입 직후 고점 대비 -0.7% 하락해도 매도하지 않는다(규칙 삭제 확인)
+        d1 = R.evaluate(R.default_state(highest_price=100.0), net_pct=-5.0,
+                        cur_price=100.0, now=T0)
+        # recovery_high=100, 이후 99.3 (-0.7%) → 매도 없어야 함(미활성)
+        d2 = R.evaluate(d1.state, net_pct=-5.6, cur_price=99.3, now=T1)
         self.assertFalse(d2.sell)
-        self.assertEqual(d2.mode, R.MODE_RECOVERY)
 
 
-class RecoveryHardStopTest(unittest.TestCase):
-    def test_minus_6_00_sell_all(self):
-        s = _recovery_state()
-        d = R.evaluate(s, net_pct=-6.00, cur_price=94.0, now=T0 + timedelta(minutes=1))
+class RecoveryArmTest(unittest.TestCase):
+    def test_minus_4_0_not_armed(self):
+        # -4.0 에서는 recovery trailing 비활성
+        d = R.evaluate(_recovery_state(high_price=96.0), net_pct=-4.0,
+                       cur_price=96.0, now=T1)
+        self.assertFalse(d.state["recovery_trail_armed"])
+        self.assertFalse(d.sell)
+
+    def test_minus_3_5_arms(self):
+        # -3.5 회복 → 활성화
+        d = R.evaluate(_recovery_state(high_price=96.5), net_pct=-3.5,
+                       cur_price=96.5, now=T1)
+        self.assertTrue(d.state["recovery_trail_armed"])
+
+    def test_small_rebound_does_not_arm(self):
+        # -5 → -4.2 작은 반등만으로는 활성 안 됨
+        d = R.evaluate(_recovery_state(high_price=95.8), net_pct=-4.2,
+                       cur_price=95.8, now=T1)
+        self.assertFalse(d.state["recovery_trail_armed"])
+
+
+class RecoveryTrailTest(unittest.TestCase):
+    def test_armed_high_drop_minus_1_19_hold(self):
+        # 활성 상태, ATR=0 → trail=1.2. 고점100 대비 -1.19% → HOLD
+        s = _recovery_state(high_price=100.0, armed=True)
+        d = R.evaluate(s, net_pct=-3.0, cur_price=98.81, now=T1, atr_pct=0.0)
+        self.assertFalse(d.sell)
+
+    def test_armed_high_drop_minus_1_20_sell(self):
+        # 활성 상태, ATR=0 → trail=1.2. 고점100 대비 -1.20% → SELL
+        s = _recovery_state(high_price=100.0, armed=True)
+        d = R.evaluate(s, net_pct=-3.0, cur_price=98.80, now=T1, atr_pct=0.0)
         self.assertTrue(d.sell)
-        self.assertIn("hard", d.reason)
+        self.assertEqual(d.action, R.ACT_SELL_ALL)
 
-    def test_minus_5_69_no_high_drop_holds(self):
-        # 반등 없이 하락하나 고점(-100)대비 가격드롭 0.65% (<0.7) + net -5.69 (>-6) → HOLD
-        s = _recovery_state(high_price=100.0)
-        d = R.evaluate(s, net_pct=-5.69, cur_price=99.35, now=T0 + timedelta(minutes=1))
+    def test_not_armed_no_trail_sell(self):
+        # 미활성이면 고점 -2% 하락도 매도 안 함
+        s = _recovery_state(high_price=100.0, armed=False)
+        d = R.evaluate(s, net_pct=-4.5, cur_price=98.0, now=T1, atr_pct=0.0)
         self.assertFalse(d.sell)
-        self.assertEqual(d.mode, R.MODE_RECOVERY)
 
-    def test_continuous_drop_triggers_hard_stop(self):
-        # 가격 상승 없이 계속 하락 → 결국 -6% 하드손절
+    def test_trail_width_atr_dynamic(self):
+        # ATR% 큰 경우 trail 폭이 넓어져(clamp 2.5) 작은 이탈은 HOLD
+        s = _recovery_state(high_price=100.0, armed=True)
+        d = R.evaluate(s, net_pct=-3.0, cur_price=98.0, now=T1, atr_pct=5.0)  # trail=2.5
+        self.assertFalse(d.sell)   # -2.0% > -2.5% → HOLD
+
+
+class RecoveryHardExitTest(unittest.TestCase):
+    def test_hard_stop_minus_6_sell(self):
         s = _recovery_state(high_price=100.0)
-        d = R.evaluate(s, net_pct=-6.01, cur_price=93.9, now=T0 + timedelta(minutes=2))
+        d = R.evaluate(s, net_pct=-6.0, cur_price=94.0, now=T1)
+        self.assertTrue(d.sell)
+        self.assertIn("hard_stop", d.reason)
+
+    def test_hard_stop_priority_over_arm(self):
+        # -6 이면 armed 여부·트레일 무관하게 하드손절
+        s = _recovery_state(high_price=100.0, armed=True)
+        d = R.evaluate(s, net_pct=-6.5, cur_price=93.0, now=T1)
         self.assertTrue(d.sell)
 
-
-class RecoveryHighDropTest(unittest.TestCase):
-    def test_rebound_updates_recovery_high(self):
-        s = _recovery_state(high_price=95.0, high_net=-5.0)
-        # -5%→-3% 반등, 가격 97 로 신고점
-        d = R.evaluate(s, net_pct=-3.0, cur_price=97.0, now=T0 + timedelta(minutes=1))
-        self.assertEqual(d.state["recovery_high_price"], 97.0)
-        self.assertFalse(d.sell)
-
-    def test_high_drop_minus_0_69_holds(self):
-        s = _recovery_state(high_price=100.0)
-        # -0.69% 하락 → HOLD, net 은 트리거 안 되게 -3.0
-        d = R.evaluate(s, net_pct=-3.0, cur_price=99.31, now=T0 + timedelta(minutes=1))
-        self.assertFalse(d.sell)
-
-    def test_high_drop_exactly_minus_0_70_sell(self):
-        s = _recovery_state(high_price=100.0)
-        d = R.evaluate(s, net_pct=-3.0, cur_price=99.30, now=T0 + timedelta(minutes=1))
-        self.assertTrue(d.sell)
-        self.assertIn("high_drop", d.reason)
-
-    def test_recovery_high_never_lowers(self):
-        s = _recovery_state(high_price=100.0)
-        # 가격 하락 재평가로도 recovery_high 는 유지(낮아지지 않음)
-        d = R.evaluate(s, net_pct=-3.0, cur_price=99.5, now=T0 + timedelta(minutes=1))
-        self.assertEqual(d.state["recovery_high_price"], 100.0)
-
-
-class RecoveryTimeStopTest(unittest.TestCase):
-    def test_14m59s_net_minus_4_5_holds(self):
-        s = _recovery_state(high_price=100.0)
-        d = R.evaluate(s, net_pct=-4.5, cur_price=99.6,
-                       now=T0 + timedelta(minutes=14, seconds=59))
-        self.assertFalse(d.sell)
-
-    def test_15m_net_minus_3_99_holds(self):
-        s = _recovery_state(high_price=100.0)
-        d = R.evaluate(s, net_pct=-3.99, cur_price=99.7,
-                       now=T0 + timedelta(minutes=15))
-        self.assertFalse(d.sell)
-
-    def test_15m_net_exactly_minus_4_0_sell(self):
-        s = _recovery_state(high_price=100.0)
-        d = R.evaluate(s, net_pct=-4.00, cur_price=99.7,
-                       now=T0 + timedelta(minutes=15))
-        self.assertTrue(d.sell)
-        self.assertIn("time_stop", d.reason)
-
-
-class RecoveryExitTest(unittest.TestCase):
-    def test_minus_2_01_stays_recovery(self):
-        s = _recovery_state(high_price=100.0)
-        d = R.evaluate(s, net_pct=-2.01, cur_price=99.8, now=T0 + timedelta(minutes=1))
-        self.assertEqual(d.mode, R.MODE_RECOVERY)
-        self.assertFalse(d.sell)
-
-    def test_exactly_minus_2_0_returns_normal(self):
-        s = _recovery_state(high_price=100.0)
-        d = R.evaluate(s, net_pct=-2.00, cur_price=99.9, now=T0 + timedelta(minutes=1))
+    def test_exit_minus_2_returns_normal(self):
+        s = _recovery_state(high_price=100.0, armed=True)
+        d = R.evaluate(s, net_pct=-2.0, cur_price=98.0, now=T1)
         self.assertEqual(d.mode, R.MODE_NORMAL)
         self.assertFalse(d.sell)
-        self.assertIsNone(d.state["recovery_started_at"])
+        self.assertFalse(d.state["recovery_trail_armed"])
 
-    def test_normal_then_profit_trailing_works(self):
-        # NORMAL 복귀 후 수익 트레일링(§3): +1.5% 활성, 최고 대비 -1.0%p 하락 시 매도
-        s = R.default_state(recovered=True)
-        s = R.evaluate_profit_trailing(s, 1.5)["state"]
-        self.assertTrue(s["profit_trail_active"])
-        r = R.evaluate_profit_trailing(s, 0.5)  # 1.5 → 0.5 (-1.0%p)
-        self.assertTrue(r["sell"])
-        r2 = R.evaluate_profit_trailing(s, 0.6)  # -0.9%p → HOLD
-        self.assertFalse(r2["sell"])
+    def test_no_rebound_straight_to_minus_6(self):
+        # 진입(-5, HOLD) → 반등 없이 -6 → SELL (2 루프)
+        d1 = R.evaluate(R.default_state(highest_price=100.0), net_pct=-5.0,
+                        cur_price=95.0, now=T0)
+        self.assertFalse(d1.sell)
+        d2 = R.evaluate(d1.state, net_pct=-6.0, cur_price=94.0, now=T1)
+        self.assertTrue(d2.sell)
 
 
-class ProfitTrailingActivateTest(unittest.TestCase):
-    def test_below_1_5_not_active(self):
-        s = R.default_state(recovered=True)
-        r = R.evaluate_profit_trailing(s, 1.49)
+class RecoveryMonotonicTest(unittest.TestCase):
+    def test_recovery_high_never_drops(self):
+        s = _recovery_state(high_price=100.0, armed=True)
+        d = R.evaluate(s, net_pct=-3.0, cur_price=97.0, now=T1)  # cur<high
+        self.assertEqual(d.state["recovery_high_price"], 100.0)  # 유지
+        d2 = R.evaluate(d.state, net_pct=-2.5, cur_price=103.0, now=T2)  # 신고점
+        self.assertEqual(d2.state["recovery_high_price"], 103.0)
+
+
+# ══════════════════════════════════════════════════════════════
+# 수익 트레일링 — 활성/ATR clamp/종가확정/EMA9
+# ══════════════════════════════════════════════════════════════
+class ProfitActivateTest(unittest.TestCase):
+    def test_plus_1_49_not_active(self):
+        r = R.evaluate_profit_trailing(_profit_state(), net_pct=1.49, cur_price=101.49,
+                                       atr_pct=0.0, ema9=100.0, ema9_rising=True)
         self.assertFalse(r["state"]["profit_trail_active"])
         self.assertFalse(r["sell"])
 
-    def test_exactly_1_5_activates_no_sell(self):
-        s = R.default_state(recovered=True)
-        r = R.evaluate_profit_trailing(s, 1.5)
-        self.assertTrue(r["activate"])
-        self.assertFalse(r["sell"])  # 도달만으로는 매도 안 함
+    def test_plus_1_50_activates_no_sell(self):
+        r = R.evaluate_profit_trailing(_profit_state(highest=101.5), net_pct=1.50,
+                                       cur_price=101.5, atr_pct=0.0, ema9=100.0,
+                                       ema9_rising=True)
+        self.assertTrue(r["state"]["profit_trail_active"])
+        self.assertFalse(r["sell"])   # 활성만, 매도 없음
+
+    def test_activation_sticky(self):
+        # 활성 후 net 이 +1.5 아래로 내려가도 active 유지
+        s = _profit_state(active=True, high_net=2.0)
+        r = R.evaluate_profit_trailing(s, net_pct=0.5, cur_price=100.0, atr_pct=0.0,
+                                       ema9=100.0, ema9_rising=True)
+        self.assertTrue(r["state"]["profit_trail_active"])
 
 
-class RecoveryPersistenceTest(unittest.TestCase):
-    # ── §9D 영속·재시작 ───────────────────────────────────────
-    def test_state_roundtrip_via_merge(self):
-        import json
-        s = _recovery_state(high_price=101.0, started=T0)
-        loaded = R.merge_state(json.loads(json.dumps(s)))
-        self.assertEqual(loaded["management_mode"], R.MODE_RECOVERY)
-        self.assertEqual(loaded["recovery_started_at"], T0.isoformat())
-        self.assertEqual(loaded["recovery_high_price"], 101.0)
+class ProfitTrailWidthTest(unittest.TestCase):
+    def _breach_once(self, atr_pct, drop_to_pct):
+        # 활성 상태, highest=100, ema9 하향이탈 조건 + cur below → 1회 이탈
+        s = _profit_state(highest=100.0, active=True, high_net=3.0, closes=1)  # 이미 1회
+        cur = 100.0 * (1 + drop_to_pct / 100.0)
+        return R.evaluate_profit_trailing(s, net_pct=1.0, cur_price=cur,
+                                          atr_pct=atr_pct, ema9=cur + 1.0,
+                                          ema9_rising=False)
 
-    def test_time_stop_survives_restart(self):
-        # 재시작(=state 재로딩) 후에도 started_at 기준 15분 경과 판정 정상
-        s = _recovery_state(high_price=100.0, started=T0)
-        loaded = R.merge_state(dict(s))
-        d = R.evaluate(loaded, net_pct=-4.0, cur_price=99.7,
-                       now=T0 + timedelta(minutes=15))
+    def test_atr_zero_clamps_min_1_0(self):
+        # trail=1.0. drop -0.99 → HOLD, -1.00 → 확정(closes 2)→ SELL
+        r_hold = self._breach_once(0.0, -0.99)
+        self.assertFalse(r_hold["sell"])
+        self.assertEqual(r_hold["state"]["profit_breach_closes"], 0)  # 리셋
+        r_sell = self._breach_once(0.0, -1.00)
+        self.assertTrue(r_sell["sell"])
+
+    def test_atr_large_clamps_max_2_5(self):
+        # ATR 매우 큼 → trail=2.5. drop -2.0 → HOLD(폭 미달)
+        r = self._breach_once(10.0, -2.0)
+        self.assertFalse(r["sell"])
+
+    def test_atr_mid(self):
+        # ATR%=1.0 → trail=1.5. drop -1.6 → 이탈, closes=2 → SELL
+        r = self._breach_once(1.0, -1.6)
+        self.assertTrue(r["sell"])
+
+
+class ProfitCloseConfirmTest(unittest.TestCase):
+    def test_single_tick_breach_holds(self):
+        # 첫 이탈(closes 0→1) → HOLD (단일 순간 이탈)
+        s = _profit_state(highest=100.0, active=True, high_net=3.0, closes=0)
+        r = R.evaluate_profit_trailing(s, net_pct=1.0, cur_price=98.5,
+                                       atr_pct=0.0, ema9=99.5, ema9_rising=False)
+        self.assertFalse(r["sell"])
+        self.assertEqual(r["state"]["profit_breach_closes"], 1)
+
+    def test_two_closes_confirm_sell(self):
+        s = _profit_state(highest=100.0, active=True, high_net=3.0, closes=0)
+        r1 = R.evaluate_profit_trailing(s, net_pct=1.0, cur_price=98.5,
+                                        atr_pct=0.0, ema9=99.5, ema9_rising=False)
+        self.assertFalse(r1["sell"])
+        r2 = R.evaluate_profit_trailing(r1["state"], net_pct=1.0, cur_price=98.5,
+                                        atr_pct=0.0, ema9=99.5, ema9_rising=False)
+        self.assertTrue(r2["sell"])   # 2회 연속 종가 확정
+
+    def test_bounce_resets_counter(self):
+        s = _profit_state(highest=100.0, active=True, high_net=3.0, closes=1)
+        # 반등(고점 위 회복) → 카운터 리셋
+        r = R.evaluate_profit_trailing(s, net_pct=2.5, cur_price=100.0,
+                                       atr_pct=0.0, ema9=99.0, ema9_rising=False)
+        self.assertEqual(r["state"]["profit_breach_closes"], 0)
+
+    def test_bar5_close_confirms_immediately(self):
+        s = _profit_state(highest=100.0, active=True, high_net=3.0, closes=0)
+        r = R.evaluate_profit_trailing(s, net_pct=1.0, cur_price=98.5, atr_pct=0.0,
+                                       ema9=99.5, ema9_rising=False, bar5_close=True)
+        self.assertTrue(r["sell"])   # 5분봉 종가 → 즉시 확정
+
+
+class ProfitEMA9Test(unittest.TestCase):
+    def test_ema9_rising_above_holds(self):
+        # EMA9 상승 + 현재가 > EMA9 → 트레일 이탈이어도 HOLD
+        s = _profit_state(highest=100.0, active=True, high_net=3.0, closes=1)
+        r = R.evaluate_profit_trailing(s, net_pct=1.0, cur_price=98.0, atr_pct=0.0,
+                                       ema9=97.0, ema9_rising=True)  # cur>ema9
+        self.assertFalse(r["sell"])
+        self.assertEqual(r["state"]["profit_breach_closes"], 0)
+
+    def test_breach_needs_ema9_downward(self):
+        # 트레일 이탈이지만 현재가 >= EMA9(하향이탈 아님) → 카운트 안 함
+        s = _profit_state(highest=100.0, active=True, high_net=3.0, closes=1)
+        r = R.evaluate_profit_trailing(s, net_pct=1.0, cur_price=98.0, atr_pct=0.0,
+                                       ema9=97.5, ema9_rising=False)  # cur>ema9
+        self.assertFalse(r["sell"])
+        self.assertEqual(r["state"]["profit_breach_closes"], 0)
+
+    def test_trail_plus_ema9_down_confirmed_sells(self):
+        s = _profit_state(highest=100.0, active=True, high_net=3.0, closes=1)
+        r = R.evaluate_profit_trailing(s, net_pct=1.0, cur_price=98.0, atr_pct=0.0,
+                                       ema9=99.0, ema9_rising=False)  # cur<ema9
+        self.assertTrue(r["sell"])
+
+
+# ══════════════════════════════════════════════════════════════
+# decide_management_action 통합 우선순위
+# ══════════════════════════════════════════════════════════════
+class DecideTest(unittest.TestCase):
+    def _ctx(self, atr_pct=0.0, ema9=None, rising=False):
+        return {"atr_pct": atr_pct, "ema9": ema9, "ema9_rising": rising}
+
+    def test_exit_pending_holds(self):
+        s = R.default_state(); s["management_mode"] = R.MODE_EXIT
+        d = R.decide_management_action(s, 3.0, 105.0, T0, ctx=self._ctx())
+        self.assertEqual(d.action, R.ACT_HOLD)
+
+    def test_net_minus_5_enters_recovery(self):
+        d = R.decide_management_action(R.default_state(highest_price=100.0),
+                                       -5.0, 95.0, T0, ctx=self._ctx())
+        self.assertEqual(d.state["management_mode"], R.MODE_RECOVERY)
+        self.assertFalse(d.sell)
+
+    def test_profit_trailing_governs_when_active(self):
+        # 최고 net +2 → 활성 → 트레일+EMA9하향 2회 확정 SELL
+        s = _profit_state(highest=100.0, active=True, high_net=2.0, closes=1)
+        d = R.decide_management_action(s, 1.0, 98.0, T0,
+                                       ctx=self._ctx(ema9=99.0, rising=False))
         self.assertTrue(d.sell)
+        self.assertIn("profit_trailing_exit", d.reason)
 
-    def test_repeated_restore_does_not_lower_highs(self):
-        s = _recovery_state(high_price=100.0)
-        R.bump_highest_price(s, 120.0)  # 최고가 120
-        # 반복 복원(낮은 현재가)로도 낮아지지 않음
-        R.bump_highest_price(s, 90.0)
-        self.assertEqual(s["highest_price"], 120.0)
-        # recovery_high 도 낮은 가격 재평가로 유지
-        d = R.evaluate(s, net_pct=-3.0, cur_price=95.0, now=T0 + timedelta(minutes=1))
-        self.assertEqual(d.state["recovery_high_price"], 100.0)
+    def test_new_position_defers_when_not_active(self):
+        # 신규(비복원), 트레일 미활성, net 낮음 → DEFER(기존 로직)
+        d = R.decide_management_action(R.default_state(highest_price=100.0),
+                                       0.5, 100.5, T0, ctx=self._ctx())
+        self.assertEqual(d.action, R.ACT_DEFER)
 
-    def test_legacy_json_defaults_safe(self):
-        # 구버전 JSON(신규 필드 없음) → 안전 기본값
-        legacy = {"code": "AAPL", "qty": 10, "avg_price": 50.0}
-        m = R.merge_state(legacy)
+    def test_recovered_holds_when_not_active(self):
+        # 복원 포지션, 트레일 미활성 → HOLD(고정익절 면제)
+        s = R.default_state(recovered=True, highest_price=100.0)
+        d = R.decide_management_action(s, 2.4, 102.4, T0, ctx=self._ctx())
+        # net +2.4 이나 highest=102.4 활성화(+2.4>=1.5) → 트레일 지배 HOLD
+        self.assertEqual(d.action, R.ACT_HOLD)
+        self.assertFalse(d.sell)
+
+    def test_recovered_not_profit_holds_no_defer(self):
+        s = R.default_state(recovered=True, highest_price=100.0)
+        d = R.decide_management_action(s, 0.5, 100.0, T0, ctx=self._ctx())
+        self.assertEqual(d.action, R.ACT_HOLD)   # 복원 → 면제 HOLD, DEFER 아님
+
+
+# ══════════════════════════════════════════════════════════════
+# 상태 병합/영속 안전
+# ══════════════════════════════════════════════════════════════
+class MergeTest(unittest.TestCase):
+    def test_legacy_defaults(self):
+        m = R.merge_state({"code": "AAPL", "qty": 10})
         self.assertEqual(m["management_mode"], R.MODE_NORMAL)
-        self.assertFalse(m["recovered"])
-        self.assertEqual(m["highest_price"], 0.0)
-        self.assertIsNone(m["recovery_started_at"])
+        self.assertFalse(m["recovery_trail_armed"])
+        self.assertEqual(m["profit_breach_closes"], 0)
 
-    def test_exit_pending_blocks_evaluation(self):
-        s = _recovery_state()
-        s["management_mode"] = R.MODE_EXIT
-        d = R.evaluate(s, net_pct=-6.0, cur_price=90.0, now=T0)
-        self.assertFalse(d.sell)  # EXIT_PENDING → 판정 보류(중복 SELL 금지)
-        self.assertEqual(d.mode, R.MODE_EXIT)
+    def test_preserves_recovery_state(self):
+        s = _recovery_state(high_price=105.0, armed=True)
+        m = R.merge_state(s)
+        self.assertEqual(m["management_mode"], R.MODE_RECOVERY)
+        self.assertTrue(m["recovery_trail_armed"])
+        self.assertEqual(m["recovery_high_price"], 105.0)
 
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class ManagementPriorityTest(unittest.TestCase):
-    """§8 통합 우선순위: 복원 면제 + 회복 우선."""
-    def test_new_normal_net_above_5_defers(self):
-        s = R.default_state(recovered=False)
-        d = R.decide_management_action(s, net_pct=-3.0, cur_price=97.0, now=T0)
-        self.assertEqual(d.action, R.ACT_DEFER)   # 기존 ①~⑩ 로직 사용
-
-    def test_new_position_minus_5_enters_recovery_not_defer(self):
-        s = R.default_state(recovered=False)
-        d = R.decide_management_action(s, net_pct=-5.0, cur_price=95.0, now=T0)
-        self.assertEqual(d.mode, R.MODE_RECOVERY)
-        self.assertFalse(d.sell)   # 즉시 -5% 손절 대체 → 즉시매도 금지
-
-    def test_recovered_normal_exempt_from_fixed_tp(self):
-        # 복원 포지션이 +2.5% 여도 고정익절 면제 → HOLD(DEFER 아님)
-        s = R.default_state(recovered=True)
-        d = R.decide_management_action(s, net_pct=2.5, cur_price=110.0, now=T0)
-        self.assertEqual(d.action, R.ACT_HOLD)
-        self.assertNotEqual(d.action, R.ACT_DEFER)
-
-    def test_recovered_profit_trailing_sells(self):
-        s = R.default_state(recovered=True)
-        # +2% 고점 후 +0.9% (-1.1%p) → 수익 트레일링 매도
-        d1 = R.decide_management_action(s, net_pct=2.0, cur_price=110.0, now=T0)
-        d2 = R.decide_management_action(d1.state, net_pct=0.9, cur_price=108.0,
-                                        now=T0 + timedelta(minutes=1))
-        self.assertTrue(d2.sell)
-
-    def test_recovery_precedes_ma_stop(self):
-        # RECOVERY 모드면 MA/−5% 로직보다 앞서 손실회복 판정(여기선 HOLD)
-        s = _recovery_state(high_price=100.0)
-        d = R.decide_management_action(s, net_pct=-4.5, cur_price=99.8,
-                                       now=T0 + timedelta(minutes=1))
-        self.assertIn(d.action, (R.ACT_HOLD, R.ACT_SELL_ALL))
-        self.assertNotEqual(d.action, R.ACT_DEFER)
-
-    def test_exit_pending_defers_to_hold(self):
-        s = _recovery_state(); s["management_mode"] = R.MODE_EXIT
-        d = R.decide_management_action(s, net_pct=-6.0, cur_price=90.0, now=T0)
-        self.assertFalse(d.sell)

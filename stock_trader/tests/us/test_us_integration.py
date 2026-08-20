@@ -63,10 +63,11 @@ def _snap(holdings, complete=True, ok=True):
             "holdings": holdings}
 
 
-def _iv(sell_score=0):
+def _iv(sell_score=0, ema9=0.0, ema9_rising=False, atr_pct=0.0):
     return {"sell_score": sell_score, "intraday_pct": 0.0, "rsi": 50.0,
             "vol_ratio": 2.0, "above_vwap": True, "macd_above": True,
-            "ema9": 0.0, "buy_score": 0, "vwap": 0.0, "sell_score": sell_score}
+            "ema9": ema9, "ema9_rising": ema9_rising, "atr_pct": atr_pct,
+            "buy_score": 0, "vwap": 0.0}
 
 
 SESS = {"session": "미국정규장", "tradeable": True}
@@ -112,10 +113,11 @@ class USIntegrationTest(unittest.TestCase):
     def _new_mgr(self):
         return USM.USStrategyManager(self.api)
 
-    def _manage(self, sym, cur, sell_score=0):
+    def _manage(self, sym, cur, sell_score=0, ema9=0.0, ema9_rising=False, atr_pct=0.0):
         pos = self.mgr.pos_mgr.positions[sym]
-        return self.mgr._manage_position(pos, sym, pos.name, pos.excd, cur,
-                                         _iv(sell_score), SESS)
+        return self.mgr._manage_position(
+            pos, sym, pos.name, pos.excd, cur,
+            _iv(sell_score, ema9=ema9, ema9_rising=ema9_rising, atr_pct=atr_pct), SESS)
 
     def _seed_internal(self, syms, qty=5, avg=50.0):
         for s in syms:
@@ -311,23 +313,26 @@ class USIntegrationTest(unittest.TestCase):
         self.assertEqual(len(self.api.sell_calls), 1)
         self.assertEqual(self.mgr.pos_mgr.positions["NNE"].management_mode, R.MODE_EXIT)
 
-    def test_recovery_high_drop_sells_once(self):
+    def test_recovery_trail_sells_after_armed(self):
+        # 진입(-5) → 회복(-3.5 이상, arm) → 고점 대비 -1.2% 이탈 → SELL 1회
         self.api.balance_full = _snap([_holding("IONQ", 10, 100.0, 100.0)])
         self.mgr.us_reconcile_positions()
-        self._manage("IONQ", 95.0)
-        self._manage("IONQ", 97.0)
-        r = self._manage("IONQ", 96.0)
+        self._manage("IONQ", 95.0)                 # net -5.25 → 진입(HOLD)
+        self._manage("IONQ", 97.0)                 # net -3.25(>=-3.5) → arm, high=97
+        self.assertTrue(self.mgr.pos_mgr.positions["IONQ"].mgmt["recovery_trail_armed"])
+        r = self._manage("IONQ", 95.8)             # (95.8-97)/97=-1.24% <=-1.2 → SELL
         self.assertEqual(len(self.api.sell_calls), 1)
         self.assertEqual(r["action"], "SELL_ACCEPTED")
 
-    def test_time_stop_sells_once(self):
+    def test_recovery_not_armed_holds_on_small_drop(self):
+        # -3.5 회복 전(작은 반등)에는 고점 이탈해도 매도하지 않음
         self.api.balance_full = _snap([_holding("QUBT", 10, 100.0, 100.0)])
         self.mgr.us_reconcile_positions()
-        self._manage("QUBT", 95.0)
-        p = self.mgr.pos_mgr.positions["QUBT"]
-        p.mgmt["recovery_started_at"] = (datetime.now() - timedelta(minutes=16)).isoformat()
-        self._manage("QUBT", 95.0)
-        self.assertEqual(len(self.api.sell_calls), 1)
+        self._manage("QUBT", 95.0)                 # 진입, high=95
+        self._manage("QUBT", 95.5)                 # net -4.75(<-3.5) → 미활성, high=95.5
+        r = self._manage("QUBT", 94.5)             # 고점 대비 하락이나 미활성 → HOLD
+        self.assertEqual(self.api.sell_calls, [])
+        self.assertFalse(self.mgr.pos_mgr.positions["QUBT"].mgmt["recovery_trail_armed"])
 
     # ══════════════════════════════════════════════════════════
     # EXIT_PENDING (item4/item5) + 체결 (item6)
@@ -420,13 +425,31 @@ class USIntegrationTest(unittest.TestCase):
         self.assertEqual(self.mgr.pnl_guard.realized_pnl, realized_before)  # 손익 무변경
 
     # ══════════════════════════════════════════════════════════
-    # 신규(비복원) 포지션은 기존 익절 정책 유지 (DEFER)
+    # 신규(비복원) 포지션: 고정 +2.5/+2.0 익절 비활성 → 동적 트레일이 지배
     # ══════════════════════════════════════════════════════════
-    def test_new_position_keeps_existing_takeprofit(self):
+    def test_fixed_takeprofit_disabled_dynamic_trail_governs(self):
         self.mgr.pos_mgr.add(USM.USPosition("IONQ", "IONQ", "NASD", 10, 100.0))
-        r = self._manage("IONQ", 103.0)   # net +2.75 → 기존 ① 무조건익절
+        # net +2.75(고점=103) → 예전 ① 무조건익절이면 즉시 SELL 이지만, 이제 비활성.
+        #   수익 트레일 활성(최고 net>=+1.5)만 되고 고점 유지 → HOLD(매도 없음).
+        r = self._manage("IONQ", 103.0)
+        self.assertEqual(self.api.sell_calls, [])
+        self.assertEqual(r["action"], "HOLD")
+        self.assertTrue(self.mgr.pos_mgr.positions["IONQ"].mgmt["profit_trail_active"])
+        # 이후 트레일 이탈(고점103 대비 -1%+) + EMA9 하향이탈 2회 종가 확정 → SELL
+        # 고점 갱신 방지 위해 103 미만 유지. cur=101.8 → drop=(101.8-103)/103=-1.16%<=-1.0
+        self._manage("IONQ", 101.8, ema9=102.5)   # 1회차(closes=1) → HOLD
+        self.assertEqual(self.api.sell_calls, [])
+        r2 = self._manage("IONQ", 101.8, ema9=102.5)   # 2회차 확정 → SELL
         self.assertEqual(len(self.api.sell_calls), 1)
-        self.assertEqual(r["action"], "SELL_ACCEPTED")
+        self.assertEqual(r2["action"], "SELL_ACCEPTED")
+
+    def test_profit_trail_ema9_uptrend_holds(self):
+        # EMA9 상승 + 현재가 > EMA9 → 트레일 이탈이어도 HOLD
+        self.mgr.pos_mgr.add(USM.USPosition("NNE", "NNE", "NASD", 10, 100.0))
+        self._manage("NNE", 103.0)                 # 활성화(고점 103)
+        r = self._manage("NNE", 101.5, ema9=101.0, ema9_rising=True)  # cur>ema9 상승
+        self.assertEqual(self.api.sell_calls, [])
+        self.assertEqual(r["action"], "HOLD")
 
     # ══════════════════════════════════════════════════════════
     # 동시성: KR 루프 + US 정합화 무데드락

@@ -169,24 +169,45 @@ class TrailingPolicyTest(unittest.TestCase):
 
 
 class USUnchangedTest(unittest.TestCase):
-    """미국 매도정책 미변경 확인(고정 익절 상수·분기 유지)."""
+    """미국 매도 파라미터 상수는 유지되나, +2.5/+2.0 고정익절 '분기'는 동적 수익
+    트레일링 도입으로 비활성화되었다(운영자 지시에 따른 의도적 변경).
+    ※ 이 클래스는 KR 트레일링 정책 변경이 US 를 건드리지 않았음을 보장하기 위한 것으로,
+      여기서 확인하는 것은 'US 소스 내용'이지 KR 로직이 아니다."""
 
-    def test_us_constants_unchanged(self):
+    def test_us_constants_defined(self):
         import strategies.us_strategy_manager as us
+        # 상수 자체는 제거하지 않는다(로그·기타 참조 유지).
         self.assertEqual(us.PROFIT_FULL_PCT, 2.0)
         self.assertEqual(us.PROFIT_SUPER_PCT, 2.5)
         self.assertEqual(us.PROFIT_TRAIL_PCT, 1.5)
         self.assertEqual(us.PROFIT_PARTIAL_KRW_US, 10_000)
         self.assertEqual(us.PROFIT_FULL_KRW_US, 30_000)
 
-    def test_us_source_retains_fixed_profit_branches(self):
-        """US 소스에 고정 익절 분기가 그대로 남아있다(정책 미변경)."""
+    def test_us_fixed_profit_branches_disabled_for_dynamic_trail(self):
+        """+2.5/+2.0 고정익절 '매도 분기'는 비활성화되고 동적 수익 트레일링이 지배한다."""
         path = os.path.join(_ROOT, "strategies", "us_strategy_manager.py")
         with open(path, encoding="utf-8") as f:
             src = f.read()
-        self.assertIn("+2.5%무조건전량익절", src)
-        self.assertIn("+2.0%전량익절", src)
-        self.assertIn("PROFIT_FULL_KRW_US", src)
+        # 고정익절 '매도 실행' 분기 문자열은 더 이상 없다(비활성화).
+        self.assertNotIn("+2.5%무조건전량익절", src)
+        self.assertNotIn("+2.0%전량익절", src)
+        # 동적 수익 트레일링(관리 경로)이 매도를 지배한다.
+        self.assertIn("_us_apply_management", src)
+        self.assertIn("고정익절", src)   # 비활성 사유 주석 존재
+
+    def test_us_recovery_uses_dynamic_atr_trail(self):
+        import strategies.us_recovery as r
+        # 손실 회복: -0.7 즉시매도 삭제, -3.5 활성, -1.2 최소 트레일, -6 하드손절
+        self.assertEqual(r.RECOVERY_ENTER_NET, -5.0)
+        self.assertEqual(r.RECOVERY_ARM_NET, -3.5)
+        self.assertEqual(r.RECOVERY_TRAIL_MIN, 1.2)
+        self.assertEqual(r.RECOVERY_HARD_NET, -6.0)
+        self.assertEqual(r.RECOVERY_EXIT_NET, -2.0)
+        self.assertFalse(hasattr(r, "RECOVERY_HIGH_DROP_PCT"))   # -0.7 규칙 삭제
+        # 수익 트레일링: +1.5 활성, ATR clamp 1.0~2.5
+        self.assertEqual(r.PROFIT_TRAIL_ACTIVATE_NET, 1.5)
+        self.assertEqual(r.PROFIT_TRAIL_MIN, 1.0)
+        self.assertEqual(r.PROFIT_TRAIL_MAX, 2.5)
 
 
 if __name__ == "__main__":
