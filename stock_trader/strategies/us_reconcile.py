@@ -21,12 +21,13 @@ Fail-safe 원칙(§6/C):
     broker 잔고에 다시 나타나면 reappeared 로 보고(호출부가 즉시 정상 복구).
 
 빈 잔고의 권위 판정(P0) — §7:
-  - broker holdings 가 '빈 목록(양성 보유 0)'인데 내부 active 포지션이 존재하면,
-    complete=True 라도 **권위 있는 0잔고로 확정하지 않는다**(authoritative=False,
-    buy_allowed=False). 단일 빈응답으로 내부 포지션을 격리/삭제/제외하지 않는다.
-    격리·삭제는 '양성 잔고 증거(broker 비어있지 않은 완전 스냅샷)' 또는 운영자 승인이
-    있을 때만 허용한다. authoritative_empty=True 는 **내부 active 포지션이 없을 때만**
-    성립한다(진짜 빈 계좌).
+  - broker holdings 가 '빈 목록(양성 보유 0)'인데 **내부 원장에 포지션이 존재**하면
+    (active 뿐 아니라 격리 포함 internal_count>0), complete=True 라도 **권위 있는
+    0잔고로 확정하지 않는다**(authoritative=False, buy_allowed=False). 단일 빈응답으로
+    내부 포지션을 신규 격리/삭제/제외하지 않으며 기존 격리분도 자동 해제하지 않는다.
+    격리 복구는 '양성 잔고 증거(broker 비어있지 않은 완전 스냅샷)의 재등장' 또는 운영자
+    수동 확인(us_manual_unquarantine_positions)으로만 허용한다. authoritative_empty=True
+    는 **내부 원장이 완전히 비었을 때만** 성립한다(진짜 빈 계좌).
 """
 from __future__ import annotations
 
@@ -147,15 +148,15 @@ def reconcile_decision(
 
     broker_syms = set(broker.keys())
 
-    # ★★ P0: broker 가 '빈 목록(양성 보유 0)'인데 내부 active 포지션이 존재하면 —
+    # ★★ P0: broker 가 '빈 목록(양성 보유 0)'인데 **내부 원장에 포지션이 존재**하면 —
     #   휴장·조회지연·빈응답·불완전 응답에서 흔히 발생 — '권위 있는 0잔고'로 확정하지
-    #   않는다(req1/req6). 단일 빈응답으로 격리·삭제·복원을 실행하지 않고,
-    #   authoritative=False·buy_allowed=False 로 처리한다. 내부 포지션은 그대로 유지되어
-    #   (호출부의 비권위 분기가 삭제/격리하지 않음) 시세감시·수익 트레일링·수동 SELL·
-    #   체결조회가 계속되고, exposure 는 내부 qty×avg 를 포함한다. 신규 BUY·ADD 만 차단.
-    #   → 명확한 '양성 잔고 증거(broker 비어있지 않음)' 또는 운영자 승인이 있을 때만
-    #     격리/삭제가 가능하다(정상 broker_absent 경로).
-    if len(broker_syms) == 0 and len(active_internal) > 0:
+    #   않는다(req1/req2). 판단 기준은 active 뿐 아니라 **격리 포함 internal_count 전체**다:
+    #   이미 전부 격리된 상태(active_internal=0, quarantined>0)에서도 broker0 이면
+    #   authoritative_empty 로 확정하면 안 되기 때문(이전 수정의 residue 결함).
+    #   단일 빈응답으로 신규 격리·삭제·복원을 실행하지 않고 authoritative=False·
+    #   buy_allowed=False 로 처리한다. 기존 격리분은 자동 해제하지 않으며(감사 유지),
+    #   운영자가 KIS 실보유를 확인해 us_manual_unquarantine_positions 로만 복구한다(req4/5).
+    if len(broker_syms) == 0 and len(internal) > 0:
         return ReconcileResult(
             authoritative=False, buy_allowed=False, complete=complete,
             authoritative_empty=False,
@@ -163,8 +164,9 @@ def reconcile_decision(
             broker_count=0, internal_count=len(internal),
             active_internal_count=len(active_internal),
             quarantined_count=len(quarantined), mismatch_count=0,
-            reason=("empty_broker_with_internal_active(ambiguous empty balance: "
-                    "no quarantine/delete/restore, block new BUY/ADD, keep positions active)"),
+            reason=("empty_broker_with_internal_ledger(ambiguous empty balance: "
+                    "internal_count>0 & broker_count==0 → not authoritative; "
+                    "no new quarantine/delete/restore, block new BUY/ADD, keep ledger)"),
         )
 
     to_restore, to_reconcile = [], []
