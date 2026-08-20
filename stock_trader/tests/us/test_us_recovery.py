@@ -28,10 +28,9 @@ def _recovery_state(high_price=100.0, high_net=-5.0):
     return s
 
 
-def _rec(state, net, cur, now=T1, atr=0.0, b5=None, b5c=None, acct=False, sym=False):
+def _rec(state, net, cur, now=T1, atr=0.0, b5=None, b5c=None, sym=False, atr_valid=True):
     return R.evaluate(state, net, cur, now, atr_pct=atr, bar5_ts=b5,
-                      bar5_close=b5c, account_risk_exceeded=acct,
-                      symbol_risk_exceeded=sym)
+                      bar5_close=b5c, symbol_risk_exceeded=sym, atr_valid=atr_valid)
 
 
 def _profit_state(highest=100.0, active=False, high_net=None, closes=0,
@@ -90,60 +89,49 @@ class NoFixedStopTest(unittest.TestCase):
 
 
 class LossSellConjunctionTest(unittest.TestCase):
-    """손실 매도는 '구조적 붕괴 연속 + 계좌위험 + 종목위험' **모두** 충족 시에만."""
-    def _confirm_struct(self, acct, sym):
-        # 연속 2봉 구조이탈 상태를 만들고 마지막 봉에서 위험조건을 적용
-        d = _rec(_recovery_state(100.0), -4.0, 96.0, atr=0.0, b5="c1", b5c=96.0,
-                 acct=acct, sym=sym)
-        return _rec(d.state, -4.2, 95.8, atr=0.0, b5="c2", b5c=95.8,
-                    acct=acct, sym=sym)
+    """개별 종목 손실 매도는 '구조적 붕괴 연속 2봉 AND 종목 금액손실 한도 초과'만.
+    계좌 위험한도는 개별 종목 매도 게이트가 아니다."""
+    def _confirm_struct(self, sym):
+        d = _rec(_recovery_state(100.0), -4.0, 96.0, atr=0.0, b5="c1", b5c=96.0, sym=sym)
+        return _rec(d.state, -4.2, 95.8, atr=0.0, b5="c2", b5c=95.8, sym=sym)
 
-    def test_all_three_sells(self):
-        d = self._confirm_struct(acct=True, sym=True)
+    def test_both_conditions_sell(self):
+        d = self._confirm_struct(sym=True)
         self.assertTrue(d.sell)
-        self.assertIn("structural_breakdown+account_risk+symbol_risk", d.reason)
+        self.assertIn("structural_breakdown+symbol_risk", d.reason)
 
     def test_struct_only_holds(self):
-        d = self._confirm_struct(acct=False, sym=False)
-        self.assertFalse(d.sell)               # 구조 확정이나 위험한도 미충족 → HOLD
+        d = self._confirm_struct(sym=False)         # 구조 확정이나 종목한도 미초과
+        self.assertFalse(d.sell)
         self.assertEqual(d.state["struct_breach_closes"], 2)
 
-    def test_struct_and_account_only_holds(self):
-        d = self._confirm_struct(acct=True, sym=False)   # 종목위험 없음
-        self.assertFalse(d.sell)
-
-    def test_struct_and_symbol_only_holds(self):
-        d = self._confirm_struct(acct=False, sym=True)   # 계좌위험 없음
-        self.assertFalse(d.sell)
-
-    def test_risks_without_struct_holds(self):
-        # 계좌+종목 위험이어도 구조적 붕괴 연속 미확인이면 매도 안 함(단순 하락 보호)
-        d = _rec(_recovery_state(100.0), -4.0, 96.0, atr=0.0, b5="c1", b5c=96.0,
-                 acct=True, sym=True)          # 구조 1봉만
-        self.assertFalse(d.sell)
-
-    def test_single_5m_breakdown_holds_even_with_risk(self):
-        d = _rec(_recovery_state(100.0), -4.0, 96.0, atr=0.0, b5="c1", b5c=96.0,
-                 acct=True, sym=True)
+    def test_symbol_only_without_struct_holds(self):
+        # 종목한도 초과이나 구조 연속 미확인(1봉) → HOLD (단순 하락 보호)
+        d = _rec(_recovery_state(100.0), -4.0, 96.0, atr=0.0, b5="c1", b5c=96.0, sym=True)
         self.assertFalse(d.sell)
         self.assertEqual(d.state["struct_breach_closes"], 1)
 
     def test_non_consecutive_resets(self):
-        d = _rec(_recovery_state(100.0), -4.0, 96.0, atr=0.0, b5="c1", b5c=96.0,
-                 acct=True, sym=True)
-        d = _rec(d.state, -2.5, 97.5, atr=0.0, b5="c2", b5c=97.5,
-                 acct=True, sym=True)          # 정상 5분봉 → 초기화
+        d = _rec(_recovery_state(100.0), -4.0, 96.0, atr=0.0, b5="c1", b5c=96.0, sym=True)
+        d = _rec(d.state, -2.5, 97.5, atr=0.0, b5="c2", b5c=97.5, sym=True)  # 정상 → 초기화
         self.assertEqual(d.state["struct_breach_closes"], 0)
         self.assertFalse(d.sell)
 
     def test_atr_widens_structural_distance(self):
-        d = _rec(_recovery_state(100.0), -4.0, 96.0, atr=2.0, b5="c1", b5c=96.0,
-                 acct=True, sym=True)          # 거리6% → -4% 미이탈
+        d = _rec(_recovery_state(100.0), -4.0, 96.0, atr=2.0, b5="c1", b5c=96.0, sym=True)
+        self.assertEqual(d.state["struct_breach_closes"], 0)   # 거리6% → -4% 미이탈
+
+    def test_atr_invalid_no_structural_sell(self):
+        # ATR 결측(atr_valid=False) → 구조 판정 보류(카운트도 안 함) → HOLD
+        d = _rec(_recovery_state(100.0), -4.0, 96.0, atr=0.0, b5="c1", b5c=96.0,
+                 sym=True, atr_valid=False)
+        d = _rec(d.state, -4.2, 95.8, atr=0.0, b5="c2", b5c=95.8,
+                 sym=True, atr_valid=False)
+        self.assertFalse(d.sell)
         self.assertEqual(d.state["struct_breach_closes"], 0)
 
     def test_no_5m_data_no_sell(self):
-        d = _rec(_recovery_state(100.0), -5.0, 95.0, b5=None, b5c=None,
-                 acct=True, sym=True)
+        d = _rec(_recovery_state(100.0), -5.0, 95.0, b5=None, b5c=None, sym=True)
         self.assertFalse(d.sell)
 
 
@@ -161,8 +149,8 @@ class RecoveryToNormalTest(unittest.TestCase):
     def test_crash_then_rebound_no_sell(self):
         # 급락 -5→-6 (경고) → 반등 → 0% 회복 → NORMAL, 매도 0회(구조붕괴/위험 미충족)
         d = _rec(R.default_state(highest_price=100.0), -5.0, 95.0, now=T0)   # 진입
-        d = _rec(d.state, -6.2, 93.8, b5="c1", b5c=93.8, acct=True, sym=True) # 급락, 단일봉
-        self.assertFalse(d.sell)                # 구조 1봉만 → 위험 충족해도 HOLD
+        d = _rec(d.state, -6.2, 93.8, b5="c1", b5c=93.8, sym=True)          # 급락, 단일봉
+        self.assertFalse(d.sell)                # 구조 1봉만 → 종목위험 충족해도 HOLD
         self.assertTrue(d.state["recovery_warn"])
         d = _rec(d.state, -3.0, 97.0)                                        # 반등
         self.assertFalse(d.sell)
@@ -185,13 +173,12 @@ class RecoveryAnalyticsTest(unittest.TestCase):
         self.assertEqual(rec["hypothetical_early_stop_net_pct"], -5.0)   # 조기손절 가상기준
         self.assertGreater(rec["recovery_seconds"], 0)
 
-    def test_records_on_structural_and_risk_sell(self):
-        d = _rec(_recovery_state(100.0), -4.0, 96.0, atr=0.0, b5="c1", b5c=96.0,
-                 acct=True, sym=True)
-        d = _rec(d.state, -4.2, 95.8, atr=0.0, b5="c2", b5c=95.8, acct=True, sym=True)
+    def test_records_on_structural_and_symbol_risk_sell(self):
+        d = _rec(_recovery_state(100.0), -4.0, 96.0, atr=0.0, b5="c1", b5c=96.0, sym=True)
+        d = _rec(d.state, -4.2, 95.8, atr=0.0, b5="c2", b5c=95.8, sym=True)
         self.assertTrue(d.sell)
         rec = d.state["recovery_last_outcome"]
-        self.assertEqual(rec["outcome"], "structural_and_risk_sell")
+        self.assertEqual(rec["outcome"], "structural_and_symbol_risk_sell")
         self.assertIsNotNone(rec["max_drawdown_net_pct"])
 
 
@@ -360,22 +347,22 @@ class DecideTest(unittest.TestCase):
         self.assertEqual(d.state["management_mode"], R.MODE_RECOVERY_WAIT)
         self.assertFalse(d.sell)
 
-    def test_account_risk_alone_holds(self):
-        # 계좌위험만으로는 손실 매도 안 함(구조붕괴+종목위험 동시 필요)
-        c = self._ctx(); c["account_risk_exceeded"] = True
-        d = R.decide_management_action(_recovery_state(100.0), -3.0, 97.0, T0, ctx=c)
-        self.assertFalse(d.sell)
-
-    def test_all_three_via_decide_sells(self):
-        c = self._ctx(b5="c1", b5c=96.0); c["account_risk_exceeded"] = True
+    def test_account_risk_not_a_symbol_sell_gate(self):
+        # 계좌위험 플래그가 있어도(그리고 종목위험까지) 구조 미확인이면 매도 안 함.
+        #   또한 계좌위험은 decide 의 개별 종목 매도 경로에서 아예 사용되지 않는다.
+        c = self._ctx(b5="c1", b5c=96.0)
+        c["account_risk_exceeded"] = True     # decide 가 무시해야 함
         c["symbol_risk_exceeded"] = True
         d = R.decide_management_action(_recovery_state(100.0), -4.0, 96.0, T0, ctx=c)
-        # 1봉만 → HOLD
-        self.assertFalse(d.sell)
-        c2 = self._ctx(b5="c2", b5c=95.8); c2["account_risk_exceeded"] = True
-        c2["symbol_risk_exceeded"] = True
+        self.assertFalse(d.sell)              # 구조 1봉 → HOLD
+
+    def test_struct_and_symbol_via_decide_sells(self):
+        c = self._ctx(b5="c1", b5c=96.0); c["symbol_risk_exceeded"] = True
+        d = R.decide_management_action(_recovery_state(100.0), -4.0, 96.0, T0, ctx=c)
+        self.assertFalse(d.sell)              # 1봉 → HOLD
+        c2 = self._ctx(b5="c2", b5c=95.8); c2["symbol_risk_exceeded"] = True
         d2 = R.decide_management_action(d.state, -4.2, 95.8, T1, ctx=c2)
-        self.assertTrue(d2.sell)
+        self.assertTrue(d2.sell)              # 연속 2봉 + 종목위험 → SELL (계좌 무관)
 
     def test_new_position_holds_not_defer(self):
         d = R.decide_management_action(R.default_state(highest_price=100.0),

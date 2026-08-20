@@ -32,6 +32,7 @@ def make_us_buy(order_avails, buy_results, fx=1300.0,
     buy_results : api.buy_us 반환 시퀀스(iter).
     """
     us = USStrategyManager.__new__(USStrategyManager)
+    us.US_MAX_LOSS_PER_SYMBOL_USD = 1e9   # 위험 사이징 비활성(KIS 예산 사이징에 집중)
     us.pos_mgr = FakePosMgr()
     us._us_pending_buy_meta = {}
     us._us_pending_sell_meta = {}
@@ -65,8 +66,11 @@ def make_us_buy(order_avails, buy_results, fx=1300.0,
 
 
 SESS = {"session": "정규장"}
+# atr_pct 유효값 부여(ATR 결측 fail-safe 회피). 위험 사이징은 make_us_buy 에서
+# US_MAX_LOSS 를 매우 크게 두어 비활성(이 파일은 KIS 예산 사이징에 집중).
 IV = {"buy_score": 1.0, "intraday_pct": 0.0, "vol_ratio": 1.0, "vwap": 0.0,
-      "above_vwap": True, "ema_bull": True, "rsi": 50.0, "pullback_breakout": False}
+      "above_vwap": True, "ema_bull": True, "rsi": 50.0, "pullback_breakout": False,
+      "atr_pct": 1.0}
 
 
 @patch.object(usm, "_US_JOURNAL_ENABLED", False)

@@ -275,17 +275,18 @@ def _recovery_outcome(s: dict, outcome: str, net_pct, cur_price, now) -> dict:
 def evaluate(state: dict, net_pct: float, cur_price: float, now: datetime,
              atr_pct: float = 0.0, bar5_ts: Optional[str] = None,
              bar5_close: Optional[float] = None,
-             account_risk_exceeded: bool = False,
-             symbol_risk_exceeded: bool = False) -> RecoveryDecision:
+             symbol_risk_exceeded: bool = False,
+             atr_valid: bool = True) -> RecoveryDecision:
     """손실 관리(RECOVERY_WAIT) 판정. EXIT/CLOSED → HOLD.
 
     목적: '정해진 손절률 준수'가 아니라 **누적 실현수익 극대화·불필요한 손실확정 최소화**.
     ★ 고정 -6% 전량손절 없음. -5%/-6% 는 상태 진입·관찰(경고) 기준. recovery high 대비
       '단순 하락'이나 '짧은 반등 실패'만으로 매도하지 않는다(0% 회복 기회 부여).
-    ★ 손실 매도는 **다음이 모두 동시 충족**될 때만 허용:
-        (1) 완성 5분봉 ATR 구조적 하락이 **연속 확인**(STRUCT_CONFIRM_BARS)  그리고
-        (2) account_risk_exceeded(계좌 위험한도 초과)                        그리고
-        (3) symbol_risk_exceeded(종목 위험한도 초과 — 호출부가 금액기준 판정)
+    ★ 개별 종목 손실 매도는 **다음 두 조건이 모두 동시 충족**될 때만 허용(계좌한도는
+      개별 종목 매도 게이트가 아니다 — 신규 BUY 차단/포트폴리오 위험축소에만 사용):
+        (1) 완성된 서로 다른 5분봉에서 ATR 구조적 하락이 **연속 2회**(STRUCT_CONFIRM_BARS)
+        (2) symbol_risk_exceeded(종목별 최대허용 금액손실 초과 — 호출부가 USD 기준 판정)
+      ATR 결측(atr_valid=False)·5분봉 없음이면 구조 판정 보류(HOLD, 추측 금지).
       net_pct >= 0.0 → NORMAL 복귀. 회복/청산 시 분석 레코드를 recovery_last_outcome 에 남긴다.
     """
     s = dict(state)
@@ -363,10 +364,10 @@ def evaluate(state: dict, net_pct: float, cur_price: float, now: datetime,
     if net_pct is not None and net_pct >= RECOVERY_SUCCESS_NET:
         s["recovery_reached_exit"] = True
 
-    # 손실 매도 — (1)구조적 붕괴 연속 확인 AND (2)계좌위험 AND (3)종목위험 **동시** 충족.
-    #   구조 카운트는 항상 갱신(정상 5분봉 끼면 초기화). 위험한도 미충족이면 HOLD(관찰).
+    # 개별 종목 손실 매도 — (1)구조적 붕괴 연속 2봉 AND (2)종목 금액손실 한도 초과 **동시**.
+    #   ATR 결측/5분봉 없음이면 구조 판정 보류(HOLD). 정상 5분봉 끼면 연속 초기화.
     struct_confirmed = False
-    if bar5_ts and bar5_close is not None and rhp and rhp > 0:
+    if atr_valid and bar5_ts and bar5_close is not None and rhp and rhp > 0:
         sstop = struct_stop_pct(atr_pct)
         b5drop = (float(bar5_close) - float(rhp)) / float(rhp) * 100.0
         breakdown = b5drop <= -sstop
@@ -375,12 +376,12 @@ def evaluate(state: dict, net_pct: float, cur_price: float, now: datetime,
             "last_struct_breach_bar_at", bar5_ts, breakdown)
         struct_confirmed = breakdown and closes >= STRUCT_CONFIRM_BARS
 
-    if struct_confirmed and account_risk_exceeded and symbol_risk_exceeded:
+    if struct_confirmed and symbol_risk_exceeded:
         s["recovery_last_outcome"] = _recovery_outcome(
-            s, "structural_and_risk_sell", net_pct, cur_price, now)
+            s, "structural_and_symbol_risk_sell", net_pct, cur_price, now)
         return RecoveryDecision(
             ACT_SELL_ALL, MODE_RECOVERY_WAIT,
-            "structural_breakdown+account_risk+symbol_risk("
+            "structural_breakdown+symbol_risk("
             f"net={net_pct:.2f}%,struct_closes={int(s.get('struct_breach_closes') or 0)})", s)
 
     return RecoveryDecision(ACT_HOLD, MODE_RECOVERY_WAIT, "recovery_wait_hold", s)
@@ -485,8 +486,8 @@ def decide_management_action(state: dict, net_pct: float, cur_price: float,
     bar1_close  = ctx.get("bar1_close")
     bar5_ts     = ctx.get("bar5_ts")
     bar5_close  = ctx.get("bar5_close")
-    account_risk_exceeded = bool(ctx.get("account_risk_exceeded"))
     symbol_risk_exceeded  = bool(ctx.get("symbol_risk_exceeded"))
+    atr_valid   = bool(ctx.get("atr_valid", True))
 
     mode = state.get("management_mode", MODE_NORMAL)
     if mode in (MODE_EXIT, MODE_CLOSED):
@@ -494,12 +495,12 @@ def decide_management_action(state: dict, net_pct: float, cur_price: float,
         return RecoveryDecision(ACT_HOLD, mode, "exit_pending_or_closed", s)
 
     # 1) 손실 관리(RECOVERY_WAIT 진입 포함) — 최우선.
-    #    손실 매도는 '구조적 5분봉 붕괴 연속 + 계좌위험 + 종목위험'이 **모두** 충족될 때만.
+    #    개별 종목 손실 매도는 '구조적 5분봉 붕괴 연속 2봉 + 종목 금액손실 한도 초과'가
+    #    **모두** 충족될 때만. (계좌 위험한도는 개별 종목 매도 게이트가 아니다.)
     if mode == MODE_RECOVERY_WAIT or (net_pct is not None and net_pct <= RECOVERY_ENTER_NET):
         return evaluate(state, net_pct, cur_price, now, atr_pct=atr_pct,
                         bar5_ts=bar5_ts, bar5_close=bar5_close,
-                        account_risk_exceeded=account_risk_exceeded,
-                        symbol_risk_exceeded=symbol_risk_exceeded)
+                        symbol_risk_exceeded=symbol_risk_exceeded, atr_valid=atr_valid)
 
     # 2) 수익 트레일링 — 활성 시 모든 NORMAL 포지션(복원/신규) 지배
     s = dict(state); s["last_evaluated_at"] = now.isoformat()
