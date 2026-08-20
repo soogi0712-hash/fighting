@@ -1659,6 +1659,40 @@ class KISApi:
             logger.error(f"[yfinance] {symbol} 현재가 폴백 실패: {e}")
             return {}
 
+    def get_us_intraday_bars(self, symbol: str, excd: str = "NASD",
+                             lookback_min: int = 90) -> list[dict]:
+        """해외주식 **1분봉** 조회(종가확정 전용, US 전용, 부수효과 없음).
+
+        반환: [{"ts": datetime(tz-aware), "close": float}, ...] 오름차순.
+          · ts 는 yfinance DatetimeIndex(거래소 tz-aware) 를 그대로 전달한다.
+            호출부/정규화기가 UTC 로 변환해 동일 봉 중복을 방지한다.
+          · 실패/데이터 없음 → [] (호출부는 확정봉 매도판정을 보류; 실시간가 기반
+            하드손절·급락 안전매도는 계속 동작).
+        ※ KR 로직과 완전히 분리된 신규 US 전용 메서드. yfinance 1m 사용.
+        """
+        try:
+            import yfinance as yf
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(period="1d", interval="1m", auto_adjust=True)
+            if df is None or df.empty:
+                df = ticker.history(period="2d", interval="1m", auto_adjust=True)
+            if df is None or df.empty:
+                return []
+            df = df.tail(max(1, int(lookback_min)))
+            out = []
+            for idx, row in df.iterrows():
+                try:
+                    ts = idx.to_pydatetime()   # tz-aware(거래소 tz)
+                    close = float(row["Close"])
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    continue
+                if close > 0:
+                    out.append({"ts": ts, "close": close})
+            return out
+        except Exception as e:
+            logger.debug(f"[US 1분봉] {symbol} 조회 실패(확정봉 매도판정 보류): {e}")
+            return []
+
     def get_us_ohlcv(self, symbol: str, excd: str = "NASD",
                      count: int = 100) -> list[dict]:
         """

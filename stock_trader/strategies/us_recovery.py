@@ -98,14 +98,16 @@ def default_state(recovered: bool = False, highest_price: float = 0.0,
         "recovery_high_net_pct": None,
         "recovery_trail_armed":  False,   # net>=-3.5 회복 시 True(sticky)
         "recovery_reached_exit": False,   # net>=-2.0 회복 성공 표시(보호 유지)
-        # ── 회복 트레일 종가 확인(봉 중복 방지) ──
+        # ── 회복 트레일 '완료봉' 연속 확인(봉 중복/역행/늦은정정 처리) ──
         "recovery_breach_closes":   0,
+        "recovery_prev_breach_closes": 0,   # 직전 봉 처리 전 카운트(늦은정정 복원용)
         "last_recovery_breach_bar_at": None,
         # ── 수익 트레일링 ──
         "profit_trail_active":   False,
         "profit_high_net_pct":   None,
-        # ── 수익 트레일 종가 확인(봉 중복 방지) ──
+        # ── 수익 트레일 '완료봉' 연속 확인(봉 중복/역행/늦은정정 처리) ──
         "profit_breach_closes":  0,
+        "profit_prev_breach_closes": 0,
         "last_profit_breach_bar_at": None,
         "last_evaluated_at":     (now.isoformat() if now else None),
         "exit_pending_ref":      None,
@@ -131,7 +133,8 @@ def merge_state(raw: Optional[dict]) -> dict:
     out["recovery_trail_armed"] = bool(out.get("recovery_trail_armed"))
     out["recovery_reached_exit"] = bool(out.get("recovery_reached_exit"))
     out["quarantined"] = bool(out.get("quarantined"))
-    for ck in ("profit_breach_closes", "recovery_breach_closes"):
+    for ck in ("profit_breach_closes", "profit_prev_breach_closes",
+               "recovery_breach_closes", "recovery_prev_breach_closes"):
         try:
             out[ck] = int(out.get(ck) or 0)
         except (TypeError, ValueError):
@@ -160,25 +163,39 @@ def bump_highest_price(state: dict, cur_price: float) -> dict:
     return state
 
 
-def _count_breach_bar(state: dict, closes_key: str, last_key: str,
-                      bar_ts: Optional[str]) -> int:
-    """트레일 이탈 확정 카운터. **서로 다른 마감 완료 봉(bar_ts)** 만 센다.
-    - bar_ts is None(미완성/미상) → 증가하지 않음(현재값 반환).
-    - bar_ts == 마지막 확인봉 → 증가하지 않음(동일 봉 중복 방지).
-    - 새 완료봉 → +1, last 갱신.
+def _update_breach_count(state: dict, closes_key: str, prev_key: str,
+                         last_key: str, bar_ts: Optional[str], is_breach: bool) -> int:
+    """'완료봉' 기반 **연속(consecutive)** 이탈 카운터 갱신. 반환: 갱신된 count.
+
+    규칙(§3/§4):
+      - bar_ts None(데이터 없음/미완성/미상) → 변경 없음(현재값 반환, 판정 보류).
+      - bar_ts < last(역행) → 무시(변경 없음).
+      - bar_ts == last(동일 봉 중복/늦은 정정) → **직전 카운트(prev)로부터 재계산**:
+          이탈이면 prev+1, 정상이면 0. (늦게 정상 종가로 바뀌면 안전하게 교정)
+      - 새 완료봉 → prev 저장 후, 이탈이면 prev+1, 정상봉이면 0(연속 초기화).
     """
-    cur = int(state.get(closes_key) or 0)
     if not bar_ts:
-        return cur
-    if state.get(last_key) == bar_ts:
-        return cur
+        return int(state.get(closes_key) or 0)
+    last = state.get(last_key)
+    if last is not None and str(bar_ts) < str(last):
+        return int(state.get(closes_key) or 0)   # 역행 무시
+    if last == bar_ts:
+        prev = int(state.get(prev_key) or 0)
+        cnt = (prev + 1) if is_breach else 0
+        state[closes_key] = cnt
+        return cnt
+    # 새 완료봉
+    prev = int(state.get(closes_key) or 0)
+    state[prev_key] = prev
+    cnt = (prev + 1) if is_breach else 0
+    state[closes_key] = cnt
     state[last_key] = bar_ts
-    state[closes_key] = cur + 1
-    return state[closes_key]
+    return cnt
 
 
-def _reset_breach(state: dict, closes_key: str, last_key: str) -> None:
+def _reset_breach(state: dict, closes_key: str, prev_key: str, last_key: str) -> None:
     state[closes_key] = 0
+    state[prev_key] = 0
     state[last_key] = None
 
 
@@ -186,8 +203,13 @@ def _reset_breach(state: dict, closes_key: str, last_key: str) -> None:
 # 손실 회복
 # ══════════════════════════════════════════════════════════════
 def evaluate(state: dict, net_pct: float, cur_price: float, now: datetime,
-             atr_pct: float = 0.0, bar1_ts: Optional[str] = None) -> RecoveryDecision:
-    """손실 회복 판정. EXIT/CLOSED 이면 HOLD. SELL_ALL 이면 호출부가 EXIT_PENDING 설정."""
+             atr_pct: float = 0.0, bar1_ts: Optional[str] = None,
+             bar1_close: Optional[float] = None) -> RecoveryDecision:
+    """손실 회복 판정. EXIT/CLOSED 이면 HOLD. SELL_ALL 이면 호출부가 EXIT_PENDING 설정.
+
+    cur_price(실시간)는 하드손절·급락 안전매도에, bar1_close(완료봉 종가)는 트레일
+    확정에 쓴다(§4/§5). bar1_ts/close None(데이터 없음) → 확정봉 매도 보류.
+    """
     s = dict(state)
     s["last_evaluated_at"] = now.isoformat()
     mode = s.get("management_mode", MODE_NORMAL)
@@ -206,7 +228,8 @@ def evaluate(state: dict, net_pct: float, cur_price: float, now: datetime,
             s["recovery_high_net_pct"]  = float(net_pct)
             s["recovery_trail_armed"]   = False
             s["recovery_reached_exit"]  = False
-            _reset_breach(s, "recovery_breach_closes", "last_recovery_breach_bar_at")
+            _reset_breach(s, "recovery_breach_closes",
+                          "recovery_prev_breach_closes", "last_recovery_breach_bar_at")
             return RecoveryDecision(ACT_HOLD, MODE_RECOVERY,
                                     f"recovery_enter(net={net_pct:.2f}%)", s)
         return RecoveryDecision(ACT_HOLD, MODE_NORMAL, "normal_hold", s)
@@ -236,7 +259,8 @@ def evaluate(state: dict, net_pct: float, cur_price: float, now: datetime,
         s["recovery_high_net_pct"]  = None
         s["recovery_trail_armed"]   = False
         s["recovery_reached_exit"]  = False
-        _reset_breach(s, "recovery_breach_closes", "last_recovery_breach_bar_at")
+        _reset_breach(s, "recovery_breach_closes",
+                      "recovery_prev_breach_closes", "last_recovery_breach_bar_at")
         return RecoveryDecision(ACT_HOLD, MODE_NORMAL,
                                 f"recovery_exit_to_normal(net={net_pct:.2f}%>=0)", s)
 
@@ -249,27 +273,28 @@ def evaluate(state: dict, net_pct: float, cur_price: float, now: datetime,
             and net_pct >= RECOVERY_ARM_NET:
         s["recovery_trail_armed"] = True
 
-    # 활성 시: recovery high 대비 동적 트레일(확정봉/급락) → SELL_ALL
-    if s.get("recovery_trail_armed") and rhp and rhp > 0 and cur_price is not None:
+    # 활성 시: recovery high 대비 동적 트레일 → SELL_ALL
+    if s.get("recovery_trail_armed") and rhp and rhp > 0:
         trail_pct = _clamp(float(atr_pct or 0.0) * RECOVERY_TRAIL_ATR_MULT,
                            RECOVERY_TRAIL_MIN, RECOVERY_TRAIL_MAX)
-        drop = (float(cur_price) - float(rhp)) / float(rhp) * 100.0
-        if drop <= -trail_pct:
-            # 급락(추가 0.5%p) → 봉 확인 없이 즉시 안전매도
-            if drop <= -(trail_pct + RECOVERY_TRAIL_PANIC_EXTRA):
+        # (a) 급락 안전매도 — 실시간 가격 기준(데이터 없어도 동작)
+        if cur_price is not None:
+            live_drop = (float(cur_price) - float(rhp)) / float(rhp) * 100.0
+            if live_drop <= -(trail_pct + RECOVERY_TRAIL_PANIC_EXTRA):
                 return RecoveryDecision(
                     ACT_SELL_ALL, MODE_RECOVERY,
-                    f"recovery_trail_panic(drop={drop:.2f}%<=-{trail_pct + RECOVERY_TRAIL_PANIC_EXTRA:.2f}%)", s)
-            closes = _count_breach_bar(s, "recovery_breach_closes",
-                                       "last_recovery_breach_bar_at", bar1_ts)
-            if closes >= RECOVERY_TRAIL_CONFIRM_BARS:
+                    f"recovery_trail_panic(live_drop={live_drop:.2f}%)", s)
+        # (b) 완료봉 종가 기준 확정 이탈 — 정상봉 끼면 연속 초기화(§5)
+        if bar1_ts and bar1_close is not None:
+            bdrop = (float(bar1_close) - float(rhp)) / float(rhp) * 100.0
+            breach = bdrop <= -trail_pct
+            closes = _update_breach_count(
+                s, "recovery_breach_closes", "recovery_prev_breach_closes",
+                "last_recovery_breach_bar_at", bar1_ts, breach)
+            if breach and closes >= RECOVERY_TRAIL_CONFIRM_BARS:
                 return RecoveryDecision(
                     ACT_SELL_ALL, MODE_RECOVERY,
-                    f"recovery_trail_exit(drop={drop:.2f}%<=-{trail_pct:.2f}%,closes={closes})", s)
-            return RecoveryDecision(ACT_HOLD, MODE_RECOVERY,
-                                    f"recovery_trail_pending(closes={closes})", s)
-        else:
-            _reset_breach(s, "recovery_breach_closes", "last_recovery_breach_bar_at")
+                    f"recovery_trail_exit(bar_drop={bdrop:.2f}%,closes={closes})", s)
 
     return RecoveryDecision(ACT_HOLD, MODE_RECOVERY, "recovery_hold", s)
 
@@ -281,12 +306,18 @@ def evaluate_profit_trailing(state: dict, net_pct: float, cur_price: float,
                              atr_pct: float = 0.0, ema9: Optional[float] = None,
                              ema9_rising: bool = False,
                              bar1_ts: Optional[str] = None,
-                             bar5_ts: Optional[str] = None) -> dict:
+                             bar1_close: Optional[float] = None,
+                             bar5_ts: Optional[str] = None,
+                             bar5_close: Optional[float] = None) -> dict:
     """수익 트레일링 순수 판정. 반환: {"activate","sell","state","reason"}.
 
-    bar1_ts : 현재 '완료된' 1분봉 타임스탬프(미완성/미상이면 None → 확인봉 아님).
-    bar5_ts : 트레일 아래 마감한 '완료된' 5분봉 타임스탬프(있으면 즉시 확정).
-    EMA9 상승은 veto 가 아니다(2봉 확정 시 매도). EMA9 하락/종가<EMA9 는 1봉 가속.
+    cur_price(실시간)는 급락 안전매도에만, **bar1_close/bar5_close(완료봉 종가)** 는
+    트레일 확정에 쓴다(§2/§4). bar_ts None(데이터 없음/미완성) → 확정봉 매도 보류.
+      · 서로 다른 '연속' 완료 1분봉 2개가 트레일 아래 마감 → SELL(EMA9 무관).
+      · 완료 5분봉 1개가 트레일 아래 마감 → SELL.
+      · 트레일 이탈(완료봉) + (EMA9 하락 or 종가<EMA9) → 완료봉 1개로 빠른 SELL.
+      · 실시간가 급락(동적폭 +0.5%p) → 봉 없이 즉시 안전매도.
+    정상봉이 끼면 연속 카운트 초기화. EMA9 상승은 veto 아님.
     """
     s = dict(state)
     hi = s.get("profit_high_net_pct")
@@ -301,50 +332,50 @@ def evaluate_profit_trailing(state: dict, net_pct: float, cur_price: float,
         activate = True
 
     if not s.get("profit_trail_active"):
-        _reset_breach(s, "profit_breach_closes", "last_profit_breach_bar_at")
+        _reset_breach(s, "profit_breach_closes",
+                      "profit_prev_breach_closes", "last_profit_breach_bar_at")
         return {"activate": activate, "sell": False, "state": s,
                 "reason": "profit_trail_inactive"}
 
     trail_pct = _clamp(float(atr_pct or 0.0) * PROFIT_TRAIL_ATR_MULT,
                        PROFIT_TRAIL_MIN, PROFIT_TRAIL_MAX)
     highest = float(s.get("highest_price") or 0.0)
-    drop = (((float(cur_price) - highest) / highest * 100.0)
-            if (highest > 0 and cur_price is not None) else 0.0)
 
-    if drop > -trail_pct:
-        # 이탈 아님 → 카운터 리셋(단일 순간 이탈 무시)
-        _reset_breach(s, "profit_breach_closes", "last_profit_breach_bar_at")
-        return {"activate": activate, "sell": False, "state": s,
-                "reason": "profit_trail_hold"}
+    # (a) 급락 안전매도 — 실시간 가격 기준(데이터 없어도 동작)
+    if highest > 0 and cur_price is not None:
+        live_drop = (float(cur_price) - highest) / highest * 100.0
+        if live_drop <= -(trail_pct + PROFIT_TRAIL_PANIC_EXTRA):
+            return {"activate": activate, "sell": True, "state": s,
+                    "reason": f"profit_trail_panic(live_drop={live_drop:.2f}%)"}
 
-    # 급락(추가 0.5%p) → 봉 확인 없이 즉시 안전매도
-    if drop <= -(trail_pct + PROFIT_TRAIL_PANIC_EXTRA):
-        return {"activate": activate, "sell": True, "state": s,
-                "reason": (f"profit_trail_panic(drop={drop:.2f}%<="
-                           f"-{trail_pct + PROFIT_TRAIL_PANIC_EXTRA:.2f}%)")}
+    # (b) 완료 5분봉 종가가 트레일 아래 → 즉시 확정
+    if bar5_ts and bar5_close is not None and highest > 0:
+        d5 = (float(bar5_close) - highest) / highest * 100.0
+        if d5 <= -trail_pct:
+            return {"activate": activate, "sell": True, "state": s,
+                    "reason": f"profit_trail_bar5_close(bar_drop={d5:.2f}%)"}
 
-    # 완성된 5분봉이 트레일 아래 마감 → 즉시 확정
-    if bar5_ts:
-        return {"activate": activate, "sell": True, "state": s,
-                "reason": f"profit_trail_bar5_close(drop={drop:.2f}%<=-{trail_pct:.2f}%)"}
-
-    # 서로 다른 완료 1분봉 카운트(봉 중복 방지)
-    closes = _count_breach_bar(s, "profit_breach_closes",
-                               "last_profit_breach_bar_at", bar1_ts)
-    ema9_down = (ema9 is not None and cur_price is not None
-                 and float(cur_price) < float(ema9))
-    fast = (not ema9_rising) or ema9_down   # EMA9 하락/종가<EMA9 → 1봉 가속
-
-    if fast and closes >= 1:
-        return {"activate": activate, "sell": True, "state": s,
-                "reason": (f"profit_trail_fast(drop={drop:.2f}%,ema9_down={ema9_down},"
-                           f"rising={ema9_rising},closes={closes})")}
-    if closes >= PROFIT_TRAIL_CONFIRM_BARS:
-        return {"activate": activate, "sell": True, "state": s,
-                "reason": f"profit_trail_confirm(drop={drop:.2f}%,closes={closes}>=2)"}
+    # (c) 완료 1분봉 종가 기준 '연속' 확정 — 정상봉 끼면 초기화(§3)
+    if bar1_ts and bar1_close is not None and highest > 0:
+        d1 = (float(bar1_close) - highest) / highest * 100.0
+        breach = d1 <= -trail_pct
+        closes = _update_breach_count(
+            s, "profit_breach_closes", "profit_prev_breach_closes",
+            "last_profit_breach_bar_at", bar1_ts, breach)
+        if breach:
+            ema9_down = ((ema9 is not None and float(bar1_close) < float(ema9))
+                         or (not ema9_rising))
+            if closes >= 1 and ema9_down:
+                return {"activate": activate, "sell": True, "state": s,
+                        "reason": (f"profit_trail_fast(bar_drop={d1:.2f}%,"
+                                   f"ema9_down={ema9_down},closes={closes})")}
+            if closes >= PROFIT_TRAIL_CONFIRM_BARS:
+                return {"activate": activate, "sell": True, "state": s,
+                        "reason": f"profit_trail_confirm(bar_drop={d1:.2f}%,closes={closes})"}
 
     return {"activate": activate, "sell": False, "state": s,
-            "reason": f"profit_trail_pending(drop={drop:.2f}%,closes={closes})"}
+            "reason": ("profit_trail_pending("
+                       f"closes={int(s.get('profit_breach_closes') or 0)})")}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -364,7 +395,9 @@ def decide_management_action(state: dict, net_pct: float, cur_price: float,
     ema9        = ctx.get("ema9")
     ema9_rising = bool(ctx.get("ema9_rising"))
     bar1_ts     = ctx.get("bar1_ts")
+    bar1_close  = ctx.get("bar1_close")
     bar5_ts     = ctx.get("bar5_ts")
+    bar5_close  = ctx.get("bar5_close")
 
     mode = state.get("management_mode", MODE_NORMAL)
     if mode in (MODE_EXIT, MODE_CLOSED):
@@ -373,13 +406,16 @@ def decide_management_action(state: dict, net_pct: float, cur_price: float,
 
     # 1) 손실 회복(진입 포함) — 최우선
     if mode == MODE_RECOVERY or (net_pct is not None and net_pct <= RECOVERY_ENTER_NET):
-        return evaluate(state, net_pct, cur_price, now, atr_pct=atr_pct, bar1_ts=bar1_ts)
+        return evaluate(state, net_pct, cur_price, now, atr_pct=atr_pct,
+                        bar1_ts=bar1_ts, bar1_close=bar1_close)
 
     # 2) 수익 트레일링 — 활성 시 모든 NORMAL 포지션(복원/신규) 지배
     s = dict(state); s["last_evaluated_at"] = now.isoformat()
     bump_highest_price(s, cur_price)
     pt = evaluate_profit_trailing(s, net_pct, cur_price, atr_pct=atr_pct, ema9=ema9,
-                                  ema9_rising=ema9_rising, bar1_ts=bar1_ts, bar5_ts=bar5_ts)
+                                  ema9_rising=ema9_rising, bar1_ts=bar1_ts,
+                                  bar1_close=bar1_close, bar5_ts=bar5_ts,
+                                  bar5_close=bar5_close)
     s = pt["state"]
     if pt["sell"]:
         return RecoveryDecision(ACT_SELL_ALL, MODE_NORMAL,
