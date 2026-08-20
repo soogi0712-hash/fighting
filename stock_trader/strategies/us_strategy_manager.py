@@ -2463,6 +2463,94 @@ class USStrategyManager:
         return {"ok": bool(unq), "unquarantined": unq, "skipped": skipped,
                 "count": len(unq), "operator": str(operator), "reason": str(reason or "")}
 
+    def us_manual_remove_quarantined_positions(
+            self, symbols, operator: str, reason: str,
+            verified_no_holdings: bool = False,
+            verified_no_open_orders: bool = False) -> dict:
+        """운영자가 KIS 앱에서 **실보유 0·미체결 0** 을 확인한 경우에만, 격리된 stale
+        포지션을 감사기록과 함께 내부 원장에서 제거한다(docker exec one-off 전용).
+
+        ★ 매도·체결·실현손익으로 기록하지 않는다(req5). 내부 stale position·management
+          state·quarantine metadata 만 일관되게 제거한다. active 포지션이거나 활성
+          BUY/SELL pending 이 하나라도 있는 종목은 제거를 거부한다(req4). 대상 외 포지션·
+          국내 데이터는 변경하지 않는다(req6). 중간 실패로 일부만 삭제되지 않도록 **사전검사
+          통과 후에만** 제거하고, 저장 실패 시 원상 롤백한다(원자성, req6). DB 직접수정·
+          포지션 파일 강제삭제 없이 pos_mgr 표준 경로(dict pop + 원자 save)만 사용한다.
+        """
+        now_iso = datetime.now().isoformat()
+        syms = [str(s).upper() for s in (symbols or []) if str(s).strip()]
+        # 운영자 이중 확인(보유0·미체결0) + operator 필수(req3)
+        if not (verified_no_holdings and verified_no_open_orders) or not str(operator or "").strip():
+            logger.warning(
+                "[US수동stale제거] 거부: 운영자 확인 필요"
+                "(no_holdings=%s, no_open_orders=%s, operator=%r)",
+                verified_no_holdings, verified_no_open_orders, operator)
+            return {"ok": False, "reason": "operator_verification_required",
+                    "removed": [], "refused": syms, "count": 0}
+        if not syms:
+            return {"ok": False, "reason": "no_symbols", "removed": [], "refused": [], "count": 0}
+        # ── 사전검사(원자성): 하나라도 부적격이면 전체 거부(부분삭제 금지, req6) ──
+        problems = []
+        for s in syms:
+            p = self.pos_mgr.positions.get(s)
+            if p is None:
+                problems.append((s, "not_found"))
+            elif not p.is_quarantined:
+                problems.append((s, "active_not_quarantined"))          # active 제거 거부(req4)
+            elif (self._us_has_active_order(s, "BUY")
+                  or self._us_has_active_order(s, "SELL")):
+                problems.append((s, "has_active_pending_order"))        # 미체결 존재 거부(req4)
+        if problems:
+            logger.warning("[US수동stale제거] 사전검사 실패 → 전체 거부(부분삭제 없음): %s",
+                           problems)
+            return {"ok": False, "reason": "precheck_failed", "removed": [],
+                    "refused": [s for s, _ in problems], "count": 0,
+                    "problems": [{"symbol": s, "why": w} for s, w in problems]}
+        # ── 원자 제거: 매핑 백업 → dict 에서 제거 → 저장. 저장 실패 시 롤백 ──
+        audit, backup = [], dict(self.pos_mgr.positions)
+        for s in syms:
+            p = self.pos_mgr.positions.get(s)
+            audit.append({
+                "ts": now_iso, "symbol": s, "operator": str(operator),
+                "reason": str(reason or ""), "verified_no_holdings": True,
+                "verified_no_open_orders": True,
+                "prior_quarantine": dict(p.mgmt.get("quarantine") or {}),
+                "qty": int(getattr(p, "qty", 0) or 0),
+                "avg_price": float(getattr(p, "avg_price", 0.0) or 0.0),
+                "action": "stale_ledger_removal(not a sell/fill)"})
+            self.pos_mgr.positions.pop(s, None)   # 내부 stale 원장·mgmt·격리메타 일괄 제거
+        try:
+            self.pos_mgr.save()   # 원자 저장(temp+fsync+replace)
+        except Exception as _se:
+            self.pos_mgr.positions.clear()
+            self.pos_mgr.positions.update(backup)   # 롤백(부분삭제 방지)
+            logger.error("[US수동stale제거] 저장 실패 → 롤백(삭제 취소): %s", _se)
+            return {"ok": False, "reason": "save_failed_rolled_back",
+                    "removed": [], "refused": syms, "count": 0}
+        for s in syms:
+            self._us_maxloss_bad.discard(s)
+        # 내부 원장이 완전히 비었으면(운영자 0보유·0미체결 확인) 신규 BUY 게이트 정상화(req7)
+        if len(self.pos_mgr.positions) == 0:
+            self._us_buy_gate_ok = True
+            self._us_buy_gate_reason = ""
+        try:                      # 감사 JSONL(추가 전용, PII 없음)
+            _path = os.path.join(os.path.dirname(US_POSITIONS_FILE),
+                                 "us_stale_removal_audit.jsonl")
+            with self._us_analytics_lock:
+                os.makedirs(os.path.dirname(_path), exist_ok=True)
+                with open(_path, "a", encoding="utf-8") as f:
+                    for rec in audit:
+                        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    f.flush()
+        except Exception as _we:
+            logger.debug("[US수동stale제거] 감사 JSONL 기록 실패(무해): %s", _we)
+        logger.warning(
+            "[US수동stale제거] %d종목 stale 원장 제거 완료(operator=%s, reason=%s): %s "
+            "(매도·체결·손익 기록 아님)", len(syms), operator, reason, syms)
+        return {"ok": True, "removed": syms, "refused": [], "count": len(syms),
+                "internal_count": len(self.pos_mgr.positions),
+                "operator": str(operator), "reason": str(reason or "")}
+
     def us_position_health(self) -> list:
         """보유종목별 관리 관찰 스냅샷 — /api/status 노출(PII 없음).
 

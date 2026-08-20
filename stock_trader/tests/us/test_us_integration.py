@@ -424,6 +424,77 @@ class USIntegrationTest(unittest.TestCase):
         self.assertIn("AAA", r2["skipped"])   # 이미 active
         self.assertIn("ZZZ", r2["skipped"])   # 미존재
 
+    # ── 운영자 확인 후 stale 격리 포지션 제거(매도/체결 아님) ─────────────
+    def test_manual_remove_stale_after_verification(self):
+        # stale 격리 9 + broker0 + pending0 → 미확인 제거 거부, 확인 후 9건 제거, 재시작 0 유지
+        self._seed_internal(INTERNAL_9)
+        self._quarantine_all(INTERNAL_9)
+        self.api.balance_full = _snap([], complete=True)
+        self.mgr.us_reconcile_positions()   # fail-safe: authoritative False, 격리 보존
+        self.assertEqual(len(self.mgr.pos_mgr.quarantined_positions()), 9)
+        # 미확인(플래그 누락) 제거 거부(req3)
+        r0 = self.mgr.us_manual_remove_quarantined_positions(
+            INTERNAL_9, operator="opA", reason="x")
+        self.assertFalse(r0["ok"])
+        self.assertEqual(r0["reason"], "operator_verification_required")
+        r0b = self.mgr.us_manual_remove_quarantined_positions(
+            INTERNAL_9, operator="opA", reason="x",
+            verified_no_holdings=True, verified_no_open_orders=False)   # 한쪽만
+        self.assertFalse(r0b["ok"])
+        self.assertEqual(len(self.mgr.pos_mgr.positions), 9)            # 변경 없음
+        # 보유0·미체결0 확인 후 9건 제거(req2)
+        r1 = self.mgr.us_manual_remove_quarantined_positions(
+            INTERNAL_9, operator="opA", reason="KIS앱 실보유0·미체결0 확인",
+            verified_no_holdings=True, verified_no_open_orders=True)
+        self.assertTrue(r1["ok"])
+        self.assertEqual(r1["count"], 9)
+        self.assertEqual(self.api.sell_calls, [])                      # 매도 기록 아님(req5)
+        # 목표 상태(req7): internal 0, active 0, quarantine 0, held 0, inflight 0, buy_ok true
+        self.assertEqual(len(self.mgr.pos_mgr.positions), 0)
+        self.assertEqual(len(self.mgr.pos_mgr.active_positions()), 0)
+        self.assertEqual(len(self.mgr.pos_mgr.quarantined_positions()), 0)
+        exp = self.mgr.us_exposure_health()
+        self.assertEqual(exp["held_basis_usd"], 0)
+        self.assertEqual(exp["inflight_buy_usd"], 0)
+        self.assertTrue(self.mgr._us_buy_gate_ok)
+        # 정합화 재실행(broker0, 이제 진짜 빈 계좌) → authoritative_empty, buy_allowed
+        self.api.balance_full = _snap([], complete=True)
+        h = self.mgr.us_reconcile_positions()
+        self.assertTrue(h["authoritative"])
+        self.assertTrue(h["authoritative_empty"])
+        self.assertTrue(h["buy_allowed"])
+        # 재시작 후 0 유지
+        mgr2 = self._new_mgr()
+        self.assertEqual(len(mgr2.pos_mgr.positions), 0)
+
+    def test_manual_remove_refuses_active_or_pending_only_listed(self):
+        # active·pending 종목 제거 거부(전체 거부, 부분삭제 없음), 대상 외 불변(req4/6)
+        self._seed_internal(["AAA", "BBB", "CCC"])
+        self._quarantine_all(["BBB", "CCC"])          # AAA active, BBB/CCC 격리
+        # AAA(active) 포함 → 전체 거부(부분삭제 0)
+        r = self.mgr.us_manual_remove_quarantined_positions(
+            ["AAA", "BBB"], operator="op", reason="x",
+            verified_no_holdings=True, verified_no_open_orders=True)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["reason"], "precheck_failed")
+        self.assertEqual(len(self.mgr.pos_mgr.positions), 3)          # 아무것도 삭제 안 됨
+        # BBB 에 활성 pending BUY 존재 → 거부
+        self.mgr._us_pending_buy_meta["lc1"] = {"code": "BBB", "qty": 1, "price": 10.0}
+        r2 = self.mgr.us_manual_remove_quarantined_positions(
+            ["BBB"], operator="op", reason="x",
+            verified_no_holdings=True, verified_no_open_orders=True)
+        self.assertFalse(r2["ok"])
+        self.assertEqual(r2["reason"], "precheck_failed")
+        self.mgr._us_pending_buy_meta.pop("lc1")
+        # CCC 만 정상 제거, BBB/AAA 불변(req6)
+        r3 = self.mgr.us_manual_remove_quarantined_positions(
+            ["CCC"], operator="op", reason="x",
+            verified_no_holdings=True, verified_no_open_orders=True)
+        self.assertTrue(r3["ok"])
+        self.assertNotIn("CCC", self.mgr.pos_mgr.positions)
+        self.assertIn("BBB", self.mgr.pos_mgr.positions)
+        self.assertIn("AAA", self.mgr.pos_mgr.positions)
+
     def test_error_empty_no_quarantine(self):
         # 오류 empty(ok=False) → 비권위: 격리/삭제 없음, BUY 스킵
         self._seed_internal(["AAA", "BBB"])

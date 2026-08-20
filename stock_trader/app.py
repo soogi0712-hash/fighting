@@ -3323,21 +3323,10 @@ def api_status():
         ),
     })
 
-@app.route("/api/us/unquarantine", methods=["POST"])
-def api_us_unquarantine():
-    """운영자 수동 격리해제 — KIS 앱에서 실보유 확인한 종목만 감사기록과 함께 복구.
-    body: {symbols:[...], operator:"name", reason:"...", verified_held_at_broker:true}
-    ★ verified_held_at_broker!=true 또는 operator 누락이면 거부. 목록 외 종목 불변."""
-    if _us_strategy is None:
-        return jsonify({"ok": False, "reason": "us_strategy_not_initialized"}), 503
-    body = request.get_json(silent=True) or {}
-    res = _us_strategy.us_manual_unquarantine_positions(
-        symbols=body.get("symbols") or [],
-        operator=body.get("operator") or "",
-        reason=body.get("reason") or "",
-        verified_held_at_broker=bool(body.get("verified_held_at_broker", False)),
-    )
-    return jsonify(res), (200 if res.get("ok") else 400)
+# ★ 격리 해제/제거는 외부 공개 포트에 노출하지 않는다(인증 없는 문자열·boolean 만으로
+#   상태변경 금지). 운영 처리는 docker exec one-off(파이썬 셸)로 매니저 메서드를 직접
+#   호출한다: us_manual_remove_quarantined_positions / us_manual_unquarantine_positions.
+#   따라서 HTTP 라우트(/api/us/unquarantine 등)는 제공하지 않는다.
 
 @app.route("/api/session")
 def api_session():
