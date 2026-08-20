@@ -382,6 +382,13 @@ US_MAX_BUY_PER_SYMBOL_USD    = float(
 US_MAX_CONCURRENT_POSITIONS  = int(
     os.environ.get("US_MAX_CONCURRENT_POSITIONS", "8") or 8)
 
+# ── 자동 SELL 최종 초크포인트: 순수익 절대금액 게이트(퍼센트+금액) — 환경변수 조정 가능 ──
+#   +0.3% 는 체결 미끄러짐으로 실제 순손실이 될 수 있으므로 최소 달러 수익·안전버퍼를 함께 둔다.
+US_MIN_NET_PROFIT_USD        = float(
+    os.environ.get("US_MIN_NET_PROFIT_USD", "1.0") or 1.0)
+US_SELL_SAFETY_BUFFER_USD    = float(
+    os.environ.get("US_SELL_SAFETY_BUFFER_USD", "0.5") or 0.5)
+
 
 # ════════════════════════════════════════════════════════════
 # ── 지표 계산 엔진
@@ -1052,6 +1059,8 @@ class USStrategyManager:
     #   손절이 없으므로 손실 노출은 '종목별 총매수원금'과 '최대 동시보유 종목 수'로 제한한다.
     US_MAX_BUY_PER_SYMBOL_USD    = US_MAX_BUY_PER_SYMBOL_USD      # 모듈 기본값(환경변수 반영)
     US_MAX_CONCURRENT_POSITIONS  = US_MAX_CONCURRENT_POSITIONS
+    US_MIN_NET_PROFIT_USD        = US_MIN_NET_PROFIT_USD          # 자동 SELL 최소 달러 수익
+    US_SELL_SAFETY_BUFFER_USD    = US_SELL_SAFETY_BUFFER_USD      # 체결 미끄러짐 안전버퍼($)
 
     # ── [US OPEN SCAN] 개장 추적 변수 ────────────────────────
     # 미국장 개장 시 초기화됨
@@ -2649,6 +2658,22 @@ class USStrategyManager:
         except Exception:
             return False
 
+    def _us_auto_sell_gate(self, symbol, name, avg_price, cur_price, qty):
+        """자동 SELL 최종 초크포인트(단일 게이트). 반환: (allowed: bool, metrics: dict).
+
+        ★ '수수료·환율 반영 예상 순손익률 >= MIN_NET_PROFIT_PCT' AND
+          '예상 순손익($) >= max(왕복비용+안전버퍼, 설정 최소달러수익)' 일 때만 자동 SELL.
+          미달이면 어떤 상위 판정이 SELL 이어도 주문하지 않는다(HOLD). 비용은 시스템
+          수수료 모델(FEE_ROUND_TRIP_PCT)을 재사용하며 임의 추정하지 않는다. 미국은
+          매수·매도 모두 USD 라 순손익률/USD 는 환율 중립(환율은 원화표기용만).
+        """
+        allowed, m = USR.auto_sell_allowed(
+            avg_price, cur_price, qty,
+            min_net_pct=USR.MIN_NET_PROFIT_PCT,
+            min_net_usd=float(self.US_MIN_NET_PROFIT_USD),
+            safety_buffer_usd=float(self.US_SELL_SAFETY_BUFFER_USD))
+        return allowed, m
+
     def _us_record_recovery_analytics(self, symbol, name, pos, outcome: dict) -> None:
         """RECOVERY_WAIT 회복/청산 시 분석 레코드를 남긴다(향후 실제 데이터로 정책 조정).
 
@@ -2826,6 +2851,24 @@ class USStrategyManager:
 
         # ── SELL_ALL: EXIT_PENDING 전이·영속 후, 기존 crash-safe 제출경로로만 매도 ──
         if d.action == USR.ACT_SELL_ALL:
+            # ★★ 자동 SELL 최종 게이트(EXIT_PENDING '전' 재확인) — 순수익률/절대금액 미달이면
+            #    주문하지 않고 HOLD. EXIT_PENDING·pending registry 를 만들지 않는다(item4).
+            _g_ok, _g_m = self._us_auto_sell_gate(
+                symbol, name, pos.avg_price, cur_price, pos.qty)
+            if not _g_ok:
+                self.pos_mgr.save()
+                logger.info(
+                    "[US자동매도게이트] %s(%s) SELL 판정이나 순수익 게이트 미달 → 미제출(HOLD). "
+                    "net=%.2f%%(>=%.2f%%?) 순익=$%.2f(>=$%.2f?) 왕복비용=$%.2f 버퍼=$%.2f",
+                    name, symbol, _g_m["net_pct"], _g_m["min_net_pct"],
+                    _g_m["net_usd"], _g_m["required_usd"],
+                    _g_m["round_trip_cost_usd"], _g_m["safety_buffer_usd"])
+                return {"action": "HOLD", "symbol": symbol, "name": name, "excd": excd,
+                        "reason": (f"[관리] 자동매도 순수익 게이트 미달"
+                                   f"(net={_g_m['net_pct']:.2f}%,순익=${_g_m['net_usd']:.2f}"
+                                   f"<${_g_m['required_usd']:.2f})"),
+                        "session": sess.get("session", ""),
+                        "net_pct": net_pct, "mode": d.mode}
             # ★ 명확 거절 쿨다운 중이면 재제출 금지(무한 재시도 방지, item5).
             #   쿨다운은 '명확 거절' 후에만 설정된다. 판정 상태는 그대로 두고 HOLD 반환.
             cd = pos.mgmt.get("sell_cooldown_until")
@@ -4361,7 +4404,33 @@ class USStrategyManager:
                                 reason, "[모멘텀추가]")
 
     def _do_sell(self, symbol, name, excd, qty, cur_price, reason, sess,
-                 is_partial: bool = False) -> dict:
+                 is_partial: bool = False, *, auto: bool = True) -> dict:
+        # ── ★★ 자동 SELL 최종 초크포인트(주문 제출 직전 단일 게이트) ──
+        #   auto=True(자동): 수수료·환율 반영 예상 순손익률/절대금액이 기준 미달이면
+        #     어떤 상위 판정이 SELL 이어도 begin_submit_intent/api.sell_us 를 호출하지
+        #     않고 HOLD(제출 없음 → EXIT_PENDING·pending registry 미생성).
+        #   auto=False(수동): 사용자 직접 실행 → 중앙 자동수익 게이트 제외(단, 로그 명시).
+        _mode_label = "AUTO" if auto else "MANUAL"
+        if auto:
+            pos_g   = self.pos_mgr.positions.get(symbol)
+            avg_g   = pos_g.avg_price if pos_g else cur_price
+            _g_ok, _g_m = self._us_auto_sell_gate(symbol, name, avg_g, cur_price, qty)
+            if not _g_ok:
+                logger.info(
+                    "[US매도게이트/%s] %s(%s) 순수익 게이트 미달 → 주문 미제출(HOLD). "
+                    "net=%.2f%% 순익=$%.2f<$%.2f 사유=%s",
+                    _mode_label, name, symbol, _g_m["net_pct"], _g_m["net_usd"],
+                    _g_m["required_usd"], reason)
+                return {
+                    "action":  "HOLD", "symbol": symbol, "name": name, "excd": excd,
+                    "reason":  (f"자동매도 순수익 게이트 미달"
+                                f"(net={_g_m['net_pct']:.2f}%,순익=${_g_m['net_usd']:.2f}"
+                                f"<${_g_m['required_usd']:.2f}) — 미제출"),
+                    "session": sess.get("session", ""),
+                }
+        else:
+            logger.info("[US매도/%s] %s(%s) 수동 매도 — 자동 순수익 게이트 제외(사용자 실행)",
+                        _mode_label, name, symbol)
         # ── ★ in-flight 중복 매도 가드: 동일 종목 미체결 매도 존재 시 스킵 ──
         #   apply(감소/삭제)는 FILLED 시점으로 미뤄지므로 포지션이 남아 있어도
         #   여기서 재매도하면 이중 매도가 된다.

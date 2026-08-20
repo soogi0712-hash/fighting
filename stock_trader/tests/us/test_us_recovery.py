@@ -251,6 +251,46 @@ class RiskSizingTest(unittest.TestCase):
         self.assertEqual(q, 5)
 
 
+class AutoSellGateTest(unittest.TestCase):
+    """자동 SELL 최종 게이트: 순수익률(%) + 절대금액($) 동시 충족 필요, 손실은 항상 차단."""
+    def test_loss_always_blocked(self):
+        for cur in (99.0, 95.0, 90.0, 70.0):   # -1/-5/-10/-30%
+            ok, m = R.auto_sell_allowed(100.0, cur, 10)
+            self.assertFalse(ok)
+            self.assertLess(m["net_pct"], 0.3)
+
+    def test_pct_pass_but_usd_below_min_blocked(self):
+        # 소수량: +0.30%여도 순익 절대금액 미달이면 차단(체결 미끄러짐 대비)
+        ok, m = R.auto_sell_allowed(100.0, 100.55, 1)   # net_pct 0.30, net_usd≈0.30
+        self.assertFalse(ok)
+        self.assertGreaterEqual(m["net_pct"], 0.3)
+        self.assertLess(m["net_usd"], m["required_usd"])
+
+    def test_pct_and_usd_pass_allows(self):
+        ok, m = R.auto_sell_allowed(100.0, 100.6, 10)   # net_pct 0.35, net_usd 3.5>=3.0
+        self.assertTrue(ok)
+
+    def test_boundary_030pct_qty10(self):
+        # net_pct 정확히 0.30, net_usd 정확히 3.0 == required 3.0 → 허용
+        ok, m = R.auto_sell_allowed(100.0, 100.55, 10)
+        self.assertTrue(ok)
+        self.assertAlmostEqual(m["net_usd"], 3.0, places=2)
+        self.assertAlmostEqual(m["required_usd"], 3.0, places=2)
+
+    def test_reuses_fee_model(self):
+        # 왕복비용 = FEE_ROUND_TRIP_PCT% × (avg×qty), net_pct = gross - fee
+        m = R.expected_net_profit(100.0, 102.0, 10)
+        self.assertAlmostEqual(m["gross_pct"], 2.0, places=3)
+        self.assertAlmostEqual(m["net_pct"], 2.0 - R.FEE_ROUND_TRIP_PCT, places=3)
+        self.assertAlmostEqual(m["round_trip_cost_usd"],
+                               R.FEE_ROUND_TRIP_PCT / 100.0 * 1000.0, places=3)
+
+    def test_configurable_min_usd(self):
+        # 설정된 최소 달러 수익을 높이면 더 큰 순익을 요구
+        ok, _ = R.auto_sell_allowed(100.0, 100.6, 10, min_net_usd=100.0)
+        self.assertFalse(ok)
+
+
 class MergeTest(unittest.TestCase):
     def test_legacy_defaults(self):
         m = R.merge_state({"code": "AAPL", "qty": 10})

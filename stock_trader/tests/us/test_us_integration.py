@@ -422,6 +422,54 @@ class USIntegrationTest(unittest.TestCase):
         self.assertEqual(len(self.api.sell_calls), 1)              # 재제출 없음
 
     # ══════════════════════════════════════════════════════════
+    # 자동 SELL 최종 게이트: 손실 구간 전 조건 발생해도 자동 SELL 0건
+    # ══════════════════════════════════════════════════════════
+    def test_no_auto_sell_at_losses_even_all_signals(self):
+        # -1/-5/-10/-30% 에서 watchdog·시간·MACD·EMA·SCORE·세션마감 신호가 모두 있어도
+        # 자동 SELL 0건 (단일 권위 HOLD + 순수익 게이트 차단).
+        losses = {"NNE": 99.0, "QUBT": 95.0, "CCJ": 90.0, "RGTI": 70.0}  # -1/-5/-10/-30
+        self.api.balance_full = _snap(
+            [_holding(s, 10, 100.0, cur) for s, cur in losses.items()])
+        self.mgr.us_reconcile_positions()
+        self.mgr.pnl_guard.state = "LOSS_LIMIT"          # 계좌 손실한도(세션 위험)도 발생
+        for sym, cur in losses.items():
+            pos = self.mgr.pos_mgr.positions[sym]
+            pos.created_at = (datetime.now() - timedelta(minutes=180)).isoformat()  # 시간청산
+            self._set_5m_bars([cur - 3, cur - 4])        # 구조적 하락봉까지 있어도
+            # 모든 지표 매도신호: SELL_SCORE 최대, 종가<EMA9(EMA 이탈), 급락
+            r = self._manage(sym, cur, sell_score=8, ema9=cur + 5.0,
+                             ema9_rising=False, atr_pct=1.0)
+            self.assertEqual(r["action"], "HOLD")
+        self.assertEqual(self.api.sell_calls, [])        # 자동 SELL 0건
+        # 어느 포지션도 EXIT_PENDING 으로 전이되지 않음(제출 없음)
+        for sym in losses:
+            self.assertNotEqual(
+                self.mgr.pos_mgr.positions[sym].management_mode, R.MODE_EXIT)
+
+    def test_do_sell_auto_gate_blocks_loss_no_exit_pending(self):
+        # _do_sell(auto=True) 를 손실 포지션에 직접 호출해도 제출 0 + EXIT_PENDING·registry 미생성
+        self.api.balance_full = _snap([_holding("NNE", 10, 100.0, 95.0)])
+        self.mgr.us_reconcile_positions()
+        pos = self.mgr.pos_mgr.positions["NNE"]
+        r = self.mgr._do_sell("NNE", "NNE", "NASD", pos.qty, 95.0,
+                              "레거시 손절 경로 모사", SESS)   # auto 기본 True
+        self.assertEqual(r["action"], "HOLD")
+        self.assertEqual(self.api.sell_calls, [])
+        self.assertNotEqual(pos.management_mode, R.MODE_EXIT)
+        self.assertIsNone(pos.mgmt.get("exit_pending_ref"))
+        self.assertFalse(self.mgr._us_has_active_order("NNE", "SELL"))  # pending registry 없음
+
+    def test_do_sell_manual_bypasses_gate(self):
+        # 수동 매도(auto=False)는 중앙 자동수익 게이트 제외 → 손실이어도 제출된다
+        self.api.balance_full = _snap([_holding("NNE", 10, 100.0, 95.0)])
+        self.mgr.us_reconcile_positions()
+        pos = self.mgr.pos_mgr.positions["NNE"]
+        r = self.mgr._do_sell("NNE", "NNE", "NASD", pos.qty, 95.0,
+                              "사용자 수동 청산", SESS, auto=False)
+        self.assertEqual(r["action"], "SELL_ACCEPTED")   # 게이트 우회 제출
+        self.assertEqual(len(self.api.sell_calls), 1)
+
+    # ══════════════════════════════════════════════════════════
     # 기존·복원 포지션의 max_loss_usd_at_entry 처리 + 실 run 배선 (message 8)
     #   실제 _manage_position → _us_apply_management → decide_management_action
     #     → _do_sell → submit-intent → EXIT_PENDING 전체 호출을 통합 검증한다.
