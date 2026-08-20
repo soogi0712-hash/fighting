@@ -197,16 +197,22 @@ class USUnchangedTest(unittest.TestCase):
 
     def test_us_recovery_uses_dynamic_atr_trail(self):
         import strategies.us_recovery as r
-        # 손실 회복: -0.7 즉시매도 삭제, -3.5 활성, -1.2 최소 트레일, -6 하드,
-        #           -2 성공표시(보호유지), 0% NORMAL 전환
+        # 손실 관리(RECOVERY_WAIT): 고정 -6 손절 제거. -5/-6 은 상태진입·경고 기준.
+        #   구조적 붕괴(완성 5분봉 ATR 연속) + 계좌위험만 손실 매도. 0% 회복 → NORMAL.
         self.assertEqual(r.RECOVERY_ENTER_NET, -5.0)
-        self.assertEqual(r.RECOVERY_ARM_NET, -3.5)
-        self.assertEqual(r.RECOVERY_TRAIL_MIN, 1.2)
-        self.assertEqual(r.RECOVERY_HARD_NET, -6.0)
-        self.assertEqual(r.RECOVERY_SUCCESS_NET, -2.0)
+        self.assertEqual(r.RECOVERY_WARN_NET, -6.0)
         self.assertEqual(r.RECOVERY_NORMAL_NET, 0.0)
-        self.assertFalse(hasattr(r, "RECOVERY_HIGH_DROP_PCT"))   # -0.7 규칙 삭제
-        self.assertFalse(hasattr(r, "RECOVERY_TIME_SEC"))        # 시간청산 삭제
+        self.assertEqual(r.STRUCT_ATR_MULT, 3.0)
+        self.assertEqual(r.STRUCT_MIN_PCT, 3.0)
+        self.assertEqual(r.STRUCT_CONFIRM_BARS, 2)
+        # 고정 손절/트레일 손절 상수는 제거되어야 한다
+        self.assertFalse(hasattr(r, "RECOVERY_HARD_NET"))       # -6 하드손절 제거
+        self.assertFalse(hasattr(r, "RECOVERY_ARM_NET"))        # -3.5 arm 제거
+        self.assertFalse(hasattr(r, "RECOVERY_TRAIL_MIN"))      # 트레일 손절 제거
+        self.assertFalse(hasattr(r, "RECOVERY_HIGH_DROP_PCT"))
+        self.assertFalse(hasattr(r, "RECOVERY_TIME_SEC"))
+        # RECOVERY_WAIT 모드 상수 존재
+        self.assertEqual(r.MODE_RECOVERY_WAIT, "RECOVERY_WAIT")
         # 수익 트레일링: +1.5 활성, ATR clamp 1.0~2.5, 봉확정/급락/EMA9가속
         self.assertEqual(r.PROFIT_TRAIL_ACTIVATE_NET, 1.5)
         self.assertEqual(r.PROFIT_TRAIL_MIN, 1.0)

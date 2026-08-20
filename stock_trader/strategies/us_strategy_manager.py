@@ -1033,6 +1033,12 @@ class USStrategyManager:
     DAILY_PROFIT_LOCK    = 300_000   # 목표 달성 즉시 차단
     DAILY_LOSS_LIMIT_KRW = -300_000  # 손실 한도
 
+    # ── ★ 종목별 최대 허용손실(USD) — 신규 매수 위험기반 사이징(§5). 고정 -5/-6%
+    #   손절 제거로 손실 위험거리가 넓어졌으므로, 이 한도 ÷ (현재가×구조적 위험거리)
+    #   로 신규 수량을 축소한다. 환경변수 US_MAX_LOSS_PER_SYMBOL_USD 로 조정 가능.
+    US_MAX_LOSS_PER_SYMBOL_USD = float(
+        os.environ.get("US_MAX_LOSS_PER_SYMBOL_USD", "60") or 60)
+
     # ── [US OPEN SCAN] 개장 추적 변수 ────────────────────────
     # 미국장 개장 시 초기화됨
     _open_scan_data: dict = {}   # 개장 스캔 이력 (클래스 레벨 공유)
@@ -2566,6 +2572,15 @@ class USStrategyManager:
         return self._check_entry(symbol, name, excd, cur_price, iv,
                                  candles_live, realtime, sess)
 
+    def _us_account_risk_exceeded(self) -> bool:
+        """계좌 위험한도 초과 여부 — 손실 매도의 유일한 계좌레벨 허용조건(§4-2).
+        기존 DailyPnLGuard 의 손실한도(LOSS_LIMIT)/정지(HALTED) 상태를 그대로 사용한다.
+        (미국장 세션 기준 실현손익이 손실한도 이하로 내려간 상태)."""
+        try:
+            return getattr(self.pnl_guard, "state", "TRADING") in ("LOSS_LIMIT", "HALTED")
+        except Exception:
+            return False
+
     # ══════════════════════════════════════════════════════════
     # US 복원/손실회복 관리 (§2/§3/§4/§8) — 기존 매도 로직보다 먼저 개입
     # ══════════════════════════════════════════════════════════
@@ -2612,6 +2627,9 @@ class USStrategyManager:
             "bar1_close":  bar_ctx["last_completed_1m_close"],
             "bar5_ts":     bar_ctx["last_completed_5m_bar_at"],
             "bar5_close":  bar_ctx["last_completed_5m_close"],
+            # ★ 계좌 위험한도 초과 여부 — 손실 매도의 유일한 계좌레벨 허용조건(§4-2).
+            #   기존 DailyPnLGuard 의 손실한도/정지 상태를 그대로 사용(추가 정책 없음).
+            "account_risk_exceeded": self._us_account_risk_exceeded(),
         }
         d = USR.decide_management_action(dict(pos.mgmt), net_pct, cur_price, now, ctx=ctx)
         # 갱신 상태 반영(액션 무관하게 last_evaluated_at/회복상태 저장) + highest 재동기화
@@ -3774,6 +3792,26 @@ class USStrategyManager:
                     "reason": "주문가능금액 부족 — 주문 미제출",
                     "session": sess.get("session", "")}
         qty = _final_qty
+
+        # ── ★ 위험기반 수량 축소(§5): 고정 -5%/-6% 손절 제거로 손실 위험거리가 넓어졌다.
+        #   종목별 최대 허용손실(US_MAX_LOSS_PER_SYMBOL_USD) ÷ (현재가 × 구조적 위험거리%)
+        #   로 상한을 두어, 변동성 큰 종목의 신규 수량을 축소한다(예산 수량을 넘겨 늘리지 않음).
+        _atr_pct = float((iv or {}).get("atr_pct") or 0.0)
+        _risk_qty = USR.risk_capped_qty(cur_price, _atr_pct, qty,
+                                        self.US_MAX_LOSS_PER_SYMBOL_USD)
+        if _risk_qty < qty:
+            logger.info(
+                "[%s] 위험기반 축소: %d → %d주 (최대손실$%.0f, 위험거리%.2f%%=구조적, ATR%.2f%%)",
+                symbol, qty, _risk_qty, self.US_MAX_LOSS_PER_SYMBOL_USD,
+                USR.struct_stop_pct(_atr_pct), _atr_pct)
+        qty = _risk_qty
+        if qty <= 0:
+            logger.warning(
+                "[%s] 위험기반 수량 0주 → 주문 미제출(최대손실$%.0f 대비 위험거리 과대)",
+                symbol, self.US_MAX_LOSS_PER_SYMBOL_USD)
+            return {"action": "BUY_BLOCKED", "symbol": symbol, "name": name,
+                    "reason": "위험기반 사이징 0주 — 주문 미제출",
+                    "session": sess.get("session", "")}
 
         # ── 사전 잔고 체크 (USD + KRW 통합) ──────────────────
         can_buy, capacity_msg = self._check_buy_capacity(symbol, cur_price, qty)

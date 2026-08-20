@@ -23,16 +23,15 @@ management_mode:
     · 동적 트레일보다 추가 0.5%p 이상 급락 → 봉 확인 없이 즉시 안전 SELL_ALL
   ★ EMA9 상승은 확정매도를 '무기한 막는 veto'가 아니다(2봉 확정 시 매도).
 
-── 손실 회복 트레일링 + 보호 연속성 ──────────────────────────────────
-  진입 : net_pct <= -5.0 (즉시매도 금지)
-  활성 : net_pct >= -3.5 회복해야 recovery trailing 활성(sticky)
-  트레일: recovery high 대비 clamp(ATR% × 1.5, 1.2%, 2.5%) 이탈(확정봉/급락) → SELL_ALL
-  하드 : net_pct <= -6.0 → SELL_ALL (반등 없이 최종 손절)
-  보호 연속성:
-    · net_pct >= -2.0 → '회복 성공' 표시만, recovery high 보호는 유지(계속 RECOVERY)
-    · net_pct >= 0.0(손익분기) → NORMAL 전환(보호 해제)
-    · 그 사이 다시 하락하면 recovery high 기준 동적 트레일로 계속 보호
-    · +1.5% 도달은 0% 통과 후 NORMAL→수익 트레일링으로 자연 전환
+── 손실 관리(RECOVERY_WAIT) — 고정 손절 제거, 회복 기회 부여 ──────────
+  ★ 고정 -6% 전량손절 제거. -5%/-6% 는 매도 조건이 아니라 상태 진입·경고 기준.
+  진입 : net_pct <= -5.0 → RECOVERY_WAIT (즉시매도 금지, 회복 대기)
+  경고 : net_pct <= -6.0 → 경고 표시만(recovery_warn), 매도 없음
+  회복 : recovery high 대비 '단순 하락'만으로 매도하지 않는다. 손익분기 0% 까지
+         회복할 기회를 준다. net_pct >= 0.0 → NORMAL 복귀, 이후 +1.5% 부터 ATR 수익 트레일.
+  손실 매도 허용(둘 중 하나뿐):
+    (1) 완성된 5분봉 기준 ATR '구조적 추세 붕괴'가 **연속 확인**(STRUCT_CONFIRM_BARS)
+    (2) 계좌 위험한도 초과(account_risk_exceeded, 호출부가 판정) — 손실 포지션 한정
 """
 from __future__ import annotations
 
@@ -40,22 +39,23 @@ from datetime import datetime
 from typing import Optional
 
 # ── 관리 모드 ────────────────────────────────────────────────────
-MODE_NORMAL   = "NORMAL"
-MODE_RECOVERY = "RECOVERY_TRAILING"
-MODE_EXIT     = "EXIT_PENDING"
-MODE_CLOSED   = "CLOSED"
+MODE_NORMAL        = "NORMAL"
+MODE_RECOVERY_WAIT = "RECOVERY_WAIT"
+MODE_RECOVERY      = MODE_RECOVERY_WAIT   # 하위호환 별칭(코드 참조용)
+MODE_EXIT          = "EXIT_PENDING"
+MODE_CLOSED        = "CLOSED"
+_LEGACY_RECOVERY   = "RECOVERY_TRAILING"  # 구버전 저장값 → RECOVERY_WAIT 로 병합
 
-# ── 손실 회복 트레일링 임계 ──────────────────────────────────────
-RECOVERY_ENTER_NET       = -5.0    # 진입: net_pct <= -5.0
-RECOVERY_ARM_NET         = -3.5    # 활성: net_pct >= -3.5 까지 회복해야 트레일 활성
-RECOVERY_SUCCESS_NET     = -2.0    # 회복 성공 표시(보호는 유지)
-RECOVERY_NORMAL_NET      = 0.0     # 손익분기 회복 → NORMAL 전환(보호 해제)
-RECOVERY_HARD_NET        = -6.0    # net_pct <= -6.0 → SELL_ALL (반등 없이 최종 손절)
-RECOVERY_TRAIL_ATR_MULT  = 1.5
-RECOVERY_TRAIL_MIN       = 1.2
-RECOVERY_TRAIL_MAX       = 2.5
-RECOVERY_TRAIL_PANIC_EXTRA = 0.5   # 동적 폭보다 +0.5%p 급락 → 즉시 안전매도
-RECOVERY_TRAIL_CONFIRM_BARS = 1    # 회복 트레일 확정 완료봉 수
+# ── 손실 관리(RECOVERY_WAIT) 임계 ─────────────────────────────────
+RECOVERY_ENTER_NET   = -5.0    # 진입: net_pct <= -5.0 (상태 진입 기준, 매도 아님)
+RECOVERY_WARN_NET    = -6.0    # 경고 기준(매도 아님)
+RECOVERY_SUCCESS_NET = -2.0    # 회복 성공 표시(정보용)
+RECOVERY_NORMAL_NET  =  0.0    # 손익분기 회복 → NORMAL 전환
+
+# ── 구조적 추세 붕괴(완성 5분봉·ATR·연속) — 유일한 '추세' 손실 매도 ──
+STRUCT_ATR_MULT      = 3.0     # 구조적 손실거리 = ATR% × 3.0 (넓은 거리)
+STRUCT_MIN_PCT       = 3.0     # 구조적 손실거리 하한(%)
+STRUCT_CONFIRM_BARS  = 2       # 연속 확인 완성 5분봉 수
 
 # ── 수익 트레일링(상방) 임계 ─────────────────────────────────────
 PROFIT_TRAIL_ACTIVATE_NET = 1.5
@@ -96,12 +96,12 @@ def default_state(recovered: bool = False, highest_price: float = 0.0,
         "recovery_started_at":   None,
         "recovery_high_price":   None,
         "recovery_high_net_pct": None,
-        "recovery_trail_armed":  False,   # net>=-3.5 회복 시 True(sticky)
-        "recovery_reached_exit": False,   # net>=-2.0 회복 성공 표시(보호 유지)
-        # ── 회복 트레일 '완료봉' 연속 확인(봉 중복/역행/늦은정정 처리) ──
-        "recovery_breach_closes":   0,
-        "recovery_prev_breach_closes": 0,   # 직전 봉 처리 전 카운트(늦은정정 복원용)
-        "last_recovery_breach_bar_at": None,
+        "recovery_reached_exit": False,   # net>=-2.0 회복 성공 표시(정보)
+        "recovery_warn":         False,   # net<=-6.0 경고 표시(매도 아님)
+        # ── 구조적 추세 붕괴 '완성 5분봉' 연속 확인(봉 중복/역행/늦은정정 처리) ──
+        "struct_breach_closes":      0,
+        "struct_prev_breach_closes": 0,
+        "last_struct_breach_bar_at": None,
         # ── 수익 트레일링 ──
         "profit_trail_active":   False,
         "profit_high_net_pct":   None,
@@ -130,11 +130,11 @@ def merge_state(raw: Optional[dict]) -> dict:
             out[k] = raw[k]
     out["recovered"] = bool(out.get("recovered"))
     out["profit_trail_active"] = bool(out.get("profit_trail_active"))
-    out["recovery_trail_armed"] = bool(out.get("recovery_trail_armed"))
     out["recovery_reached_exit"] = bool(out.get("recovery_reached_exit"))
+    out["recovery_warn"] = bool(out.get("recovery_warn"))
     out["quarantined"] = bool(out.get("quarantined"))
     for ck in ("profit_breach_closes", "profit_prev_breach_closes",
-               "recovery_breach_closes", "recovery_prev_breach_closes"):
+               "struct_breach_closes", "struct_prev_breach_closes"):
         try:
             out[ck] = int(out.get(ck) or 0)
         except (TypeError, ValueError):
@@ -143,7 +143,11 @@ def merge_state(raw: Optional[dict]) -> dict:
         out["highest_price"] = float(out.get("highest_price") or 0.0)
     except (TypeError, ValueError):
         out["highest_price"] = 0.0
-    if out.get("management_mode") not in (MODE_NORMAL, MODE_RECOVERY, MODE_EXIT, MODE_CLOSED):
+    # 구버전 RECOVERY_TRAILING → RECOVERY_WAIT 로 병합
+    if out.get("management_mode") == _LEGACY_RECOVERY:
+        out["management_mode"] = MODE_RECOVERY_WAIT
+    if out.get("management_mode") not in (MODE_NORMAL, MODE_RECOVERY_WAIT,
+                                          MODE_EXIT, MODE_CLOSED):
         out["management_mode"] = MODE_NORMAL
     return out
 
@@ -202,13 +206,50 @@ def _reset_breach(state: dict, closes_key: str, prev_key: str, last_key: str) ->
 # ══════════════════════════════════════════════════════════════
 # 손실 회복
 # ══════════════════════════════════════════════════════════════
-def evaluate(state: dict, net_pct: float, cur_price: float, now: datetime,
-             atr_pct: float = 0.0, bar1_ts: Optional[str] = None,
-             bar1_close: Optional[float] = None) -> RecoveryDecision:
-    """손실 회복 판정. EXIT/CLOSED 이면 HOLD. SELL_ALL 이면 호출부가 EXIT_PENDING 설정.
+def struct_stop_pct(atr_pct: float) -> float:
+    """구조적 손실거리(%) = max(하한, ATR% × 배수). '넓은' 거리."""
+    return max(STRUCT_MIN_PCT, float(atr_pct or 0.0) * STRUCT_ATR_MULT)
 
-    cur_price(실시간)는 하드손절·급락 안전매도에, bar1_close(완료봉 종가)는 트레일
-    확정에 쓴다(§4/§5). bar1_ts/close None(데이터 없음) → 확정봉 매도 보류.
+
+def risk_capped_qty(cur_price: float, atr_pct: float, budget_qty: int,
+                    max_loss_usd: float) -> int:
+    """신규 미국 매수 수량을 '종목별 최대 허용손실 + 넓어진 위험거리'로 **축소**.
+
+    고정 -5%/-6% 손절을 제거했으므로, 손실 위험거리는 구조적 손실거리(넓음)로 본다.
+      per_share_risk = cur_price × struct_stop_pct(atr)%/100
+      qty_cap        = floor(max_loss_usd / per_share_risk)
+      반환           = max(0, min(budget_qty, qty_cap))   ← 예산 수량을 넘겨 늘리지 않음
+    """
+    try:
+        cp = float(cur_price); ml = float(max_loss_usd); bq = int(budget_qty)
+    except (TypeError, ValueError):
+        try:
+            return max(0, int(budget_qty or 0))
+        except (TypeError, ValueError):
+            return 0
+    if bq <= 0:
+        return 0
+    if cp <= 0 or ml <= 0:
+        return bq
+    risk_frac = struct_stop_pct(atr_pct) / 100.0
+    per_share = cp * risk_frac
+    if per_share <= 0:
+        return bq
+    cap = int(ml / per_share)
+    return max(0, min(bq, cap))
+
+
+def evaluate(state: dict, net_pct: float, cur_price: float, now: datetime,
+             atr_pct: float = 0.0, bar5_ts: Optional[str] = None,
+             bar5_close: Optional[float] = None,
+             account_risk_exceeded: bool = False) -> RecoveryDecision:
+    """손실 관리(RECOVERY_WAIT) 판정. EXIT/CLOSED → HOLD.
+
+    ★ 고정 -6% 전량손절 없음. -5%/-6% 는 상태 진입·경고 기준. recovery high 대비 '단순
+      하락'만으로 매도하지 않는다(0% 회복 기회 부여). 손실 매도는 아래 둘만 허용:
+        (1) 완성 5분봉 ATR 구조적 추세 붕괴가 **연속 확인**(STRUCT_CONFIRM_BARS)
+        (2) account_risk_exceeded(계좌 위험한도 초과)
+      net_pct >= 0.0 → NORMAL 복귀.
     """
     s = dict(state)
     s["last_evaluated_at"] = now.isoformat()
@@ -219,22 +260,22 @@ def evaluate(state: dict, net_pct: float, cur_price: float, now: datetime,
 
     bump_highest_price(s, cur_price)
 
-    # ── NORMAL: 진입 감시 ──
+    # ── NORMAL: 진입 감시(매도 아님) ──
     if mode == MODE_NORMAL:
         if net_pct is not None and net_pct <= RECOVERY_ENTER_NET:
-            s["management_mode"]        = MODE_RECOVERY
+            s["management_mode"]        = MODE_RECOVERY_WAIT
             s["recovery_started_at"]    = now.isoformat()
             s["recovery_high_price"]    = float(cur_price or 0.0)
             s["recovery_high_net_pct"]  = float(net_pct)
-            s["recovery_trail_armed"]   = False
             s["recovery_reached_exit"]  = False
-            _reset_breach(s, "recovery_breach_closes",
-                          "recovery_prev_breach_closes", "last_recovery_breach_bar_at")
-            return RecoveryDecision(ACT_HOLD, MODE_RECOVERY,
-                                    f"recovery_enter(net={net_pct:.2f}%)", s)
+            s["recovery_warn"]          = bool(net_pct <= RECOVERY_WARN_NET)
+            _reset_breach(s, "struct_breach_closes",
+                          "struct_prev_breach_closes", "last_struct_breach_bar_at")
+            return RecoveryDecision(ACT_HOLD, MODE_RECOVERY_WAIT,
+                                    f"recovery_wait_enter(net={net_pct:.2f}%)", s)
         return RecoveryDecision(ACT_HOLD, MODE_NORMAL, "normal_hold", s)
 
-    # ── RECOVERY_TRAILING ──
+    # ── RECOVERY_WAIT ──
     rhp = s.get("recovery_high_price")
     if rhp is None:
         rhp = float(cur_price or 0.0)
@@ -246,57 +287,47 @@ def evaluate(state: dict, net_pct: float, cur_price: float, now: datetime,
     if net_pct is not None and (rhn is None or net_pct > rhn):
         s["recovery_high_net_pct"] = float(net_pct)
 
-    # 하드손절(최우선): 반등 없이 -6.0
-    if net_pct is not None and net_pct <= RECOVERY_HARD_NET:
-        return RecoveryDecision(ACT_SELL_ALL, MODE_RECOVERY,
-                                f"recovery_hard_stop(net={net_pct:.2f}%)", s)
+    # (0) 계좌 위험한도 초과 → 손실 포지션 강제 청산(허용된 손실 매도)
+    if account_risk_exceeded and net_pct is not None and net_pct < 0:
+        return RecoveryDecision(ACT_SELL_ALL, MODE_RECOVERY_WAIT,
+                                f"account_risk_limit(net={net_pct:.2f}%)", s)
 
-    # 손익분기(0%) 회복 → NORMAL 전환(보호 해제)
+    # 경고 표시(매도 아님)
+    if net_pct is not None and net_pct <= RECOVERY_WARN_NET:
+        s["recovery_warn"] = True
+
+    # 손익분기(0%) 회복 → NORMAL 전환
     if net_pct is not None and net_pct >= RECOVERY_NORMAL_NET:
         s["management_mode"]        = MODE_NORMAL
         s["recovery_started_at"]    = None
         s["recovery_high_price"]    = None
         s["recovery_high_net_pct"]  = None
-        s["recovery_trail_armed"]   = False
         s["recovery_reached_exit"]  = False
-        _reset_breach(s, "recovery_breach_closes",
-                      "recovery_prev_breach_closes", "last_recovery_breach_bar_at")
+        s["recovery_warn"]          = False
+        _reset_breach(s, "struct_breach_closes",
+                      "struct_prev_breach_closes", "last_struct_breach_bar_at")
         return RecoveryDecision(ACT_HOLD, MODE_NORMAL,
                                 f"recovery_exit_to_normal(net={net_pct:.2f}%>=0)", s)
 
-    # -2.0 회복 성공 표시(보호는 유지, 계속 RECOVERY)
+    # -2.0 회복 성공 표시(정보)
     if net_pct is not None and net_pct >= RECOVERY_SUCCESS_NET:
         s["recovery_reached_exit"] = True
 
-    # -3.5 회복 → 트레일 활성(sticky)
-    if not s.get("recovery_trail_armed") and net_pct is not None \
-            and net_pct >= RECOVERY_ARM_NET:
-        s["recovery_trail_armed"] = True
+    # (1) 구조적 추세 붕괴 — 완성 5분봉 종가가 recovery high 대비 넓은 ATR 거리 이탈,
+    #     **연속** 확인. 정상 5분봉이 끼면 초기화. (단순 하락 매도 아님)
+    if bar5_ts and bar5_close is not None and rhp and rhp > 0:
+        sstop = struct_stop_pct(atr_pct)
+        b5drop = (float(bar5_close) - float(rhp)) / float(rhp) * 100.0
+        breakdown = b5drop <= -sstop
+        closes = _update_breach_count(
+            s, "struct_breach_closes", "struct_prev_breach_closes",
+            "last_struct_breach_bar_at", bar5_ts, breakdown)
+        if breakdown and closes >= STRUCT_CONFIRM_BARS:
+            return RecoveryDecision(
+                ACT_SELL_ALL, MODE_RECOVERY_WAIT,
+                f"structural_breakdown(5m_drop={b5drop:.2f}%<=-{sstop:.2f}%,closes={closes})", s)
 
-    # 활성 시: recovery high 대비 동적 트레일 → SELL_ALL
-    if s.get("recovery_trail_armed") and rhp and rhp > 0:
-        trail_pct = _clamp(float(atr_pct or 0.0) * RECOVERY_TRAIL_ATR_MULT,
-                           RECOVERY_TRAIL_MIN, RECOVERY_TRAIL_MAX)
-        # (a) 급락 안전매도 — 실시간 가격 기준(데이터 없어도 동작)
-        if cur_price is not None:
-            live_drop = (float(cur_price) - float(rhp)) / float(rhp) * 100.0
-            if live_drop <= -(trail_pct + RECOVERY_TRAIL_PANIC_EXTRA):
-                return RecoveryDecision(
-                    ACT_SELL_ALL, MODE_RECOVERY,
-                    f"recovery_trail_panic(live_drop={live_drop:.2f}%)", s)
-        # (b) 완료봉 종가 기준 확정 이탈 — 정상봉 끼면 연속 초기화(§5)
-        if bar1_ts and bar1_close is not None:
-            bdrop = (float(bar1_close) - float(rhp)) / float(rhp) * 100.0
-            breach = bdrop <= -trail_pct
-            closes = _update_breach_count(
-                s, "recovery_breach_closes", "recovery_prev_breach_closes",
-                "last_recovery_breach_bar_at", bar1_ts, breach)
-            if breach and closes >= RECOVERY_TRAIL_CONFIRM_BARS:
-                return RecoveryDecision(
-                    ACT_SELL_ALL, MODE_RECOVERY,
-                    f"recovery_trail_exit(bar_drop={bdrop:.2f}%,closes={closes})", s)
-
-    return RecoveryDecision(ACT_HOLD, MODE_RECOVERY, "recovery_hold", s)
+    return RecoveryDecision(ACT_HOLD, MODE_RECOVERY_WAIT, "recovery_wait_hold", s)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -398,16 +429,24 @@ def decide_management_action(state: dict, net_pct: float, cur_price: float,
     bar1_close  = ctx.get("bar1_close")
     bar5_ts     = ctx.get("bar5_ts")
     bar5_close  = ctx.get("bar5_close")
+    account_risk_exceeded = bool(ctx.get("account_risk_exceeded"))
 
     mode = state.get("management_mode", MODE_NORMAL)
     if mode in (MODE_EXIT, MODE_CLOSED):
         s = dict(state); s["last_evaluated_at"] = now.isoformat()
         return RecoveryDecision(ACT_HOLD, mode, "exit_pending_or_closed", s)
 
-    # 1) 손실 회복(진입 포함) — 최우선
-    if mode == MODE_RECOVERY or (net_pct is not None and net_pct <= RECOVERY_ENTER_NET):
+    # 0) 계좌 위험한도 초과 → 손실 포지션(net<0)만 강제 청산(허용된 손실 매도)
+    if account_risk_exceeded and net_pct is not None and net_pct < 0:
+        s = dict(state); s["last_evaluated_at"] = now.isoformat()
+        return RecoveryDecision(ACT_SELL_ALL, mode,
+                                f"account_risk_limit(net={net_pct:.2f}%)", s)
+
+    # 1) 손실 관리(RECOVERY_WAIT 진입 포함) — 최우선. 완성 5분봉 구조적 붕괴만 매도.
+    if mode == MODE_RECOVERY_WAIT or (net_pct is not None and net_pct <= RECOVERY_ENTER_NET):
         return evaluate(state, net_pct, cur_price, now, atr_pct=atr_pct,
-                        bar1_ts=bar1_ts, bar1_close=bar1_close)
+                        bar5_ts=bar5_ts, bar5_close=bar5_close,
+                        account_risk_exceeded=account_risk_exceeded)
 
     # 2) 수익 트레일링 — 활성 시 모든 NORMAL 포지션(복원/신규) 지배
     s = dict(state); s["last_evaluated_at"] = now.isoformat()
