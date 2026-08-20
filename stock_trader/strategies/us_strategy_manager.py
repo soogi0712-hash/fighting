@@ -1334,10 +1334,19 @@ class USStrategyManager:
         if row is not None:
             self._us_process_outbox_row(row)
 
-        # 주문 완전 종료(누적 == 주문수량) 시 meta 정리
-        if cum_qty >= int(getattr(lc, "order_qty", 0) or 0):
-            (self._us_pending_buy_meta if side == "BUY"
-             else self._us_pending_sell_meta).pop(oid, None)
+        # 주문 완전 종료(누적 == 주문수량) 시 meta 정리. 부분체결이면 미체결 잔량으로
+        #   갱신해 '체결분(실보유) + 미체결분' 이 이중 집계되지 않게 한다(노출 정확화, req4).
+        _order_qty = int(getattr(lc, "order_qty", 0) or 0)
+        _meta_map  = (self._us_pending_buy_meta if side == "BUY"
+                      else self._us_pending_sell_meta)
+        if cum_qty >= _order_qty:
+            _meta_map.pop(oid, None)               # 완전체결 → pending 소멸(실보유가 승계)
+        elif oid in _meta_map:
+            _rem = max(0, _order_qty - int(cum_qty))
+            try:
+                _meta_map[oid] = {**_meta_map[oid], "qty": _rem}   # BUY 노출 = 미체결 잔량
+            except Exception:
+                pass
 
     def _us_process_outbox_row(self, row: dict) -> None:
         """outbox 1행의 미완료 부수효과만 idempotent 하게 적용하고, 각 효과 적용
@@ -2146,12 +2155,26 @@ class USStrategyManager:
             # registry row 대사(권위: 실 ODNO·상태). trade_id == lifecycle_id.
             row_status = ""
             row_odno   = ""
+            row_price  = 0.0    # 노출 복원용 제출가(체결 전이면 lc.avg_fill_price=0 이므로 필요)
             if reg is not None:
                 try:
                     row = reg.get_by_trade_id(lc_id)
                     if row is not None:
                         row_status = row.get("status") or ""
                         row_odno   = str(row.get("odno") or "").strip()
+                        # 제출가: raw_order_response.intent_price → fill_price 순 폴백
+                        try:
+                            _raw = row.get("raw_order_response")
+                            if _raw:
+                                _rd = json.loads(_raw) if isinstance(_raw, str) else _raw
+                                row_price = float((_rd or {}).get("intent_price") or 0.0)
+                        except Exception:
+                            row_price = 0.0
+                        if row_price <= 0:
+                            try:
+                                row_price = float(row.get("fill_price") or 0.0)
+                            except (TypeError, ValueError):
+                                row_price = 0.0
                 except Exception:
                     pass
             odno = str(getattr(lc, "odno", "") or "").strip() or row_odno
@@ -2226,11 +2249,15 @@ class USStrategyManager:
                     "[US RestoreMeta] 예상 밖 상태(차단 복원): "
                     "symbol=%s side=%s state=%s", lc.code, side, state.name)
 
+            # ★ 노출 복원: 체결 전(avg_fill_price=0)이면 제출가(row_price)로 원금을 복원해
+            #   durable in-flight BUY 가 $0 으로 누락되지 않게 한다(req5). qty 는 미체결 잔량.
+            _rem_qty = max(0, int(lc.order_qty or 0) - int(lc.filled_qty or 0))
+            _meta_price = (lc.avg_fill_price or row_price or 0.0)
             base_meta = {
                 "code":    lc.code,
-                "qty":     lc.filled_qty if lc.filled_qty > 0 else (lc.order_qty or 0),
-                "price":   lc.avg_fill_price or 0.0,
-                "avg_price": lc.avg_fill_price or 0.0,
+                "qty":     _rem_qty if _rem_qty > 0 else int(lc.order_qty or 0),
+                "price":   _meta_price,
+                "avg_price": _meta_price,
                 "trade_id": lc.trade_id or "",
                 "reason":  "us_restored_on_restart",
             }
@@ -2741,13 +2768,28 @@ class USStrategyManager:
         return total
 
     def _us_reserved_notional_usd(self) -> float:
+        """예약분($). 단, durable 미체결 meta(lc_id)로 승계된 예약은 제외해 **이중 집계
+        방지**(req3). meta 가 사라지면(거절/재시도 갭) 예약이 다시 노출로 잡혀 under-count
+        도 방지된다(req4). 반드시 _us_order_lock 안에서 호출."""
         total = 0.0
         for r in self._us_exposure_reservations.values():
+            _lc = r.get("lc_id")
+            if _lc and _lc in self._us_pending_buy_meta:
+                continue   # durable 미체결 원금으로 승계됨 → 예약분 제외(중복 금지)
             try:
                 total += float(r.get("notional") or 0.0)
             except (TypeError, ValueError):
                 pass
         return total
+
+    def _us_bind_reservation_lc(self, res_id, lc_id) -> None:
+        """begin_submit_intent 성공 후 예약을 durable intent(lc_id)에 바인딩(원자적 승계)."""
+        if not res_id:
+            return
+        with self._us_order_lock:
+            r = self._us_exposure_reservations.get(res_id)
+            if r is not None:
+                r["lc_id"] = lc_id
 
     def us_total_exposure_usd(self) -> float:
         """현재 총노출액($) = 실보유 매입원금 + 미체결 BUY 주문원금 + 예약분. 락 안 집계."""
@@ -2786,8 +2828,10 @@ class USStrategyManager:
                 return 0, None
             self._us_res_counter += 1
             res_id = f"expres-{symbol}-{self._us_res_counter}"
+            # lc_id=None: 아직 durable intent 미등록(예약 단계). begin 성공 시 lc_id 를 바인딩해
+            #   durable 미체결 meta 로 '원자적 승계'(이중 집계 방지, req3).
             self._us_exposure_reservations[res_id] = {
-                "symbol": symbol, "notional": allowed * px}
+                "symbol": symbol, "notional": allowed * px, "lc_id": None}
             if allowed < dq:
                 logger.info(
                     "[US총노출] %s 수량축소 %d→%d주 (현재노출 $%.2f, 남은한도 $%.2f, 상한 $%.2f)",
@@ -4346,6 +4390,8 @@ class USStrategyManager:
                     return {"action": "BUY_FAIL", "symbol": symbol, "name": name,
                             "reason": "submit-intent 저장 실패 — 주문 미제출(안전)",
                             "session": sess["session"]}
+                # durable 미체결 meta 등록됨 → 예약을 그 lc_id 로 승계(이중 집계 방지)
+                self._us_bind_reservation_lc(_exp_res_id, _us_lc_id)
 
             result   = self.api.buy_us(symbol, qty, cur_price, excd,
                                        allow_krw_order=True)
@@ -4534,6 +4580,8 @@ class USStrategyManager:
                 return {"action": "BUY_FAIL", "symbol": symbol, "name": name,
                         "reason": "submit-intent 저장 실패 — 주문 미제출(안전)",
                         "session": sess["session"]}
+            # durable 미체결 meta 등록됨 → 예약을 그 lc_id 로 승계(이중 집계 방지)
+            self._us_bind_reservation_lc(_add_res_id, _us_add_lc_id)
 
         result  = self.api.buy_us(symbol, add_qty, cur_price, excd, allow_krw_order=True)
 
