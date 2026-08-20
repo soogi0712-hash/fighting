@@ -373,9 +373,9 @@ class USIntegrationTest(unittest.TestCase):
 
     def test_struct_only_holds(self):
         # 구조 2봉 충족이나 종목손실 한도 미초과 → HOLD (임의 매도 안 함)
+        self.mgr.US_MAX_LOSS_PER_SYMBOL_USD = 500.0    # 종목위험 매우 큼(미초과) — 정합화 전 설정
         self.api.balance_full = _snap([_holding("BLZE", 10, 100.0, 100.0)])
-        self.mgr.us_reconcile_positions()
-        self.mgr.US_MAX_LOSS_PER_SYMBOL_USD = 500.0    # 종목위험 매우 큼(미초과)
+        self.mgr.us_reconcile_positions()              # 복원 시 max_loss=500 영속
         self._manage("BLZE", 95.0, atr_pct=1.0)
         self._set_5m_bars([91.5]); self._manage("BLZE", 91.5, atr_pct=1.0)
         self._set_5m_bars([91.5, 91.3]); self._manage("BLZE", 91.3, atr_pct=1.0)
@@ -413,6 +413,92 @@ class USIntegrationTest(unittest.TestCase):
         self.assertEqual(self.api.sell_calls, [])
         # 계좌위험 신호는 존재(신규 BUY 차단·포트폴리오 위험축소 용도) — 개별 매도 게이트 아님
         self.assertTrue(self.mgr._us_account_risk_exceeded())
+
+    # ══════════════════════════════════════════════════════════
+    # 기존·복원 포지션의 max_loss_usd_at_entry 처리 + 실 run 배선 (message 8)
+    #   실제 _manage_position → _us_apply_management → decide_management_action
+    #     → _do_sell → submit-intent → EXIT_PENDING 전체 호출을 통합 검증한다.
+    # ══════════════════════════════════════════════════════════
+    def test_existing_holding_struct2_and_over_limit_sells_once_full_chain(self):
+        """실보유 종목 모사: 복원 시 max_loss 1회 영속 → 구조 2봉 + 손실>한도이면
+        전체 실 체인(_manage_position→_us_apply_management→decide→_do_sell→
+        submit-intent→EXIT_PENDING)을 통해 정확히 1회 SELL. 한도는 재계산 없이 고정."""
+        self.mgr.US_MAX_LOSS_PER_SYMBOL_USD = 20.0     # 정합화 전 설정 → 영속값=20
+        self.api.balance_full = _snap([_holding("IONQ", 10, 100.0, 100.0)])
+        self.mgr.us_reconcile_positions()
+        pos = self.mgr.pos_mgr.positions["IONQ"]
+        self.assertEqual(pos.mgmt["max_loss_usd_at_entry"], 20.0)   # 1회 초기화·영속
+
+        self._manage("IONQ", 95.0, atr_pct=1.0)        # RECOVERY_WAIT 진입 high=95
+        self.assertEqual(pos.mgmt["max_loss_usd_at_entry"], 20.0)   # 재계산 없음
+        self._set_5m_bars([91.5]); self._manage("IONQ", 91.5, atr_pct=1.0)  # 구조 count1
+        self.assertEqual(self.api.sell_calls, [])      # 1봉만 → 아직 HOLD
+        self.assertEqual(pos.mgmt["max_loss_usd_at_entry"], 20.0)   # 여전히 고정
+
+        self._set_5m_bars([91.5, 91.3])                # 연속 2봉 → count2
+        r = self._manage("IONQ", 91.3, atr_pct=1.0)    # 손실 -87>$20 AND 구조2 → SELL
+        self.assertEqual(len(self.api.sell_calls), 1)              # 정확히 1회
+        self.assertEqual(r["action"], "SELL_ACCEPTED")
+        self.assertEqual(pos.management_mode, R.MODE_EXIT)         # EXIT_PENDING 전이
+        self.assertIn("IONQ", self.mgr.pos_mgr.positions)          # 체결 전 제거 안 함
+        self.assertEqual(pos.mgmt["max_loss_usd_at_entry"], 20.0)  # 매도 후에도 불변
+
+        # 재판정해도 EXIT_PENDING → 재제출 0 (중복주문 방지)
+        self._set_5m_bars([91.5, 91.3, 91.1])
+        self._manage("IONQ", 91.1, atr_pct=1.0)
+        self.assertEqual(len(self.api.sell_calls), 1)
+
+    def test_missing_maxloss_holds_and_blocks_buy_with_critical(self):
+        """한도 누락/손상: 손실매도 보류(HOLD) + 신규 BUY 차단 + CRITICAL + health 노출.
+        구조 2봉·대손실이 있어도 추측 매도하지 않는다(fail-safe)."""
+        self.api.balance_full = _snap([_holding("NNE", 10, 100.0, 100.0)])
+        self.mgr.us_reconcile_positions()
+        pos = self.mgr.pos_mgr.positions["NNE"]
+        pos.mgmt["max_loss_usd_at_entry"] = None       # 손상 모사
+        self.mgr.pos_mgr.save()
+
+        self._manage("NNE", 95.0, atr_pct=1.0)         # 진입
+        self._set_5m_bars([91.5]); self._manage("NNE", 91.5, atr_pct=1.0)
+        self._set_5m_bars([91.5, 91.3])
+        with self.assertLogs("USStrategy", level="CRITICAL") as lg:
+            r = self._manage("NNE", 91.3, atr_pct=1.0)  # 구조2+대손실이나 한도 없음
+        self.assertEqual(r["action"], "HOLD")          # 추측 매도 안 함
+        self.assertEqual(self.api.sell_calls, [])
+        self.assertIn("NNE", self.mgr._us_maxloss_bad)
+        self.assertFalse(self.mgr._us_buy_gate_ok)     # 신규 BUY 게이트 하향
+        self.assertTrue(any("max_loss_usd_at_entry" in m for m in lg.output))
+
+        # health 노출(PII 없음)
+        hp = self.mgr.us_maxloss_health()
+        self.assertFalse(hp["ok"])
+        self.assertIn("NNE", hp["bad_symbols"])
+        ph = [x for x in self.mgr.us_position_health() if x["symbol"] == "NNE"][0]
+        self.assertFalse(ph["max_loss_valid"])
+        self.assertIsNone(ph["max_loss_usd_at_entry"])
+
+        # 신규 BUY 차단(_check_entry HOLD)
+        self.mgr._us_buy_gate_ok = True                # buy 게이트 자체는 통과시켜도
+        er = self.mgr._check_entry("AAPL", "Apple", "NASD", 10.0,
+                                   _iv(), [], {}, SESS)  # max_loss 게이트에서 차단
+        self.assertEqual(er["action"], "HOLD")
+
+    def test_restart_preserves_maxloss_and_struct_counter(self):
+        """재시작 후 종목별 한도와 구조 카운터가 파일에서 그대로 복원된다."""
+        self.mgr.US_MAX_LOSS_PER_SYMBOL_USD = 500.0    # 미초과(구조만 카운트, 매도 없음)
+        self.api.balance_full = _snap([_holding("RGTI", 10, 100.0, 100.0)])
+        self.mgr.us_reconcile_positions()
+        self._manage("RGTI", 95.0, atr_pct=1.0)        # RECOVERY_WAIT 진입 high=95
+        self._set_5m_bars([91.5]); self._manage("RGTI", 91.5, atr_pct=1.0)  # 구조 count1
+        p = self.mgr.pos_mgr.positions["RGTI"]
+        self.assertEqual(p.mgmt["struct_breach_closes"], 1)
+        self.assertEqual(p.mgmt["max_loss_usd_at_entry"], 500.0)
+        self.assertEqual(self.api.sell_calls, [])      # 한도 미초과 → 매도 없음
+
+        mgr2 = self._new_mgr()                          # 재시작(동일 파일 로드)
+        p2 = mgr2.pos_mgr.positions["RGTI"]
+        self.assertEqual(p2.mgmt["max_loss_usd_at_entry"], 500.0)   # 한도 유지
+        self.assertEqual(p2.mgmt["struct_breach_closes"], 1)        # 카운터 유지
+        self.assertEqual(p2.management_mode, R.MODE_RECOVERY_WAIT)
 
     # ── 위험기반 사이징(최초 BUY·ADD 공통 최종 권위) ─────────────────
     def test_risk_sizing_blocks_on_atr_missing(self):

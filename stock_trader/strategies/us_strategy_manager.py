@@ -1069,6 +1069,7 @@ class USStrategyManager:
         import threading as _th
         self._us_reconcile_lock   = _th.Lock()   # US 전용 비재진입 락(중복 실행 방지)
         self._us_analytics_lock   = _th.Lock()   # 회복 분석 JSONL append 직렬화(줄 깨짐 방지)
+        self._us_maxloss_bad: set = set()        # max_loss 누락/손상 종목(fail-safe·health)
         self._us_buy_gate_ok      = False
         self._us_buy_gate_reason  = "awaiting_first_authoritative_complete_reconcile"
         self._us_snapshot_seq     = 0            # snapshot_id 생성용 시퀀스
@@ -1149,6 +1150,21 @@ class USStrategyManager:
     # Phase 4: US Pipeline — lifecycle 콜백 + PendingRegistry
     # ══════════════════════════════════════════════════════════
 
+    def _us_default_max_loss(self) -> float:
+        """현재 계좌설정에 따른 종목별 최대허용 금액손실($, 보수적 한도)."""
+        try:
+            return float(self.US_MAX_LOSS_PER_SYMBOL_USD)
+        except (TypeError, ValueError):
+            return 60.0
+
+    def _us_set_entry_max_loss(self, pos, *, overwrite: bool) -> None:
+        """진입 시 max_loss_usd_at_entry 를 확정·영속. 이후 매 루프 재계산/확대 금지.
+        overwrite=True(신규 진입/격리해제 후 신규): 현재 계좌설정값으로 확정.
+        overwrite=False(값 없을 때만): 미설정 시 1회 초기화(기존값 보존·확대 안 함)."""
+        cur = pos.mgmt.get("max_loss_usd_at_entry")
+        if overwrite or cur is None or not (isinstance(cur, (int, float)) and cur > 0):
+            pos.mgmt["max_loss_usd_at_entry"] = self._us_default_max_loss()
+
     # ── 포지션 저수준 헬퍼 (idempotent 적용에 사용) ──
     def _us_pos_add(self, symbol, name, excd, delta, delta_avg, level=1):
         existing = self.pos_mgr.positions.get(symbol)
@@ -1160,17 +1176,21 @@ class USStrategyManager:
             existing.avg_price = float(delta_avg)
             existing.current_level = level
             existing.recovered = False   # 신규 매수분 — 기존 익절/손절 정책 적용
+            self._us_set_entry_max_loss(existing, overwrite=True)   # 신규 진입 → 확정
             self.pos_mgr.save()
             return
         if existing is not None:
             new_qty = existing.qty + int(delta)
             new_avg = ((existing.avg_price * existing.qty + delta_avg * delta) / new_qty
                        if new_qty > 0 else delta_avg)
+            # ★ ADD_BUY: max_loss 는 확대하지 않는다(진입값 유지). 없으면 1회 초기화.
+            self._us_set_entry_max_loss(existing, overwrite=False)
             self.pos_mgr.update(symbol, new_qty, new_avg,
                                 max(existing.current_level, level))
         else:
             pos = USPosition(symbol, name, excd or "NASD", int(delta), float(delta_avg))
             pos.current_level = level
+            self._us_set_entry_max_loss(pos, overwrite=True)       # 최초 진입 → 확정
             self.pos_mgr.add(pos)
 
     def _us_pos_reduce(self, symbol, delta):
@@ -2303,6 +2323,39 @@ class USStrategyManager:
         """격리 감사정보(symbol/quarantined_at/reason/snapshot_id) — /api/status 노출."""
         return self.pos_mgr.quarantine_audit()
 
+    def us_position_health(self) -> list:
+        """보유종목별 관리 관찰 스냅샷 — /api/status 노출(PII 없음).
+
+        노출: net_pct, unrealized_loss_usd, max_loss_usd_at_entry, atr_pct,
+              structural_breach_count, last_5m_bar_at, management_mode, decision.
+        ★ 계좌·토큰·ODNO·주문번호는 노출하지 않는다.
+        """
+        out = []
+        for sym, p in self.pos_mgr.active_positions().items():
+            m = p.mgmt
+            _ml = m.get("max_loss_usd_at_entry")
+            out.append({
+                "symbol":                 sym,
+                "management_mode":        p.management_mode,
+                "recovered":              p.recovered,
+                "net_pct":                m.get("last_net_pct"),
+                "unrealized_loss_usd":    m.get("last_unrealized_usd"),
+                "max_loss_usd_at_entry":  (float(_ml) if isinstance(_ml, (int, float)) else None),
+                "max_loss_valid":         bool(isinstance(_ml, (int, float)) and _ml > 0),
+                "atr_pct":                m.get("last_atr_pct"),
+                "structural_breach_count": int(m.get("struct_breach_closes") or 0),
+                "last_5m_bar_at":         m.get("last_struct_breach_bar_at"),
+                "decision":               m.get("last_decision"),
+            })
+        return out
+
+    def us_maxloss_health(self) -> dict:
+        """max_loss 무결성 health(PII 없음). bad 종목이 있으면 신규 BUY 차단·CRITICAL."""
+        bad = sorted(s for s in self._us_maxloss_bad
+                     if s in self.pos_mgr.active_positions())
+        return {"ok": (len(bad) == 0), "bad_symbols": bad,
+                "default_max_loss_usd": self._us_default_max_loss()}
+
     # ── [US OPEN SCAN] 개장 감지 및 초기 스캔 관리 ────────────
     def _check_open_scan(self, sess: dict) -> bool:
         """
@@ -2678,26 +2731,55 @@ class USStrategyManager:
             bar_ctx = USBARS.completed_bar_context(_raw_bars, datetime.now(_UTC))
         except Exception as _be:
             logger.debug("[US관리] %s 1분봉 조회 실패 → 확정봉 보류: %s", symbol, _be)
+        _atr_pct = float(_iv.get("atr_pct") or 0.0)
+        # ★ 종목 손실 게이트는 **포지션에 영속된** max_loss_usd_at_entry($) 로 판정한다
+        #   (매 루프 재계산/확대 없음). 값이 없거나 손상(<=0/비수치)이면:
+        #     · 손실매도를 추측하지 않는다(symbol_risk=False → HOLD)
+        #     · 신규 BUY 차단(정합화 buy 게이트) + CRITICAL 경고 + /api/status health 노출
+        _ml = pos.mgmt.get("max_loss_usd_at_entry")
+        _ml_valid = isinstance(_ml, (int, float)) and float(_ml) > 0
+        if _ml_valid:
+            _symbol_risk = (pnl_usd < -float(_ml))
+            self._us_maxloss_bad.discard(symbol)
+        else:
+            _symbol_risk = False
+            self._us_maxloss_bad.add(symbol)
+            self._us_buy_gate_ok = False
+            self._us_buy_gate_reason = f"max_loss_missing({symbol})"
+            logger.critical(
+                "[US관리] %s(%s) max_loss_usd_at_entry 없음/손상(%r) → 손실매도 보류(HOLD) "
+                "+ 신규 BUY 차단. 다음 정합화에서 계좌설정 한도로 1회 초기화 필요.",
+                name, symbol, _ml)
         ctx = {
-            "atr_pct":     float(_iv.get("atr_pct") or 0.0),
+            "atr_pct":     _atr_pct,
             "ema9":        _iv.get("ema9"),
             "ema9_rising": bool(_iv.get("ema9_rising")),
             "bar1_ts":     bar_ctx["last_completed_1m_bar_at"],
             "bar1_close":  bar_ctx["last_completed_1m_close"],
             "bar5_ts":     bar_ctx["last_completed_5m_bar_at"],
             "bar5_close":  bar_ctx["last_completed_5m_close"],
-            # ★ 개별 종목 손실 매도 조건 — '구조적 5분봉 붕괴 연속 2봉 AND 종목 금액손실
-            #   한도 초과'가 **모두** 충족될 때만. 계좌위험(DailyPnLGuard)은 개별 종목 매도
-            #   게이트가 아니다(신규 BUY 차단·포트폴리오 위험축소 용도).
-            #   symbol : 이 종목의 미실현 손실($) > 종목별 최대 허용손실($). USD-USD 동일단위.
-            "symbol_risk_exceeded":  (pnl_usd < -abs(self.US_MAX_LOSS_PER_SYMBOL_USD)),
-            # ★ ATR 결측(<=0) 시 구조 판정 보류(추측 금지). 정상 양수일 때만 구조 매도 가능.
-            "atr_valid":             (float(_iv.get("atr_pct") or 0.0) > 0.0),
+            # ★ 개별 종목 손실 매도 = '구조적 5분봉 붕괴 연속 2봉 AND 종목 금액손실 한도 초과'.
+            #   계좌위험(DailyPnLGuard)은 개별 종목 매도 게이트가 아니다.
+            "symbol_risk_exceeded":  _symbol_risk,
+            # ★ ATR 결측(<=0) 시 구조 판정 보류(추측 금지).
+            "atr_valid":             (_atr_pct > 0.0),
         }
         d = USR.decide_management_action(dict(pos.mgmt), net_pct, cur_price, now, ctx=ctx)
         # 갱신 상태 반영(액션 무관하게 last_evaluated_at/회복상태 저장) + highest 재동기화
         pos.mgmt = d.state
         pos.sync_mgmt_high()
+        # ── /api/status·로그 관찰 스냅샷 갱신(PII 없음) ──
+        pos.mgmt["last_net_pct"]        = round(float(net_pct), 3)
+        pos.mgmt["last_unrealized_usd"] = round(float(pnl_usd), 2)
+        pos.mgmt["last_atr_pct"]        = round(_atr_pct, 4)
+        pos.mgmt["last_decision"]       = d.reason
+        logger.info(
+            "[US관리스냅샷] %s(%s) mode=%s net=%+.2f%% 미실현=$%+.2f max_loss=$%s "
+            "ATR=%.2f%% 구조카운트=%d last5m=%s decision=%s",
+            name, symbol, pos.management_mode, net_pct, pnl_usd,
+            (round(float(_ml), 2) if _ml_valid else "NONE"), _atr_pct,
+            int(pos.mgmt.get("struct_breach_closes") or 0),
+            pos.mgmt.get("last_struct_breach_bar_at"), d.reason)
 
         # ── 매매일지 분석 레코드(회복 성공/구조적 청산 시 1회) — 소비 후 제거 ──
         _outcome = pos.mgmt.pop("recovery_last_outcome", None)
@@ -2908,6 +2990,7 @@ class USStrategyManager:
                     existing.highest_price = max(float(existing.highest_price or 0.0), h)
                     existing.recovered = True
                     existing.sync_mgmt_high()
+                    self._us_set_entry_max_loss(existing, overwrite=False)  # 누락 시 1회 초기화
                     if was_q:
                         unquarantined += 1
                         logger.info("♻️[US정합화] 격리해제(재등장) %s %s주 avg=$%.2f",
@@ -2921,6 +3004,7 @@ class USStrategyManager:
                 p.highest_price = h
                 p.sync_mgmt_high()
                 p.mgmt["management_mode"] = USR.MODE_NORMAL   # 복원 직후 HOLD(즉시매도 금지)
+                self._us_set_entry_max_loss(p, overwrite=False)  # 현재 계좌설정 한도 1회 초기화
                 self.pos_mgr.positions[sym] = p
                 restored += 1
                 logger.info(
@@ -2947,6 +3031,7 @@ class USStrategyManager:
                     p.mgmt["recovery_high_price"] = max(
                         float(rhp), float(rec.get("cur_price") or 0.0))
                 p.sync_mgmt_high()
+                self._us_set_entry_max_loss(p, overwrite=False)   # 누락 시 1회 초기화
                 reconciled += 1
 
             # (3) broker_absent(완전 스냅샷만) → 격리 or (승인 시)최종 삭제. §5
@@ -2974,6 +3059,14 @@ class USStrategyManager:
                             "🚧[US정합화] 격리 %s (KIS 완전스냅샷 미보유 → "
                             "BROKER_ABSENT_QUARANTINED; 매도·판정·집계 제외, 감사 유지)",
                             sym)
+
+            # ── 종목별 max_loss 한도: 활성 포지션 중 누락분을 계좌설정값으로 1회 초기화 ──
+            #    (item 2: 최초 정합화 시 정확히 한 번만. 기존값은 보존·확대 안 함.)
+            for _s, _p in list(self.pos_mgr.active_positions().items()):
+                self._us_set_entry_max_loss(_p, overwrite=False)
+                _pml = _p.mgmt.get("max_loss_usd_at_entry")
+                if isinstance(_pml, (int, float)) and _pml > 0:
+                    self._us_maxloss_bad.discard(_s)
 
             # ── 신규 BUY 게이트: 완전·권위 + 미해결 broker_absent 없음(전부 격리/삭제) ──
             remaining_absent = [s for s in res.broker_absent
@@ -3318,6 +3411,15 @@ class USStrategyManager:
                 f"정합화 비권위로 신규매수 보류({self._us_buy_gate_reason or 'unauthoritative'})",
                 "HOLD",
             )
+
+        # ── ★ max_loss 무결성 fail-safe: 보유 종목에 한도 누락/손상이 있으면 신규 BUY 차단 ──
+        _ml_bad = [s for s in self._us_maxloss_bad if s in self.pos_mgr.active_positions()]
+        if _ml_bad:
+            logger.critical(
+                "[US관리] 종목 max_loss 누락/손상(%s) → 신규매수 차단(fail-safe). "
+                "정합화 재초기화 대기.", ",".join(sorted(_ml_bad)))
+            return _hold(f"max_loss 무결성 오류({','.join(sorted(_ml_bad))}) — 신규매수 차단",
+                         "HOLD")
 
         # ── 현재 운영 단계 확인 ──────────────────────────────
         phase_info  = us_phase_info()
@@ -4363,6 +4465,7 @@ class USStrategyManager:
                 if sym not in self.pos_mgr.positions:
                     pos = USPosition(sym, h.get("name", sym), h.get("excd", "NASD"),
                                      h["qty"], h["avg_price"])
+                    self._us_set_entry_max_loss(pos, overwrite=False)  # 한도 1회 초기화
                     self.pos_mgr.add(pos)
                     logger.info(f"🔄 US포지션복원: {sym} {h['qty']}주 ${h['avg_price']:.2f}")
         except Exception as e:
