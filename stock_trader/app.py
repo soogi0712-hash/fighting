@@ -1410,6 +1410,26 @@ def _us_realbalance_force_sell_check():
             continue
 
         # ════════════════════════════════════════════════════════
+        # ★★ 자동 SELL 최종 초크포인트(정책: 자동 손절 없음)
+        #   수수료·환율 반영 예상 순손익률/절대금액이 기준 미달이면 자동 주문 제출 금지.
+        #   이 경로는 손실(-5%) 청산이므로 순수익 게이트에서 항상 차단된다(자동 손절 폐지).
+        #   수동 청산은 UI/전용 경로에서 auto=False 로 별도 처리한다.
+        # ════════════════════════════════════════════════════════
+        from strategies.us_recovery import auto_sell_allowed
+        from strategies.us_strategy_manager import (
+            US_MIN_NET_PROFIT_USD as _MIN_USD,
+            US_SELL_SAFETY_BUFFER_USD as _BUF_USD)
+        _g_ok, _g_m = auto_sell_allowed(avg_price, cur_price, sell_qty,
+                                        min_net_usd=_MIN_USD, safety_buffer_usd=_BUF_USD)
+        if not _g_ok:
+            logger.info(
+                f"[US 실제잔고 청산점검] {name}({symbol}) 자동매도 순수익 게이트 미달 → "
+                f"미제출(정책: 자동 손절 없음) | net={_g_m['net_pct']:.2f}% "
+                f"순익=${_g_m['net_usd']:.2f} < 기준=${_g_m['required_usd']:.2f}"
+            )
+            continue
+
+        # ════════════════════════════════════════════════════════
         # ★ 강제 손절 매도
         # ★ KIS 해외주식은 시장가(price=0) 미지원
         #   → 현재가 기준 지정가로 주문 (슬리피지 허용 -1%)

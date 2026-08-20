@@ -63,6 +63,65 @@ PROFIT_TRAIL_PANIC_EXTRA  = 0.5    # (구 정책 상수 — 하위호환 유지,
 PROFIT_TRAIL_CONFIRM_BARS = 2      # (구 정책 상수 — 하위호환 유지, 현재 미사용)
 # ★ 순손익 최소 확보(%). 트레일 '활성화'와 '매도' 게이트 공통 기준(수수료·환율 반영).
 MIN_NET_PROFIT_PCT        = 0.3
+# ── 자동 SELL 최종 초크포인트: 순수익 절대금액 게이트 기본값(호출부가 override) ──
+#   +0.3% 는 체결 미끄러짐으로 실제 순손실이 될 수 있으므로, 퍼센트뿐 아니라
+#   '수수료 반영 예상 순손익($)'이 (왕복비용+안전버퍼)와 최소달러수익을 모두 넘을 때만 매도.
+FEE_ROUND_TRIP_PCT        = 0.25   # 시스템 왕복 수수료 근사(USPosition.net_pct 의 -0.25 와 동일)
+MIN_NET_PROFIT_USD        = 1.0    # 설정된 최소 달러 수익(기본값 — 호출부 override 가능)
+SELL_SAFETY_BUFFER_USD    = 0.5    # 체결 미끄러짐 안전버퍼($, 기본값 — 호출부 override 가능)
+
+
+def expected_net_profit(avg_price: float, cur_price: float, qty: int,
+                        fee_pct: float = FEE_ROUND_TRIP_PCT) -> dict:
+    """수수료 반영 예상 순손익(퍼센트/USD). **비용은 시스템 수수료 모델을 재사용**한다.
+
+    · gross_pct = (cur-avg)/avg×100,  net_pct = gross_pct - fee_pct
+      (fee_pct 는 USPosition.net_pct 가 쓰는 왕복 수수료 근사와 동일한 값).
+    · round_trip_cost_usd = fee_pct% × (avg×qty)  ← 왕복 수수료($) 근사.
+    · net_usd = (cur-avg)×qty - round_trip_cost_usd  ← 수수료 반영 예상 순손익($).
+    ★ 미국 포지션은 매수·매도 모두 USD 라 '순손익률/USD'는 환율에 중립이다(환율은
+      원화 환산 표기에만 영향). 따라서 게이트는 USD 기준으로 비교한다(환율 추정 없음).
+    """
+    try:
+        a = float(avg_price); c = float(cur_price); q = int(qty)
+    except (TypeError, ValueError):
+        a = c = 0.0; q = 0
+    gross_pct = ((c - a) / a * 100.0) if a > 0 else 0.0
+    net_pct = gross_pct - float(fee_pct or 0.0)
+    cost_basis = a * q
+    round_trip_cost_usd = (float(fee_pct or 0.0) / 100.0) * cost_basis
+    net_usd = (c - a) * q - round_trip_cost_usd
+    return {
+        "net_pct":              round(net_pct, 4),
+        "net_usd":              round(net_usd, 4),
+        "gross_pct":            round(gross_pct, 4),
+        "round_trip_cost_usd":  round(round_trip_cost_usd, 4),
+        "cost_basis_usd":       round(cost_basis, 4),
+    }
+
+
+def auto_sell_allowed(avg_price: float, cur_price: float, qty: int, *,
+                      fee_pct: float = FEE_ROUND_TRIP_PCT,
+                      min_net_pct: float = MIN_NET_PROFIT_PCT,
+                      min_net_usd: float = MIN_NET_PROFIT_USD,
+                      safety_buffer_usd: float = SELL_SAFETY_BUFFER_USD) -> tuple:
+    """자동 SELL 최종 게이트(단일 초크포인트 로직). 반환: (allowed: bool, metrics: dict).
+
+    allowed = (net_pct >= min_net_pct) AND
+              (net_usd >= max(round_trip_cost_usd + safety_buffer_usd, min_net_usd)).
+    ★ 상위 판정이 SELL 이어도 이 게이트 미달이면 주문하지 않는다(HOLD). 손실 구간은
+      net_pct<0 이므로 항상 차단된다(자동 손절 없음).
+    """
+    m = expected_net_profit(avg_price, cur_price, qty, fee_pct=fee_pct)
+    required_usd = max(m["round_trip_cost_usd"] + float(safety_buffer_usd or 0.0),
+                       float(min_net_usd or 0.0))
+    allowed = (m["net_pct"] >= float(min_net_pct)) and (m["net_usd"] >= required_usd)
+    m = dict(m)
+    m["required_usd"]  = round(required_usd, 4)
+    m["min_net_pct"]   = float(min_net_pct)
+    m["min_net_usd"]   = float(min_net_usd)
+    m["safety_buffer_usd"] = float(safety_buffer_usd or 0.0)
+    return bool(allowed), m
 
 # ── 판정 액션 ────────────────────────────────────────────────────
 ACT_HOLD     = "HOLD"
