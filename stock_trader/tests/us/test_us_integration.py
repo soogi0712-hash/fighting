@@ -435,21 +435,70 @@ class USIntegrationTest(unittest.TestCase):
         self.assertEqual(self.api.sell_calls, [])
         self.assertEqual(r["action"], "HOLD")
         self.assertTrue(self.mgr.pos_mgr.positions["IONQ"].mgmt["profit_trail_active"])
-        # 이후 트레일 이탈(고점103 대비 -1%+) + EMA9 하향이탈 2회 종가 확정 → SELL
-        # 고점 갱신 방지 위해 103 미만 유지. cur=101.8 → drop=(101.8-103)/103=-1.16%<=-1.0
-        self._manage("IONQ", 101.8, ema9=102.5)   # 1회차(closes=1) → HOLD
-        self.assertEqual(self.api.sell_calls, [])
-        r2 = self._manage("IONQ", 101.8, ema9=102.5)   # 2회차 확정 → SELL
+        # 트레일 이탈 + EMA9 하향이탈(cur<ema9) → 확정봉 1개 빠른 SELL
+        #   cur=101.8 → drop=(101.8-103)/103=-1.16% <=-1.0, ema9=102.5>cur → fast
+        r2 = self._manage("IONQ", 101.8, ema9=102.5)
         self.assertEqual(len(self.api.sell_calls), 1)
         self.assertEqual(r2["action"], "SELL_ACCEPTED")
 
-    def test_profit_trail_ema9_uptrend_holds(self):
-        # EMA9 상승 + 현재가 > EMA9 → 트레일 이탈이어도 HOLD
+    def test_profit_trail_panic_immediate_sell(self):
+        # 동적 트레일보다 +0.5%p 이상 급락 → 봉 확인 없이 즉시 SELL
         self.mgr.pos_mgr.add(USM.USPosition("NNE", "NNE", "NASD", 10, 100.0))
-        self._manage("NNE", 103.0)                 # 활성화(고점 103)
-        r = self._manage("NNE", 101.5, ema9=101.0, ema9_rising=True)  # cur>ema9 상승
+        self._manage("NNE", 103.0)                  # 활성화(고점 103)
+        # cur=101.3 → drop=(101.3-103)/103=-1.65% <= -(1.0+0.5) → panic (봉 없이 즉시)
+        r = self._manage("NNE", 101.3, ema9=100.0, ema9_rising=True)
+        self.assertEqual(len(self.api.sell_calls), 1)
+        self.assertEqual(r["action"], "SELL_ACCEPTED")
+
+    def test_profit_trail_ema9_uptrend_single_bar_holds(self):
+        # EMA9 상승 + 현재가>EMA9 → 확정봉 1개로는 HOLD(2봉 필요, veto 아님)
+        self.mgr.pos_mgr.add(USM.USPosition("QUBT", "QUBT", "NASD", 10, 100.0))
+        self._manage("QUBT", 103.0)                 # 활성화(고점 103)
+        # cur=101.8 drop -1.16%(이탈), ema9=101.0<cur 상승 → normal 경로 1봉 → HOLD
+        r = self._manage("QUBT", 101.8, ema9=101.0, ema9_rising=True)
         self.assertEqual(self.api.sell_calls, [])
         self.assertEqual(r["action"], "HOLD")
+
+    # ══════════════════════════════════════════════════════════
+    # §5 단일 매도판정 권위: 고정익절/금액익절/SELL_SCORE/시간/MACD 매도 0회
+    # ══════════════════════════════════════════════════════════
+    def test_no_fixed_or_amount_or_score_sell_in_profit_range(self):
+        # +1.5~+10% 구간, 고점 유지(이탈 없음) → 매도 0 (고정익절·금액익절·SCORE 무효)
+        self.mgr.pos_mgr.add(USM.USPosition("BLNK", "BLNK", "NASD", 100, 100.0))
+        for pct in (1.75, 2.25, 2.75, 3.5, 5.5, 8.0, 10.25):
+            cur = 100.0 * (1 + (pct + 0.25) / 100.0)   # net≈pct, 고점 계속 갱신(이탈 없음)
+            r = self._manage("BLNK", cur, sell_score=8)   # SELL_SCORE 최대여도 무효
+            self.assertEqual(r["action"], "HOLD")
+        self.assertEqual(self.api.sell_calls, [])          # 매도 0회
+
+    def test_no_time_exit_sell(self):
+        # 60분 경과만으로 매도 0 (시간청산 분기 비활성)
+        self.mgr.pos_mgr.add(USM.USPosition("CEG", "CEG", "NASD", 10, 100.0))
+        p = self.mgr.pos_mgr.positions["CEG"]
+        p.created_at = (datetime.now() - timedelta(minutes=120)).isoformat()
+        r = self._manage("CEG", 100.3)   # 2시간 경과, 소폭 수익, 비활성 → HOLD
+        self.assertEqual(self.api.sell_calls, [])
+        self.assertEqual(r["action"], "HOLD")
+
+    def test_no_macd_ema_vwap_only_sell(self):
+        # MACD 역전/EMA9 이탈/VWAP 하회 지표만으로 매도 0 (트레일 미활성)
+        self.mgr.pos_mgr.add(USM.USPosition("CCJ", "CCJ", "NASD", 10, 100.0))
+        # 지표는 매도 신호이나 profit trail 미활성(net<+1.5), net>-5 → HOLD
+        r = self._manage("CCJ", 100.5, sell_score=8, ema9=105.0)  # cur<ema9, macd역전 등
+        self.assertEqual(self.api.sell_calls, [])
+        self.assertEqual(r["action"], "HOLD")
+
+    def test_single_run_sell_exactly_once_through_submit_intent(self):
+        # 실제 run()→_manage_position→_us_apply_management→_do_sell→submit-intent 1회
+        self.mgr.pos_mgr.add(USM.USPosition("RGTI", "RGTI", "NASD", 10, 100.0))
+        self._manage("RGTI", 103.0)                 # 활성화
+        r = self._manage("RGTI", 101.3, ema9=100.0, ema9_rising=True)  # panic → SELL
+        self.assertEqual(len(self.api.sell_calls), 1)
+        self.assertEqual(r["action"], "SELL_ACCEPTED")
+        self.assertEqual(self.mgr.pos_mgr.positions["RGTI"].management_mode, R.MODE_EXIT)
+        # 재판정해도 EXIT_PENDING → 재제출 0
+        self._manage("RGTI", 101.0, ema9=100.0)
+        self.assertEqual(len(self.api.sell_calls), 1)
 
     # ══════════════════════════════════════════════════════════
     # 동시성: KR 루프 + US 정합화 무데드락

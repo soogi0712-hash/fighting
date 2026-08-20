@@ -197,17 +197,22 @@ class USUnchangedTest(unittest.TestCase):
 
     def test_us_recovery_uses_dynamic_atr_trail(self):
         import strategies.us_recovery as r
-        # 손실 회복: -0.7 즉시매도 삭제, -3.5 활성, -1.2 최소 트레일, -6 하드손절
+        # 손실 회복: -0.7 즉시매도 삭제, -3.5 활성, -1.2 최소 트레일, -6 하드,
+        #           -2 성공표시(보호유지), 0% NORMAL 전환
         self.assertEqual(r.RECOVERY_ENTER_NET, -5.0)
         self.assertEqual(r.RECOVERY_ARM_NET, -3.5)
         self.assertEqual(r.RECOVERY_TRAIL_MIN, 1.2)
         self.assertEqual(r.RECOVERY_HARD_NET, -6.0)
-        self.assertEqual(r.RECOVERY_EXIT_NET, -2.0)
+        self.assertEqual(r.RECOVERY_SUCCESS_NET, -2.0)
+        self.assertEqual(r.RECOVERY_NORMAL_NET, 0.0)
         self.assertFalse(hasattr(r, "RECOVERY_HIGH_DROP_PCT"))   # -0.7 규칙 삭제
-        # 수익 트레일링: +1.5 활성, ATR clamp 1.0~2.5
+        self.assertFalse(hasattr(r, "RECOVERY_TIME_SEC"))        # 시간청산 삭제
+        # 수익 트레일링: +1.5 활성, ATR clamp 1.0~2.5, 봉확정/급락/EMA9가속
         self.assertEqual(r.PROFIT_TRAIL_ACTIVATE_NET, 1.5)
         self.assertEqual(r.PROFIT_TRAIL_MIN, 1.0)
         self.assertEqual(r.PROFIT_TRAIL_MAX, 2.5)
+        self.assertEqual(r.PROFIT_TRAIL_CONFIRM_BARS, 2)
+        self.assertEqual(r.PROFIT_TRAIL_PANIC_EXTRA, 0.5)
 
 
 if __name__ == "__main__":

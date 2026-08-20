@@ -2589,21 +2589,33 @@ class USStrategyManager:
                     "reason": "[관리] 격리 포지션 — 매도판정 제외",
                     "session": sess.get("session", "")}
         _iv = iv or {}
+        # ── 종가 확인용 봉 타임스탬프(봉 중복 방지) ──
+        #   bar1_ts : '직전에 마감한 1분봉' 종료시각 = 현재 분으로 내림(floor). 같은 분의
+        #             반복 평가는 동일 bar1_ts → 카운터 증가 안 함(미완성 현재봉 미사용).
+        #   bar5_ts : 5분 경계 분에서만 부여(완성된 5분봉 마감 근사). 그 외 None.
+        _b1 = now.replace(second=0, microsecond=0)
+        bar1_ts = _b1.isoformat()
+        bar5_ts = (_b1.replace(minute=(_b1.minute // 5) * 5).isoformat()
+                   if (_b1.minute % 5 == 0) else None)
         ctx = {
             "atr_pct":     float(_iv.get("atr_pct") or 0.0),
             "ema9":        _iv.get("ema9"),
             "ema9_rising": bool(_iv.get("ema9_rising")),
-            "bar5_close":  False,   # 60초 루프 = 1분봉 근사 → 연속 2회 확정 경로 사용
+            "bar1_ts":     bar1_ts,
+            "bar5_ts":     bar5_ts,
         }
         d = USR.decide_management_action(dict(pos.mgmt), net_pct, cur_price, now, ctx=ctx)
         # 갱신 상태 반영(액션 무관하게 last_evaluated_at/회복상태 저장) + highest 재동기화
         pos.mgmt = d.state
         pos.sync_mgmt_high()
 
-        # ── DEFER: 관리 개입 없음 — 상태만 저장하고 기존 ①~⑩ 로 위임 ──
-        if d.action == USR.ACT_DEFER:
+        # ── DEFER 는 더 이상 반환되지 않는다(단일 매도판정 권위). 방어적으로 HOLD 처리.
+        #   → _manage_position 이 기존 ①~⑩ 분기로 흘려보내지 않는다(항상 dict 반환).
+        if d.action == USR.ACT_DEFER:   # pragma: no cover (도달 불가)
             self.pos_mgr.save()
-            return None
+            return {"action": "HOLD", "symbol": symbol, "name": name, "excd": excd,
+                    "reason": "[관리] normal_hold(single_sell_authority)",
+                    "session": sess.get("session", ""), "net_pct": net_pct}
 
         # ── HOLD: 관리모드가 HOLD 강제(복원 면제/회복 유지) → 기존 로직 스킵 ──
         if d.action == USR.ACT_HOLD:
@@ -2689,9 +2701,11 @@ class USStrategyManager:
             self.pos_mgr.save()
             return result
 
-        # 방어: 알 수 없는 액션 → 개입하지 않음
+        # 방어: 알 수 없는 액션 → 기존 ①~⑩ 로 흘려보내지 않고 HOLD(단일 권위 유지)
         self.pos_mgr.save()
-        return None
+        return {"action": "HOLD", "symbol": symbol, "name": name, "excd": excd,
+                "reason": "[관리] unknown_action_hold", "session": sess.get("session", ""),
+                "net_pct": net_pct}
 
     # ══════════════════════════════════════════════════════════
     # US 실보유 정합화(§4~§7) — KIS 잔고 권위 기반 복원/정리
