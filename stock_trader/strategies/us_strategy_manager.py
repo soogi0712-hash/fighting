@@ -2573,13 +2573,66 @@ class USStrategyManager:
                                  candles_live, realtime, sess)
 
     def _us_account_risk_exceeded(self) -> bool:
-        """계좌 위험한도 초과 여부 — 손실 매도의 유일한 계좌레벨 허용조건(§4-2).
+        """계좌 위험한도 초과 여부 — 손실 매도의 계좌레벨 허용조건(§4).
         기존 DailyPnLGuard 의 손실한도(LOSS_LIMIT)/정지(HALTED) 상태를 그대로 사용한다.
         (미국장 세션 기준 실현손익이 손실한도 이하로 내려간 상태)."""
         try:
             return getattr(self.pnl_guard, "state", "TRADING") in ("LOSS_LIMIT", "HALTED")
         except Exception:
             return False
+
+    def _us_record_recovery_analytics(self, symbol, name, pos, outcome: dict) -> None:
+        """RECOVERY_WAIT 회복/청산 시 분석 레코드를 남긴다(향후 실제 데이터로 정책 조정).
+
+        기록: -5%/-6% 도달 후 **최대하락률**, **회복까지 걸린 시간**, **최종 손익**,
+              **조기손절 가상손익**(진입 net≈-5%에서 손절했을 경우). 기존 저널/lifecycle
+              을 변경하지 않는 **추가 전용 싱크**(JSONL) + 로그. 가능하면 저널에도 기록.
+        """
+        qty = int(getattr(pos, "qty", 0) or 0)
+        avg = float(getattr(pos, "avg_price", 0.0) or 0.0)
+        entry_net  = outcome.get("entry_net_pct")
+        final_net  = outcome.get("final_net_pct")
+        final_px   = outcome.get("final_price")
+        # $ 환산(수수료 미세반영 근사 — 분석용)
+        hypo_stop_usd = (qty * avg * (float(entry_net) / 100.0)) if (entry_net is not None) else None
+        if final_px is not None and avg > 0:
+            final_pnl_usd = qty * (float(final_px) - avg)
+        elif final_net is not None:
+            final_pnl_usd = qty * avg * (float(final_net) / 100.0)
+        else:
+            final_pnl_usd = None
+        saved_usd = (final_pnl_usd - hypo_stop_usd) \
+            if (final_pnl_usd is not None and hypo_stop_usd is not None) else None
+        rec = {
+            "ts": datetime.now().isoformat(), "symbol": symbol, "name": name,
+            "outcome": outcome.get("outcome"),
+            "qty": qty, "avg_price": avg,
+            "entry_net_pct": entry_net,
+            "max_drawdown_net_pct": outcome.get("max_drawdown_net_pct"),
+            "warn6_at": outcome.get("warn6_at"),
+            "recovery_seconds": outcome.get("recovery_seconds"),
+            "final_net_pct": final_net,
+            "final_pnl_usd": (round(final_pnl_usd, 2) if final_pnl_usd is not None else None),
+            "hypothetical_early_stop_pnl_usd": (round(hypo_stop_usd, 2) if hypo_stop_usd is not None else None),
+            "saved_vs_early_stop_usd": (round(saved_usd, 2) if saved_usd is not None else None),
+        }
+        logger.info(
+            "[US회복분석] %s(%s) outcome=%s 최대하락=%.2f%% 회복=%.0fs 최종손익=$%s "
+            "조기손절가상=$%s 절감=$%s",
+            name, symbol, rec["outcome"],
+            (rec["max_drawdown_net_pct"] or 0.0), (rec["recovery_seconds"] or 0.0),
+            rec["final_pnl_usd"], rec["hypothetical_early_stop_pnl_usd"],
+            rec["saved_vs_early_stop_usd"])
+        # 추가 전용 매매일지 싱크(JSONL) — 기존 저널/lifecycle 파일·스키마 무변경.
+        #   data/us_recovery_analytics.jsonl 에 append. 운영 후 이 데이터로 정책을 조정한다.
+        try:
+            _path = os.path.join(os.path.dirname(US_POSITIONS_FILE),
+                                 "us_recovery_analytics.jsonl")
+            os.makedirs(os.path.dirname(_path), exist_ok=True)
+            with open(_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception as _we:
+            logger.debug("[US회복분석] JSONL 기록 실패(무해): %s", _we)
 
     # ══════════════════════════════════════════════════════════
     # US 복원/손실회복 관리 (§2/§3/§4/§8) — 기존 매도 로직보다 먼저 개입
@@ -2627,14 +2680,25 @@ class USStrategyManager:
             "bar1_close":  bar_ctx["last_completed_1m_close"],
             "bar5_ts":     bar_ctx["last_completed_5m_bar_at"],
             "bar5_close":  bar_ctx["last_completed_5m_close"],
-            # ★ 계좌 위험한도 초과 여부 — 손실 매도의 유일한 계좌레벨 허용조건(§4-2).
-            #   기존 DailyPnLGuard 의 손실한도/정지 상태를 그대로 사용(추가 정책 없음).
+            # ★ 손실 매도의 위험한도 조건 — 손실 매도는 '구조적 5분봉 붕괴 연속 +
+            #   계좌위험 + 종목위험'이 **모두** 충족될 때만 허용된다.
+            #   account: 기존 DailyPnLGuard 손실한도/정지 상태(추가 정책 없음).
+            #   symbol : 이 종목의 미실현 손실($)이 종목별 최대 허용손실 초과.
             "account_risk_exceeded": self._us_account_risk_exceeded(),
+            "symbol_risk_exceeded":  (pnl_usd < -abs(self.US_MAX_LOSS_PER_SYMBOL_USD)),
         }
         d = USR.decide_management_action(dict(pos.mgmt), net_pct, cur_price, now, ctx=ctx)
         # 갱신 상태 반영(액션 무관하게 last_evaluated_at/회복상태 저장) + highest 재동기화
         pos.mgmt = d.state
         pos.sync_mgmt_high()
+
+        # ── 매매일지 분석 레코드(회복 성공/구조적 청산 시 1회) — 소비 후 제거 ──
+        _outcome = pos.mgmt.pop("recovery_last_outcome", None)
+        if _outcome:
+            try:
+                self._us_record_recovery_analytics(symbol, name, pos, _outcome)
+            except Exception as _re:
+                logger.debug("[US회복분석] 기록 실패(무해): %s", _re)
 
         # ── DEFER 는 더 이상 반환되지 않는다(단일 매도판정 권위). 방어적으로 HOLD 처리.
         #   → _manage_position 이 기존 ①~⑩ 분기로 흘려보내지 않는다(항상 dict 반환).

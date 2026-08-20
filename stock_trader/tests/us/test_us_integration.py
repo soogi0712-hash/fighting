@@ -140,10 +140,15 @@ class USIntegrationTest(unittest.TestCase):
             for i, c in enumerate(bucket_closes)
         ]
 
-    def _account_risk_sell(self, sym, cur):
-        """계좌 위험한도 초과로 손실 포지션을 1회 매도(테스트용 트리거)."""
-        self.mgr.pnl_guard.state = "LOSS_LIMIT"
-        return self._manage(sym, cur)
+    def _force_loss_sell(self, sym):
+        """손실 매도 3조건(구조붕괴 연속 2봉 + 계좌위험 + 종목위험)을 모두 충족시켜
+        1회 매도를 유도(테스트용 트리거). 진입가 95 기준 recovery_high=95."""
+        self.mgr.US_MAX_LOSS_PER_SYMBOL_USD = 10.0     # 종목위험 쉽게(손실>$10)
+        self.mgr.pnl_guard.state = "LOSS_LIMIT"         # 계좌위험
+        self._manage(sym, 95.0)                         # RECOVERY_WAIT 진입 high=95
+        self._set_5m_bars([92.0]);        self._manage(sym, 92.0)   # 구조 count1
+        self._set_5m_bars([92.0, 91.8])                 # 연속 구조 count2
+        return self._manage(sym, 91.8)                  # 3조건 충족 → SELL
 
     def _seed_internal(self, syms, qty=5, avg=50.0):
         for s in syms:
@@ -352,39 +357,40 @@ class USIntegrationTest(unittest.TestCase):
         self.assertEqual(self.api.sell_calls, [])
         self.assertEqual(r["action"], "HOLD")
 
-    def test_structural_breakdown_sells_once(self):
-        # 완성 5분봉 ATR 구조 붕괴 '연속 2봉' → SELL 1회
+    def test_structural_breakdown_and_risk_sells_once(self):
+        # 구조 붕괴 연속 2봉 + 계좌위험 + 종목위험 **모두** 충족 → SELL 1회
         self.api.balance_full = _snap([_holding("NNE", 10, 100.0, 100.0)])
         self.mgr.us_reconcile_positions()
+        self.mgr.pnl_guard.state = "LOSS_LIMIT"    # 계좌위험 (종목위험은 깊은 손실로 충족)
         self._manage("NNE", 95.0)                  # 진입 high=95
-        self._set_5m_bars([91.5])                  # 5분봉1 -3.7% 구조이탈 → count1
+        self._set_5m_bars([91.5])                  # 5분봉1 구조이탈 → count1
         self._manage("NNE", 91.5)
-        self.assertEqual(self.api.sell_calls, [])
+        self.assertEqual(self.api.sell_calls, [])  # 1봉만 → HOLD
         self._set_5m_bars([91.5, 91.3])            # 연속 5분봉2 → count2 → SELL
         r = self._manage("NNE", 91.3)
         self.assertEqual(len(self.api.sell_calls), 1)
         self.assertEqual(self.mgr.pos_mgr.positions["NNE"].management_mode, R.MODE_EXIT)
 
     def test_structural_non_consecutive_holds(self):
-        # 이탈 → 정상 5분봉 → 이탈: 연속 아님 → 매도 없음
+        # 계좌·종목 위험이어도 구조가 연속 아니면 매도 없음(정상 5분봉 끼면 초기화)
         self.api.balance_full = _snap([_holding("RGTI", 10, 100.0, 100.0)])
         self.mgr.us_reconcile_positions()
+        self.mgr.pnl_guard.state = "LOSS_LIMIT"
         self._manage("RGTI", 95.0)                 # 진입 high=95
         self._set_5m_bars([91.5]);        self._manage("RGTI", 91.5)   # count1
         self._set_5m_bars([91.5, 94.5]);  self._manage("RGTI", 94.5)   # 정상 → 초기화
         self._set_5m_bars([91.5, 94.5, 91.5]); self._manage("RGTI", 91.5)  # count1
         self.assertEqual(self.api.sell_calls, [])
 
-    def test_account_risk_sells_without_bar_data(self):
-        # 데이터 없어도 계좌 위험한도 초과 → 손실 포지션 강제청산
+    def test_risks_without_struct_holds(self):
+        # 계좌+종목 위험이어도 구조적 붕괴 없으면(봉 없음/미이탈) 매도 안 함
         self.api.balance_full = _snap([_holding("NVTS", 10, 100.0, 100.0)])
         self.mgr.us_reconcile_positions()
         self.api.intraday_bars = []
-        self._manage("NVTS", 95.0)                 # 진입, 계좌위험 아님 → HOLD
+        self.mgr.pnl_guard.state = "LOSS_LIMIT"
+        self._manage("NVTS", 95.0)                 # 진입
+        self._manage("NVTS", 90.0)                 # 계좌+종목 위험이나 구조봉 없음 → HOLD
         self.assertEqual(self.api.sell_calls, [])
-        r = self._account_risk_sell("NVTS", 95.0)  # 계좌위험 → SELL(봉 없이)
-        self.assertEqual(len(self.api.sell_calls), 1)
-        self.assertEqual(r["action"], "SELL_ACCEPTED")
 
     def test_recovery_recovers_to_normal_no_sell(self):
         # -5 진입 후 0% 회복 → NORMAL, 손실 매도 0회
@@ -396,22 +402,41 @@ class USIntegrationTest(unittest.TestCase):
         self.assertEqual(self.api.sell_calls, [])
         self.assertEqual(self.mgr.pos_mgr.positions["CEG"].management_mode, R.MODE_NORMAL)
 
+    def test_recovery_analytics_recorded_on_recovered(self):
+        # 회복 시 매매일지 분석 JSONL 에 레코드 기록(최대하락·회복시간·최종손익·가상손익)
+        self.api.balance_full = _snap([_holding("CEG", 10, 100.0, 100.0)])
+        self.mgr.us_reconcile_positions()
+        self._manage("CEG", 95.0)                  # 진입(-5)
+        self._manage("CEG", 93.0)                  # 최대하락 갱신(-7)
+        self._manage("CEG", 100.3)                 # 회복 → NORMAL, 레코드 기록
+        path = os.path.join(self.tmp, "us_recovery_analytics.jsonl")
+        self.assertTrue(os.path.exists(path))
+        with open(path, encoding="utf-8") as f:
+            rows = [json.loads(ln) for ln in f if ln.strip()]
+        self.assertTrue(any(r["outcome"] == "recovered" and r["symbol"] == "CEG"
+                            for r in rows))
+        rec = [r for r in rows if r["symbol"] == "CEG"][-1]
+        self.assertLessEqual(rec["max_drawdown_net_pct"], -7.0)     # 최대하락 기록
+        self.assertIsNotNone(rec["hypothetical_early_stop_pnl_usd"])  # 조기손절 가상손익
+        self.assertIsNotNone(rec["saved_vs_early_stop_usd"])
+        # 소비 후 제거(재기록 방지)
+        self.assertIsNone(self.mgr.pos_mgr.positions["CEG"].mgmt.get("recovery_last_outcome"))
+
     # ══════════════════════════════════════════════════════════
     # EXIT_PENDING (item4/item5) + 체결 (item6)
     # ══════════════════════════════════════════════════════════
     def test_exit_pending_kept_across_restart_no_resubmit(self):
-        # SELL 접수 후 crash(재시작) → EXIT_PENDING 유지, 재제출 0 (트리거=계좌위험)
+        # SELL 접수 후 crash(재시작) → EXIT_PENDING 유지, 재제출 0 (트리거=3조건)
         self.api.balance_full = _snap([_holding("ACHR", 10, 100.0, 100.0)])
         self.mgr.us_reconcile_positions()
-        self._manage("ACHR", 95.0)                  # 진입
-        self._account_risk_sell("ACHR", 95.0)       # 계좌위험 → SELL 접수 → EXIT_PENDING
+        self._force_loss_sell("ACHR")               # 3조건 → SELL 접수 → EXIT_PENDING
         self.assertEqual(len(self.api.sell_calls), 1)
         n_before = len(self.api.sell_calls)
         mgr2 = self._new_mgr()       # 재시작
         self.assertEqual(mgr2.pos_mgr.positions["ACHR"].management_mode, R.MODE_EXIT)
         pos = mgr2.pos_mgr.positions["ACHR"]
-        r = mgr2._us_apply_management(pos, "ACHR", "ACHR", "NASD", 95.0,
-                                      pos.net_pct(95.0), 0.0, 0.0, SESS)
+        r = mgr2._us_apply_management(pos, "ACHR", "ACHR", "NASD", 91.8,
+                                      pos.net_pct(91.8), 0.0, 0.0, SESS)
         self.assertEqual(r["action"], "HOLD")
         self.assertEqual(len(self.api.sell_calls), n_before)   # 재제출 0
 
@@ -419,12 +444,16 @@ class USIntegrationTest(unittest.TestCase):
         # SELL_ALL → EXIT_PENDING 저장 후 begin 실패(KIS 미호출) → 직전 상태 원상복구
         self.api.balance_full = _snap([_holding("RGTI", 10, 100.0, 100.0)])
         self.mgr.us_reconcile_positions()
-        self._manage("RGTI", 95.0)      # RECOVERY_WAIT 진입
+        self.mgr.US_MAX_LOSS_PER_SYMBOL_USD = 10.0
+        self.mgr.pnl_guard.state = "LOSS_LIMIT"
+        self._manage("RGTI", 95.0)      # RECOVERY_WAIT 진입 high=95
+        self._set_5m_bars([92.0]); self._manage("RGTI", 92.0)   # 구조 count1
         p = self.mgr.pos_mgr.positions["RGTI"]
         started = p.mgmt["recovery_started_at"]
         high    = p.mgmt["recovery_high_price"]
         self.mgr._us_begin_submit_intent = lambda *a, **k: False   # begin 실패 주입
-        self._account_risk_sell("RGTI", 95.0)   # 계좌위험 SELL 판정 → begin 실패
+        self._set_5m_bars([92.0, 91.8])
+        self._manage("RGTI", 91.8)      # 3조건 SELL 판정 → begin 실패
         self.assertEqual(self.api.sell_calls, [])               # KIS 미호출
         p = self.mgr.pos_mgr.positions["RGTI"]
         self.assertEqual(p.management_mode, R.MODE_RECOVERY_WAIT)   # 원상복구
@@ -433,38 +462,35 @@ class USIntegrationTest(unittest.TestCase):
         self.assertIsNone(p.mgmt["exit_pending_ref"])
 
     def test_clear_reject_cooldown(self):
-        # 명확 거절 → 쿨다운 동안 재제출 없음, 쿨다운 후 재시도 (트리거=계좌위험)
+        # 명확 거절 → 쿨다운 동안 재제출 없음, 쿨다운 후 재시도 (트리거=3조건)
         self.api.sell_rt_cd = "reject"
         self.api.balance_full = _snap([_holding("BLNK", 10, 100.0, 100.0)])
         self.mgr.us_reconcile_positions()
-        self._manage("BLNK", 95.0)      # 진입
-        self._account_risk_sell("BLNK", 95.0)   # SELL 시도 → 명확거절 → 쿨다운
+        self._force_loss_sell("BLNK")   # SELL 시도 → 명확거절 → 쿨다운
         self.assertEqual(len(self.api.sell_calls), 1)
         p = self.mgr.pos_mgr.positions["BLNK"]
         self.assertIsNotNone(p.mgmt["sell_cooldown_until"])
         self.assertEqual(p.management_mode, R.MODE_RECOVERY_WAIT)   # EXIT 고착 아님
-        self._manage("BLNK", 95.0)      # 쿨다운 중 → 재제출 없음
+        self._manage("BLNK", 91.8)      # 쿨다운 중 재판정(3조건 유지) → 재제출 없음
         self.assertEqual(len(self.api.sell_calls), 1)
         p.mgmt["sell_cooldown_until"] = (datetime.now() - timedelta(seconds=1)).isoformat()
-        self._manage("BLNK", 95.0)      # 쿨다운 만료 → 재시도(2회차)
+        self._manage("BLNK", 91.8)      # 쿨다운 만료 → 재시도(2회차)
         self.assertEqual(len(self.api.sell_calls), 2)
 
     def test_no_duplicate_sell_after_timeout(self):
         self.api.sell_rt_cd = "9"       # UNKNOWN_CONFIRM
         self.api.balance_full = _snap([_holding("RGTI", 10, 100.0, 100.0)])
         self.mgr.us_reconcile_positions()
-        self._manage("RGTI", 95.0)
-        self._account_risk_sell("RGTI", 95.0)   # SELL 시도(UNKNOWN) → EXIT_PENDING 유지
+        self._force_loss_sell("RGTI")   # SELL 시도(UNKNOWN) → EXIT_PENDING 유지
         self.assertEqual(len(self.api.sell_calls), 1)
         self.assertEqual(self.mgr.pos_mgr.positions["RGTI"].management_mode, R.MODE_EXIT)
-        self._manage("RGTI", 93.0)
+        self._manage("RGTI", 91.0)
         self.assertEqual(len(self.api.sell_calls), 1)   # 재제출 없음
 
     def test_position_removed_only_after_fill_partial_then_full(self):
         self.api.balance_full = _snap([_holding("ACHR", 10, 100.0, 100.0)])
         self.mgr.us_reconcile_positions()
-        self._manage("ACHR", 95.0)
-        self._account_risk_sell("ACHR", 95.0)      # SELL 접수 — 체결 아님
+        self._force_loss_sell("ACHR")              # SELL 접수 — 체결 아님
         self.assertIn("ACHR", self.mgr.pos_mgr.positions)
         # 부분 체결(3주) → delta 만 감소, 제거 안 함
         self.mgr._us_pos_reduce("ACHR", 3)
