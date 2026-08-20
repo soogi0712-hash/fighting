@@ -2405,6 +2405,64 @@ class USStrategyManager:
         """격리 감사정보(symbol/quarantined_at/reason/snapshot_id) — /api/status 노출."""
         return self.pos_mgr.quarantine_audit()
 
+    def us_manual_unquarantine_positions(self, symbols, operator: str, reason: str,
+                                         verified_held_at_broker: bool = True) -> dict:
+        """운영자가 KIS 앱에서 실보유를 확인한 격리 종목만 **감사기록과 함께 수동 해제**한다.
+
+        ★ 자동 해제가 아니다(req4/5). verified_held_at_broker=True 이고 operator 가
+          지정돼야만 실행하며, 목록에 없는 종목은 절대 변경하지 않는다(req7). DB 직접수정·
+          포지션 파일 삭제를 사용하지 않고 pos_mgr 표준 경로(clear_quarantine)+원자 저장만
+          쓴다. 해제된 종목은 즉시 active 관리대상·held_basis·US 루프에 복귀하고 수익전용
+          트레일링이 작동한다(recovered=True, NORMAL, highest 보존). 감사는 PII 없이 JSONL 기록.
+        """
+        now_iso = datetime.now().isoformat()
+        syms = [str(s).upper() for s in (symbols or []) if str(s).strip()]
+        # 운영자 확인 없이는 거부(req5)
+        if not verified_held_at_broker or not str(operator or "").strip():
+            logger.warning(
+                "[US수동격리해제] 거부: 운영자 실보유 확인 필요"
+                "(operator=%r, verified_held_at_broker=%s)", operator, verified_held_at_broker)
+            return {"ok": False, "reason": "operator_verification_required",
+                    "unquarantined": [], "skipped": syms, "count": 0}
+        if not syms:
+            return {"ok": False, "reason": "no_symbols",
+                    "unquarantined": [], "skipped": [], "count": 0}
+        unq, skipped, audit = [], [], []
+        for s in syms:
+            p = self.pos_mgr.positions.get(s)
+            if p is None or not p.is_quarantined:
+                skipped.append(s)          # 격리 아님/미존재 → 변경 없음(req7)
+                continue
+            prior_q = dict(p.mgmt.get("quarantine") or {})
+            p.clear_quarantine()
+            p.recovered = True
+            p.mgmt["management_mode"] = USR.MODE_NORMAL   # 복귀 직후 HOLD(즉시매도 금지)
+            p.sync_mgmt_high()
+            self._us_set_entry_max_loss(p, overwrite=False)   # 누락 시 1회 초기화
+            self._us_maxloss_bad.discard(s)
+            unq.append(s)
+            audit.append({"ts": now_iso, "symbol": s, "operator": str(operator),
+                          "reason": str(reason or ""), "verified_held_at_broker": True,
+                          "prior_quarantine": prior_q})
+            logger.warning(
+                "♻️[US수동격리해제] %s → active 복구 (operator=%s, reason=%s, 격리사유=%s)",
+                s, operator, reason, prior_q.get("reason"))
+        if unq:
+            self.pos_mgr.save()   # 원자 저장(파일 삭제/DB 직접수정 없음)
+            try:                  # 감사 JSONL(추가 전용, PII 없음)
+                _path = os.path.join(os.path.dirname(US_POSITIONS_FILE),
+                                     "us_unquarantine_audit.jsonl")
+                with self._us_analytics_lock:
+                    os.makedirs(os.path.dirname(_path), exist_ok=True)
+                    with open(_path, "a", encoding="utf-8") as f:
+                        for rec in audit:
+                            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                        f.flush()
+            except Exception as _we:
+                logger.debug("[US수동격리해제] 감사 JSONL 기록 실패(무해): %s", _we)
+        return {"ok": bool(unq), "unquarantined": unq, "skipped": skipped,
+                "count": len(unq), "operator": str(operator), "reason": str(reason or "")}
+
     def us_position_health(self) -> list:
         """보유종목별 관리 관찰 스냅샷 — /api/status 노출(PII 없음).
 

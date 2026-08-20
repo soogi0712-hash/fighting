@@ -349,6 +349,81 @@ class USIntegrationTest(unittest.TestCase):
         self.assertEqual(len(self.mgr.pos_mgr.active_positions()), 9)
         self.assertTrue(self.mgr._us_buy_gate_ok)
 
+    def _quarantine_all(self, syms, snap="snap-old"):
+        for s in syms:
+            self.mgr.pos_mgr.positions[s].quarantine(
+                reason="broker_absent(prev complete snapshot)",
+                snapshot_id=snap, now_iso="2026-01-01T00:00:00")
+
+    def test_residue_all_quarantined_broker0_then_manual_recovery(self):
+        # 내부 9종목 모두 이미 격리 + broker0 → authoritative false, buy false, 추가 격리·삭제 0
+        self._seed_internal(INTERNAL_9)                    # qty5 avg50
+        self._quarantine_all(INTERNAL_9)
+        self.assertEqual(len(self.mgr.pos_mgr.active_positions()), 0)
+        self.assertEqual(len(self.mgr.pos_mgr.quarantined_positions()), 9)
+        self.api.balance_full = _snap([], complete=True)  # broker0
+        h = self.mgr.us_reconcile_positions()
+        self.assertFalse(h["authoritative"])
+        self.assertFalse(h["authoritative_empty"])
+        self.assertFalse(h["buy_allowed"])
+        self.assertEqual(h["quarantined"], 0)             # 추가 격리 0
+        self.assertEqual(h["stale_deleted"], 0)           # 삭제 0
+        self.assertEqual(len(self.mgr.pos_mgr.quarantined_positions()), 9)  # 보존
+        # 격리 사유·snapshot 확인 가능(req4)
+        audit = self.mgr.us_quarantine_audit()
+        self.assertEqual(len(audit), 9)
+        self.assertTrue(all(a.get("reason") and a.get("snapshot_id") for a in audit))
+        # 운영자 확인 없이 unquarantine 거부(req5)
+        r0 = self.mgr.us_manual_unquarantine_positions(INTERNAL_9, operator="", reason="x")
+        self.assertFalse(r0["ok"])
+        self.assertEqual(r0["reason"], "operator_verification_required")
+        r0b = self.mgr.us_manual_unquarantine_positions(
+            INTERNAL_9, operator="opA", reason="x", verified_held_at_broker=False)
+        self.assertFalse(r0b["ok"])
+        self.assertEqual(len(self.mgr.pos_mgr.active_positions()), 0)   # 변경 없음
+        # 확인된 9종목 수동복구 → active9, quarantine0, held_basis>0, 관리9
+        r1 = self.mgr.us_manual_unquarantine_positions(
+            INTERNAL_9, operator="opA", reason="KIS앱 실보유 확인", verified_held_at_broker=True)
+        self.assertTrue(r1["ok"])
+        self.assertEqual(r1["count"], 9)
+        self.assertEqual(len(self.mgr.pos_mgr.active_positions()), 9)
+        self.assertEqual(len(self.mgr.pos_mgr.quarantined_positions()), 0)
+        exp = self.mgr.us_exposure_health()
+        self.assertAlmostEqual(exp["held_basis_usd"], 9 * 5 * 50.0, places=2)
+        managed = 0
+        for s in INTERNAL_9:
+            rr = self._manage(s, 51.0)   # 수익전용 트레일링 작동(HOLD)
+            self.assertIn(rr["action"], ("HOLD", "SELL_ACCEPTED"))
+            managed += 1
+        self.assertEqual(managed, 9)
+        self.assertEqual(self.api.sell_calls, [])
+        # 재시작 후 active9 유지
+        mgr2 = self._new_mgr()
+        self.assertEqual(len(mgr2.pos_mgr.active_positions()), 9)
+        self.assertEqual(len(mgr2.pos_mgr.quarantined_positions()), 0)
+        # 이후 정상 broker9 → 정합화 정상(buy 게이트 복구)
+        mgr2.api.balance_full = _snap(
+            [_holding(s, 5, 50.0, 51.0) for s in INTERNAL_9], complete=True)
+        h3 = mgr2.us_reconcile_positions()
+        self.assertTrue(h3["authoritative"])
+        self.assertTrue(h3["buy_allowed"])
+        self.assertEqual(len(mgr2.pos_mgr.active_positions()), 9)
+
+    def test_manual_unquarantine_only_listed_symbols(self):
+        # 수동 해제 목록에 없는 종목은 변경하지 않는다(req7)
+        self._seed_internal(["AAA", "BBB", "CCC"])
+        self._quarantine_all(["AAA", "BBB", "CCC"])
+        r = self.mgr.us_manual_unquarantine_positions(["AAA"], operator="op", reason="확인")
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["unquarantined"], ["AAA"])
+        self.assertFalse(self.mgr.pos_mgr.positions["AAA"].is_quarantined)
+        self.assertTrue(self.mgr.pos_mgr.positions["BBB"].is_quarantined)   # 미변경
+        self.assertTrue(self.mgr.pos_mgr.positions["CCC"].is_quarantined)
+        # 미격리/미존재 심볼은 skipped
+        r2 = self.mgr.us_manual_unquarantine_positions(["AAA", "ZZZ"], operator="op", reason="x")
+        self.assertIn("AAA", r2["skipped"])   # 이미 active
+        self.assertIn("ZZZ", r2["skipped"])   # 미존재
+
     def test_error_empty_no_quarantine(self):
         # 오류 empty(ok=False) → 비권위: 격리/삭제 없음, BUY 스킵
         self._seed_internal(["AAA", "BBB"])
