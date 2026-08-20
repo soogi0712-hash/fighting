@@ -23,6 +23,9 @@ class FakePosMgr:
     def add(self, pos):
         self.positions[pos.symbol] = pos
 
+    def active_positions(self):
+        return self.positions
+
 
 def make_us_buy(order_avails, buy_results, fx=1300.0,
                 capacity_usd=1e9, active=False):
@@ -31,8 +34,13 @@ def make_us_buy(order_avails, buy_results, fx=1300.0,
     order_avails: _do_buy 의 주문별 get_us_available_amounts 반환 시퀀스(iter).
     buy_results : api.buy_us 반환 시퀀스(iter).
     """
+    import threading as _th
     us = USStrategyManager.__new__(USStrategyManager)
     us.US_MAX_LOSS_PER_SYMBOL_USD = 1e9   # 위험 사이징 비활성(KIS 예산 사이징에 집중)
+    us.US_MAX_TOTAL_EXPOSURE_USD  = 1e9   # 총노출 제한 비활성(예산 사이징에 집중)
+    us._us_order_lock = _th.Lock()
+    us._us_exposure_reservations = {}
+    us._us_res_counter = 0
     us.pos_mgr = FakePosMgr()
     us._us_pending_buy_meta = {}
     us._us_pending_sell_meta = {}
@@ -76,6 +84,16 @@ IV = {"buy_score": 1.0, "intraday_pct": 0.0, "vol_ratio": 1.0, "vwap": 0.0,
 @patch.object(usm, "_US_JOURNAL_ENABLED", False)
 @patch.object(usm, "_US_LIFECYCLE_ENABLED", False)
 class TestUSBuyOrderSizing(unittest.TestCase):
+
+    def test_initial_buy_capped_at_200(self):
+        """운용자금 $3,000 신정책: 최초 BUY 예산 $200 상한 → $10 종목이면 20주($200)."""
+        us = make_us_buy(
+            order_avails=[{"ok": True, "usd": 1e9, "krw": 0.0, "qty": 999}],
+            buy_results=[{"rt_cd": "0"}])
+        res = us._do_buy("AAPL", "Apple", "NASD", 10.0, SESS, IV)
+        self.assertEqual(res["action"], "BUY_ACCEPTED")
+        self.assertEqual(us.api.buy_us.call_args[0][1], 20)          # 20주 = $200
+        self.assertEqual(usm.INVEST_PER_TRADE_USD, 200.0)            # 코드 기본값 $200
 
     def test_deposit_large_but_qty_small(self):
         """가능금액 큼 but KIS 주문가능수량 3 → 3주만 주문."""

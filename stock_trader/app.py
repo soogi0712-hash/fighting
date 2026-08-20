@@ -3313,6 +3313,14 @@ def api_status():
         "us_maxloss_health": (
             _us_strategy.us_maxloss_health() if _us_strategy else {}
         ),
+        # ★ 총노출액(실보유 매입원금 + 미체결 BUY 주문원금) + 리스크 상한 스냅샷
+        "us_exposure_health": (
+            _us_strategy.us_exposure_health() if _us_strategy else {}
+        ),
+        # ★ 환경변수 파싱 경고(비수치·0·음수 → 안전 기본값 적용)
+        "us_config_health": (
+            _us_strategy.us_config_health() if _us_strategy else {}
+        ),
     })
 
 @app.route("/api/session")
