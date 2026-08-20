@@ -1,9 +1,12 @@
-"""US 손실 회복 + 수익 트레일링 상태기계 — 실제 완료봉 기반 종가확정 테스트.
+"""US 수익 전용 트레일링(손절 없음) 상태기계 — 순수 로직 테스트.
 
-핵심(§1~§5):
-  breach 판정은 '실제 마감 완료봉 종가(bar1_close/bar5_close)'로, 급락 안전매도와
-  하드손절은 '실시간 가격(cur_price/net)'로. 완료봉은 연속으로 세고 정상봉이 끼면
-  초기화. 동일 봉 중복/늦은 정정/역행/데이터 없음을 안전 처리.
+정책(재정의):
+  · 손실 구간에서는 어떤 자동 SELL 도 없다(HOLD, 재상승 대기). 고정 -5/-6 손절,
+    구조하락+금액한도 손실매도, RECOVERY 손실청산 분기 전부 비활성화.
+  · 활성화: 순수익률 최고점 >= trail_pct + MIN_NET_PROFIT_PCT (sticky).
+  · 매도: 완성봉(5분 우선/없으면 1분) 종가가 고점 대비 동적 트레일 이탈 AND
+          수수료·환율 반영 순손익률 >= MIN_NET_PROFIT_PCT 일 때만.
+  · highest·활성상태·마지막 확인봉은 재시작 후에도 영속.
 """
 import os
 import sys
@@ -19,178 +22,227 @@ T1 = T0 + timedelta(minutes=1)
 T2 = T0 + timedelta(minutes=2)
 
 
-def _recovery_state(high_price=100.0, high_net=-5.0):
-    s = R.default_state()
-    s["management_mode"]       = R.MODE_RECOVERY_WAIT
-    s["recovery_started_at"]   = T0.isoformat()
-    s["recovery_high_price"]   = high_price
-    s["recovery_high_net_pct"] = high_net
-    return s
-
-
-def _rec(state, net, cur, now=T1, atr=0.0, b5=None, b5c=None, sym=False, atr_valid=True):
-    return R.evaluate(state, net, cur, now, atr_pct=atr, bar5_ts=b5,
-                      bar5_close=b5c, symbol_risk_exceeded=sym, atr_valid=atr_valid)
-
-
-def _profit_state(highest=100.0, active=False, high_net=None, closes=0,
-                  prev=0, last_bar=None):
+def _profit_state(highest=100.0, active=False, high_net=None, last_bar=None):
     s = R.default_state(highest_price=highest)
     s["profit_trail_active"]  = active
     s["profit_high_net_pct"]  = high_net
-    s["profit_breach_closes"] = closes
-    s["profit_prev_breach_closes"] = prev
     s["last_profit_breach_bar_at"] = last_bar
     return s
 
 
-def _pt(state, net=1.0, cur=None, atr=0.0, ema9=98.0, rising=True,
-        b1=None, b1c=None, b5=None, b5c=None):
-    # cur 기본 = bar close(급락 아님). breach 는 bar close 로 판정.
-    if cur is None:
-        cur = b1c if b1c is not None else 100.0
-    return R.evaluate_profit_trailing(state, net, cur, atr_pct=atr, ema9=ema9,
-                                      ema9_rising=rising, bar1_ts=b1, bar1_close=b1c,
+def _pt(state, net=1.0, cur=100.0, atr=0.0, b1=None, b1c=None, b5=None, b5c=None):
+    return R.evaluate_profit_trailing(state, net, cur, atr_pct=atr,
+                                      bar1_ts=b1, bar1_close=b1c,
                                       bar5_ts=b5, bar5_close=b5c)
 
 
+def _ctx(b1=None, b1c=None, b5=None, b5c=None, atr=0.0):
+    return {"atr_pct": atr, "bar1_ts": b1, "bar1_close": b1c,
+            "bar5_ts": b5, "bar5_close": b5c}
+
+
 # ══════════════════════════════════════════════════════════════
-# 손실 관리(RECOVERY_WAIT) — 고정 손절 제거 / 구조적 붕괴·계좌위험만 매도
+# 정책 상수
 # ══════════════════════════════════════════════════════════════
-class RecoveryEnterTest(unittest.TestCase):
-    def test_enter_minus_4_99_stays_normal(self):
-        d = _rec(R.default_state(), -4.99, 95.01, now=T0)
-        self.assertEqual(d.mode, R.MODE_NORMAL)
+class PolicyConstantsTest(unittest.TestCase):
+    def test_min_net_profit_pct(self):
+        self.assertEqual(R.MIN_NET_PROFIT_PCT, 0.3)
 
-    def test_enter_exactly_minus_5_no_sell(self):
-        d = _rec(R.default_state(highest_price=100.0), -5.0, 95.0, now=T0)
-        self.assertEqual(d.mode, R.MODE_RECOVERY_WAIT)
+    def test_trail_clamp_bounds(self):
+        self.assertEqual(R.PROFIT_TRAIL_MIN, 1.0)
+        self.assertEqual(R.PROFIT_TRAIL_MAX, 2.5)
+
+
+# ══════════════════════════════════════════════════════════════
+# 손실 구간: 어떤 자동 SELL 도 없다
+# ══════════════════════════════════════════════════════════════
+class NoLossSellTest(unittest.TestCase):
+    def test_buy_then_minus1_holds(self):
+        d = R.decide_management_action(R.default_state(highest_price=100.0),
+                                       -1.0, 99.0, T0, ctx=_ctx())
+        self.assertEqual(d.action, R.ACT_HOLD)
         self.assertFalse(d.sell)
 
-    def test_minus_6_is_warning_not_sell(self):
-        d = _rec(R.default_state(highest_price=100.0), -6.0, 94.0, now=T0)  # 진입
-        self.assertFalse(d.sell)                        # -6 은 경고, 매도 아님
-        self.assertTrue(d.state["recovery_warn"])
-        d2 = _rec(d.state, -6.5, 93.5)                  # RECOVERY_WAIT 유지, 여전히 매도 안 함
-        self.assertFalse(d2.sell)
-        self.assertEqual(d2.mode, R.MODE_RECOVERY_WAIT)
+    def test_buy_then_minus5_holds_no_recovery_sell(self):
+        d = R.decide_management_action(R.default_state(highest_price=100.0),
+                                       -5.0, 95.0, T0, ctx=_ctx(b5="c1", b5c=95.0))
+        self.assertEqual(d.action, R.ACT_HOLD)
+        self.assertEqual(d.state["management_mode"], R.MODE_NORMAL)   # RECOVERY 진입 안 함
 
-
-class NoFixedStopTest(unittest.TestCase):
-    def test_no_hard_stop_minus_6(self):
-        # 예전 -6 하드손절 제거: RECOVERY_WAIT 에서 -6 이어도 매도 안 함
-        d = _rec(_recovery_state(100.0), -6.0, 94.0, b5=None, b5c=None)
+    def test_buy_then_minus10_holds(self):
+        d = R.decide_management_action(R.default_state(highest_price=100.0),
+                                       -10.0, 90.0, T0, ctx=_ctx(b5="c1", b5c=90.0))
         self.assertFalse(d.sell)
 
-    def test_no_simple_high_drop_sell(self):
-        # recovery high 대비 단순 하락(예: -3%)만으로는 매도하지 않는다
-        d = _rec(_recovery_state(100.0), -3.0, 97.0, b5="c1", b5c=97.0)  # -3% < 구조3%
+    def test_structural_breakdown_plus_big_loss_still_holds(self):
+        # 구조적 5분봉 연속 붕괴 + 큰 손실이어도 손절 없음 → HOLD (정책 비활성화)
+        s = R.default_state(highest_price=100.0)
+        d = R.decide_management_action(s, -6.0, 94.0, T0, ctx=_ctx(b5="c1", b5c=94.0, atr=1.0))
+        d = R.decide_management_action(d.state, -6.5, 93.5, T1,
+                                       ctx=_ctx(b5="c2", b5c=93.5, atr=1.0))
+        d = R.decide_management_action(d.state, -7.0, 93.0, T2,
+                                       ctx=_ctx(b5="c3", b5c=93.0, atr=1.0))
         self.assertFalse(d.sell)
 
-
-class LossSellConjunctionTest(unittest.TestCase):
-    """개별 종목 손실 매도는 '구조적 붕괴 연속 2봉 AND 종목 금액손실 한도 초과'만.
-    계좌 위험한도는 개별 종목 매도 게이트가 아니다."""
-    def _confirm_struct(self, sym):
-        d = _rec(_recovery_state(100.0), -4.0, 96.0, atr=0.0, b5="c1", b5c=96.0, sym=sym)
-        return _rec(d.state, -4.2, 95.8, atr=0.0, b5="c2", b5c=95.8, sym=sym)
-
-    def test_both_conditions_sell(self):
-        d = self._confirm_struct(sym=True)
-        self.assertTrue(d.sell)
-        self.assertIn("structural_breakdown+symbol_risk", d.reason)
-
-    def test_struct_only_holds(self):
-        d = self._confirm_struct(sym=False)         # 구조 확정이나 종목한도 미초과
+    def test_loss_rebound_then_redrop_holds(self):
+        # 손실 중 반등 후 재하락 → 매도 0회(수익 미확보로 트레일 미활성)
+        s = R.default_state(highest_price=100.0)
+        d = R.decide_management_action(s, -4.0, 96.0, T0, ctx=_ctx())           # 손실
+        d = R.decide_management_action(d.state, -1.0, 99.0, T1, ctx=_ctx())     # 반등(여전히 손실)
+        d = R.decide_management_action(d.state, -3.0, 97.0, T2,
+                                       ctx=_ctx(b1="a", b1c=97.0))              # 재하락
         self.assertFalse(d.sell)
-        self.assertEqual(d.state["struct_breach_closes"], 2)
+        self.assertFalse(d.state["profit_trail_active"])
 
-    def test_symbol_only_without_struct_holds(self):
-        # 종목한도 초과이나 구조 연속 미확인(1봉) → HOLD (단순 하락 보호)
-        d = _rec(_recovery_state(100.0), -4.0, 96.0, atr=0.0, b5="c1", b5c=96.0, sym=True)
+    def test_evaluate_never_sells(self):
+        # 구 evaluate 는 하위호환용이지만 절대 SELL 하지 않는다
+        s = R.default_state(highest_price=100.0)
+        d = R.evaluate(s, -8.0, 92.0, T0, atr_pct=1.0, bar5_ts="c1", bar5_close=92.0,
+                       symbol_risk_exceeded=True, atr_valid=True)
         self.assertFalse(d.sell)
-        self.assertEqual(d.state["struct_breach_closes"], 1)
+        self.assertEqual(d.action, R.ACT_HOLD)
 
-    def test_non_consecutive_resets(self):
-        d = _rec(_recovery_state(100.0), -4.0, 96.0, atr=0.0, b5="c1", b5c=96.0, sym=True)
-        d = _rec(d.state, -2.5, 97.5, atr=0.0, b5="c2", b5c=97.5, sym=True)  # 정상 → 초기화
-        self.assertEqual(d.state["struct_breach_closes"], 0)
+
+# ══════════════════════════════════════════════════════════════
+# 활성화: highest_net >= trail_pct + MIN_NET_PROFIT_PCT
+# ══════════════════════════════════════════════════════════════
+class ActivateTest(unittest.TestCase):
+    def test_plus_1_29_not_active(self):
+        # trail 1.0(atr0) + 0.3 = 1.3 → 1.29 미활성
+        r = _pt(_profit_state(highest=101.29), net=1.29, cur=101.29)
+        self.assertFalse(r["state"]["profit_trail_active"])
+        self.assertFalse(r["sell"])
+
+    def test_plus_1_30_activates_at_trail_1(self):
+        # trail 1.0 + 0.3 = 1.3 → 1.30 활성
+        r = _pt(_profit_state(highest=101.30), net=1.30, cur=101.30)
+        self.assertTrue(r["state"]["profit_trail_active"])
+        self.assertFalse(r["sell"])
+
+    def test_activation_sticky(self):
+        r = _pt(_profit_state(highest=101.30), net=1.30, cur=101.30)
+        self.assertTrue(r["state"]["profit_trail_active"])
+        # 이후 수익률이 내려가도 활성 유지(sticky)
+        r2 = _pt(r["state"], net=0.5, cur=100.5)
+        self.assertTrue(r2["state"]["profit_trail_active"])
+
+    def test_activation_need_scales_with_atr(self):
+        # atr 큼 → trail 2.5 → 활성 need = 2.8. hi=2.0 이면 미활성.
+        r = _pt(_profit_state(highest=102.0), net=2.0, cur=102.0, atr=10.0)
+        self.assertFalse(r["state"]["profit_trail_active"])
+        # hi=2.9 이면 활성
+        r2 = _pt(_profit_state(highest=102.9), net=2.9, cur=102.9, atr=10.0)
+        self.assertTrue(r2["state"]["profit_trail_active"])
+
+
+# ══════════════════════════════════════════════════════════════
+# 매도: 완성봉 트레일 이탈 AND 순손익 >= 0.3%
+# ══════════════════════════════════════════════════════════════
+class ProfitSellGateTest(unittest.TestCase):
+    def _active(self, highest=102.0):
+        return _profit_state(highest=highest, active=True, high_net=3.0)
+
+    def test_no_completed_bar_holds(self):
+        r = _pt(self._active(), net=1.0, cur=100.5, b1=None, b1c=None)
+        self.assertFalse(r["sell"])
+        self.assertIn("no_completed_bar", r["reason"])
+
+    def test_bar_not_below_trail_holds(self):
+        # 완성봉 종가가 트레일(고점102×-1%=100.98) 위 → HOLD
+        r = _pt(self._active(), net=1.0, cur=101.2, b1="a", b1c=101.2)
+        self.assertFalse(r["sell"])
+
+    def test_breach_but_net_0_29_holds(self):
+        # 완성봉 이탈(100.7<100.98) but 순손익 +0.29% → HOLD(재상승 대기)
+        r = _pt(self._active(), net=0.29, cur=100.54, b1="a", b1c=100.7)
+        self.assertFalse(r["sell"])
+        self.assertIn("net_below_min", r["reason"])
+
+    def test_breach_and_net_0_30_sells(self):
+        # 완성봉 이탈 AND 순손익 +0.30% → SELL
+        r = _pt(self._active(), net=0.30, cur=100.55, b1="a", b1c=100.7)
+        self.assertTrue(r["sell"])
+        self.assertIn("profit_trail_exit", r["reason"])
+
+    def test_bar5_preferred_over_bar1(self):
+        # 5분봉이 있으면 우선 사용
+        r = _pt(self._active(), net=1.0, cur=101.0, b1="a", b1c=101.5, b5="b5", b5c=100.5)
+        self.assertTrue(r["sell"])
+        self.assertIn("5m", r["reason"])
+
+    def test_last_confirmed_bar_persisted(self):
+        r = _pt(self._active(), net=1.0, cur=101.0, b1="2231", b1c=101.2)  # 미이탈이어도
+        self.assertEqual(r["state"]["last_profit_breach_bar_at"], "2231")
+
+    def test_loss_never_sells_even_when_active(self):
+        # 활성 상태여도 순손익 음수면 절대 SELL 안 함(트레일 이탈이어도)
+        r = _pt(self._active(), net=-0.5, cur=99.0, b1="a", b1c=100.0)
+        self.assertFalse(r["sell"])
+
+
+# ══════════════════════════════════════════════════════════════
+# 재시작 영속: highest·활성상태·마지막 확인봉
+# ══════════════════════════════════════════════════════════════
+class RestartPersistTest(unittest.TestCase):
+    def test_restart_preserves_highest_active_lastbar(self):
+        r = _pt(_profit_state(highest=102.0), net=1.5, cur=102.0)   # 활성화
+        r = _pt(r["state"], net=1.0, cur=101.0, b1="2231", b1c=101.2)
+        reloaded = R.merge_state(r["state"])
+        self.assertTrue(reloaded["profit_trail_active"])
+        self.assertEqual(reloaded["highest_price"], 102.0)
+        self.assertEqual(reloaded["last_profit_breach_bar_at"], "2231")
+
+    def test_restart_then_breach_sells(self):
+        r = _pt(_profit_state(highest=102.0), net=1.5, cur=102.0)   # 활성화
+        reloaded = R.merge_state(r["state"])
+        r2 = _pt(reloaded, net=0.4, cur=100.6, b1="2232", b1c=100.7)  # 이탈+순익>0.3
+        self.assertTrue(r2["sell"])
+
+
+# ══════════════════════════════════════════════════════════════
+# decide — 단일 매도판정 권위(손절 없음)
+# ══════════════════════════════════════════════════════════════
+class DecideTest(unittest.TestCase):
+    def test_exit_pending_holds(self):
+        s = R.default_state(); s["management_mode"] = R.MODE_EXIT
+        d = R.decide_management_action(s, 3.0, 105.0, T0, ctx=_ctx(b5="b5", b5c=100.0))
+        self.assertEqual(d.action, R.ACT_HOLD)   # EXIT 유지, 재제출 없음
+        self.assertEqual(d.state["management_mode"], R.MODE_EXIT)
+
+    def test_normalizes_legacy_recovery_wait(self):
+        s = R.default_state(highest_price=100.0)
+        s["management_mode"] = R.MODE_RECOVERY_WAIT
+        d = R.decide_management_action(s, -4.0, 96.0, T0, ctx=_ctx())
+        self.assertEqual(d.state["management_mode"], R.MODE_NORMAL)  # NORMAL 정규화
         self.assertFalse(d.sell)
 
-    def test_atr_widens_structural_distance(self):
-        d = _rec(_recovery_state(100.0), -4.0, 96.0, atr=2.0, b5="c1", b5c=96.0, sym=True)
-        self.assertEqual(d.state["struct_breach_closes"], 0)   # 거리6% → -4% 미이탈
+    def test_profit_exit_via_decide(self):
+        s = R.default_state(highest_price=100.0)
+        d = R.decide_management_action(s, 1.5, 101.5, T0, ctx=_ctx())   # 활성화(highest=101.5)
+        self.assertTrue(d.state["profit_trail_active"])
+        # 완성봉 종가 100.4 < 트레일(101.5×0.99=100.485) 이탈 + 순익 +0.5% → SELL
+        d2 = R.decide_management_action(d.state, 0.5, 100.6, T1,
+                                        ctx=_ctx(b1="a", b1c=100.4))
+        self.assertTrue(d2.sell)
+        self.assertEqual(d2.action, R.ACT_SELL_ALL)
 
-    def test_atr_invalid_no_structural_sell(self):
-        # ATR 결측(atr_valid=False) → 구조 판정 보류(카운트도 안 함) → HOLD
-        d = _rec(_recovery_state(100.0), -4.0, 96.0, atr=0.0, b5="c1", b5c=96.0,
-                 sym=True, atr_valid=False)
-        d = _rec(d.state, -4.2, 95.8, atr=0.0, b5="c2", b5c=95.8,
-                 sym=True, atr_valid=False)
-        self.assertFalse(d.sell)
-        self.assertEqual(d.state["struct_breach_closes"], 0)
+    def test_never_returns_defer(self):
+        for pct in [-5.0, 0.0, 1.5, 2.5, 10.0]:
+            d = R.decide_management_action(R.default_state(highest_price=100.0 + pct),
+                                           pct, 100.0 + pct, T0, ctx=_ctx())
+            self.assertNotEqual(d.action, R.ACT_DEFER)
 
-    def test_no_5m_data_no_sell(self):
-        d = _rec(_recovery_state(100.0), -5.0, 95.0, b5=None, b5c=None, sym=True)
-        self.assertFalse(d.sell)
-
-
-class RecoveryToNormalTest(unittest.TestCase):
-    def test_minus_2_marks_success_no_normal(self):
-        d = _rec(_recovery_state(100.0), -2.0, 98.5)
-        self.assertEqual(d.mode, R.MODE_RECOVERY_WAIT)
-        self.assertTrue(d.state["recovery_reached_exit"])
-
-    def test_zero_recovers_to_normal(self):
-        d = _rec(_recovery_state(100.0), 0.0, 100.5)
-        self.assertEqual(d.mode, R.MODE_NORMAL)
-        self.assertIsNone(d.state["recovery_high_price"])
-
-    def test_crash_then_rebound_no_sell(self):
-        # 급락 -5→-6 (경고) → 반등 → 0% 회복 → NORMAL, 매도 0회(구조붕괴/위험 미충족)
-        d = _rec(R.default_state(highest_price=100.0), -5.0, 95.0, now=T0)   # 진입
-        d = _rec(d.state, -6.2, 93.8, b5="c1", b5c=93.8, sym=True)          # 급락, 단일봉
-        self.assertFalse(d.sell)                # 구조 1봉만 → 종목위험 충족해도 HOLD
-        self.assertTrue(d.state["recovery_warn"])
-        d = _rec(d.state, -3.0, 97.0)                                        # 반등
-        self.assertFalse(d.sell)
-        d = _rec(d.state, 0.1, 100.1)                                       # 손익분기 회복
-        self.assertEqual(d.mode, R.MODE_NORMAL)
-        self.assertFalse(d.sell)
+    def test_highest_tracked_from_entry(self):
+        d = R.decide_management_action(R.default_state(highest_price=0.0),
+                                       0.5, 100.5, T0, ctx=_ctx())
+        self.assertGreaterEqual(d.state["highest_price"], 100.5)
 
 
-class RecoveryAnalyticsTest(unittest.TestCase):
-    def test_records_on_recovered(self):
-        # 진입 후 최대하락 갱신 → 0% 회복 시 분석 레코드 생성
-        d = _rec(R.default_state(highest_price=100.0), -5.0, 95.0, now=T0)   # 진입
-        d = _rec(d.state, -6.5, 93.5, now=T1)                                # 최대하락 -6.5
-        d = _rec(d.state, 0.2, 100.2, now=T2)                                # 회복 → NORMAL
-        rec = d.state["recovery_last_outcome"]
-        self.assertEqual(rec["outcome"], "recovered")
-        self.assertAlmostEqual(rec["entry_net_pct"], -5.0)
-        self.assertAlmostEqual(rec["max_drawdown_net_pct"], -6.5)
-        self.assertAlmostEqual(rec["final_net_pct"], 0.2)
-        self.assertEqual(rec["hypothetical_early_stop_net_pct"], -5.0)   # 조기손절 가상기준
-        self.assertGreater(rec["recovery_seconds"], 0)
-
-    def test_records_on_structural_and_symbol_risk_sell(self):
-        d = _rec(_recovery_state(100.0), -4.0, 96.0, atr=0.0, b5="c1", b5c=96.0, sym=True)
-        d = _rec(d.state, -4.2, 95.8, atr=0.0, b5="c2", b5c=95.8, sym=True)
-        self.assertTrue(d.sell)
-        rec = d.state["recovery_last_outcome"]
-        self.assertEqual(rec["outcome"], "structural_and_symbol_risk_sell")
-        self.assertIsNotNone(rec["max_drawdown_net_pct"])
-
-
+# ══════════════════════════════════════════════════════════════
+# 위험 사이징(BUY 수량 축소) — 유지
+# ══════════════════════════════════════════════════════════════
 class RiskSizingTest(unittest.TestCase):
-    def test_reduces_qty_for_high_atr(self):
-        # ATR 클수록 위험거리 넓어져 수량 축소
-        q_lo = R.risk_capped_qty(100.0, atr_pct=1.0, budget_qty=100, max_loss_usd=60)
-        q_hi = R.risk_capped_qty(100.0, atr_pct=5.0, budget_qty=100, max_loss_usd=60)
-        self.assertGreater(q_lo, q_hi)
-
     def test_caps_at_max_loss(self):
-        # max_loss=30, price=100, 구조거리=3%(atr0) → per-share risk=3 → cap=10
         q = R.risk_capped_qty(100.0, atr_pct=0.0, budget_qty=100, max_loss_usd=30)
         self.assertEqual(q, 10)
 
@@ -198,203 +250,17 @@ class RiskSizingTest(unittest.TestCase):
         q = R.risk_capped_qty(10.0, atr_pct=0.0, budget_qty=5, max_loss_usd=100000)
         self.assertEqual(q, 5)
 
-    def test_zero_price_returns_budget(self):
-        self.assertEqual(R.risk_capped_qty(0.0, 1.0, 7, 60), 7)
-
-
-# ══════════════════════════════════════════════════════════════
-# 수익 트레일링 — 활성/완료봉확정/연속/EMA9가속/급락/5분/정정
-# ══════════════════════════════════════════════════════════════
-class ProfitActivateTest(unittest.TestCase):
-    def test_plus_1_49_not_active(self):
-        r = _pt(_profit_state(), net=1.49, cur=101.49)
-        self.assertFalse(r["state"]["profit_trail_active"])
-
-    def test_plus_1_50_activates(self):
-        r = _pt(_profit_state(highest=101.5), net=1.50, cur=101.5)
-        self.assertTrue(r["state"]["profit_trail_active"])
-        self.assertFalse(r["sell"])
-
-
-class ProfitBarConfirmTest(unittest.TestCase):
-    def _st(self):
-        return _profit_state(highest=100.0, active=True, high_net=3.0)
-
-    def test_in_progress_bar_no_count(self):
-        # 완료봉 없음(None) → count 0, HOLD (미완성 22:31봉)
-        r = _pt(self._st(), b1=None, b1c=None, cur=98.8)
-        self.assertEqual(r["state"]["profit_breach_closes"], 0)
-        self.assertFalse(r["sell"])
-
-    def test_completed_bar_breach_count_1(self):
-        r = _pt(self._st(), b1="2231", b1c=98.8, cur=98.8)   # -1.2% 이탈
-        self.assertEqual(r["state"]["profit_breach_closes"], 1)
-        self.assertFalse(r["sell"])                          # 1봉 정상경로 HOLD
-
-    def test_same_bar_10x_count_stays_1(self):
-        s = self._st()
-        for _ in range(10):
-            r = _pt(s, b1="2231", b1c=98.8, cur=98.8)
-            s = r["state"]
-            self.assertFalse(r["sell"])
-        self.assertEqual(s["profit_breach_closes"], 1)
-
-    def test_two_consecutive_bars_sell(self):
-        r1 = _pt(self._st(), b1="2231", b1c=98.8, cur=98.8)
-        r2 = _pt(r1["state"], b1="2232", b1c=98.8, cur=98.8)
-        self.assertTrue(r2["sell"])
-
-    def test_non_consecutive_no_sell(self):
-        # 22:31 이탈(1) → 22:32 정상(0) → 22:33 이탈(1) → HOLD
-        r = _pt(self._st(), b1="2231", b1c=98.8, cur=98.8)
-        self.assertEqual(r["state"]["profit_breach_closes"], 1)
-        r = _pt(r["state"], b1="2232", b1c=100.5, cur=100.5)     # 정상봉
-        self.assertEqual(r["state"]["profit_breach_closes"], 0)
-        r = _pt(r["state"], b1="2233", b1c=98.8, cur=98.8)       # 다시 이탈
-        self.assertEqual(r["state"]["profit_breach_closes"], 1)
-        self.assertFalse(r["sell"])
-
-    def test_restart_second_bar_sells(self):
-        r1 = _pt(self._st(), b1="2231", b1c=98.8, cur=98.8)
-        reloaded = R.merge_state(r1["state"])   # 재시작(저장·복원)
-        self.assertEqual(reloaded["profit_breach_closes"], 1)
-        self.assertEqual(reloaded["last_profit_breach_bar_at"], "2231")
-        r2 = _pt(reloaded, b1="2232", b1c=98.8, cur=98.8)
-        self.assertTrue(r2["sell"])
-
-    def test_late_correction_breach_to_normal(self):
-        r1 = _pt(self._st(), b1="2231", b1c=98.8, cur=98.8)      # 이탈 → 1
-        self.assertEqual(r1["state"]["profit_breach_closes"], 1)
-        r2 = _pt(r1["state"], b1="2231", b1c=100.5, cur=100.5)   # 같은 봉 정정→정상
-        self.assertEqual(r2["state"]["profit_breach_closes"], 0)  # 안전 교정
-
-    def test_regression_ignored(self):
-        r1 = _pt(self._st(), b1="2232", b1c=98.8, cur=98.8)      # 1
-        r2 = _pt(r1["state"], b1="2231", b1c=98.8, cur=98.8)     # 역행 → 무시
-        self.assertEqual(r2["state"]["profit_breach_closes"], 1)
-
-    def test_ema9_rising_not_veto_two_bars(self):
-        # EMA9 상승·종가>EMA9 여도 완료봉 2개면 SELL
-        r1 = _pt(self._st(), b1="2231", b1c=98.8, cur=98.8, ema9=98.0, rising=True)
-        r2 = _pt(r1["state"], b1="2232", b1c=98.8, cur=98.8, ema9=98.0, rising=True)
-        self.assertTrue(r2["sell"])
-
-    def test_ema9_down_one_bar_fast(self):
-        # 이탈 완료봉 + 종가<EMA9 → 1봉 빠른 SELL
-        r = _pt(self._st(), b1="2231", b1c=98.8, cur=98.8, ema9=99.5, rising=False)
-        self.assertTrue(r["sell"])
-        self.assertIn("fast", r["reason"])
-
-    def test_ema9_down_alone_no_sell(self):
-        # 이탈 없는데 종가<EMA9 만으로는 SELL 금지
-        r = _pt(self._st(), b1="2231", b1c=100.5, cur=100.5, ema9=101.0, rising=False)
-        self.assertFalse(r["sell"])
-
-    def test_bar5_completed_immediate(self):
-        r = _pt(self._st(), b1=None, b1c=None, b5="b5", b5c=98.8, cur=100.0)
-        self.assertTrue(r["sell"])
-        self.assertIn("bar5", r["reason"])
-
-    def test_bar5_in_progress_none_holds(self):
-        # 진행중 5분봉(None) → HOLD
-        r = _pt(self._st(), b1=None, b1c=None, b5=None, b5c=None, cur=100.0)
-        self.assertFalse(r["sell"])
-
-    def test_panic_live_immediate(self):
-        # 실시간가 급락(추가 0.5%p) → 봉 없이 즉시 SELL
-        r = _pt(self._st(), b1=None, b1c=None, cur=98.4)   # live -1.6% <= -1.5
-        self.assertTrue(r["sell"])
-        self.assertIn("panic", r["reason"])
-
-    def test_missing_data_holds_count(self):
-        s = _profit_state(highest=100.0, active=True, high_net=3.0, closes=1,
-                          prev=0, last_bar="2231")
-        r = _pt(s, b1=None, b1c=None, cur=100.0)   # 데이터 없음 → 카운트 유지, 매도 보류
-        self.assertEqual(r["state"]["profit_breach_closes"], 1)
-        self.assertFalse(r["sell"])
-
-
-class ProfitTrailWidthTest(unittest.TestCase):
-    def test_atr_clamp_min(self):
-        # atr=0 → trail=1.0. 완료봉 -1.1% + 종가<EMA9 → fast SELL
-        r = _pt(_profit_state(100.0, active=True, high_net=3.0),
-                b1="a", b1c=98.9, cur=98.9, ema9=99.5, rising=False)
-        self.assertTrue(r["sell"])
-
-    def test_atr_clamp_max(self):
-        # atr 큼 → trail=2.5. 완료봉 -2.0% > -2.5 → 미이탈 HOLD
-        r = _pt(_profit_state(100.0, active=True, high_net=3.0),
-                atr=10.0, b1="a", b1c=98.0, cur=98.0, ema9=99.5, rising=False)
-        self.assertFalse(r["sell"])
-
-
-# ══════════════════════════════════════════════════════════════
-# decide — 단일 매도판정 권위(DEFER 없음)
-# ══════════════════════════════════════════════════════════════
-class DecideTest(unittest.TestCase):
-    def _ctx(self, b1=None, b1c=None, b5=None, b5c=None, ema9=98.0, rising=True, atr=0.0):
-        return {"atr_pct": atr, "ema9": ema9, "ema9_rising": rising,
-                "bar1_ts": b1, "bar1_close": b1c, "bar5_ts": b5, "bar5_close": b5c}
-
-    def test_exit_pending_holds(self):
-        s = R.default_state(); s["management_mode"] = R.MODE_EXIT
-        d = R.decide_management_action(s, 3.0, 105.0, T0, ctx=self._ctx())
-        self.assertEqual(d.action, R.ACT_HOLD)
-
-    def test_net_minus5_enters_recovery(self):
-        d = R.decide_management_action(R.default_state(highest_price=100.0),
-                                       -5.0, 95.0, T0, ctx=self._ctx())
-        self.assertEqual(d.state["management_mode"], R.MODE_RECOVERY_WAIT)
-        self.assertFalse(d.sell)
-
-    def test_account_risk_not_a_symbol_sell_gate(self):
-        # 계좌위험 플래그가 있어도(그리고 종목위험까지) 구조 미확인이면 매도 안 함.
-        #   또한 계좌위험은 decide 의 개별 종목 매도 경로에서 아예 사용되지 않는다.
-        c = self._ctx(b5="c1", b5c=96.0)
-        c["account_risk_exceeded"] = True     # decide 가 무시해야 함
-        c["symbol_risk_exceeded"] = True
-        d = R.decide_management_action(_recovery_state(100.0), -4.0, 96.0, T0, ctx=c)
-        self.assertFalse(d.sell)              # 구조 1봉 → HOLD
-
-    def test_struct_and_symbol_via_decide_sells(self):
-        c = self._ctx(b5="c1", b5c=96.0); c["symbol_risk_exceeded"] = True
-        d = R.decide_management_action(_recovery_state(100.0), -4.0, 96.0, T0, ctx=c)
-        self.assertFalse(d.sell)              # 1봉 → HOLD
-        c2 = self._ctx(b5="c2", b5c=95.8); c2["symbol_risk_exceeded"] = True
-        d2 = R.decide_management_action(d.state, -4.2, 95.8, T1, ctx=c2)
-        self.assertTrue(d2.sell)              # 연속 2봉 + 종목위험 → SELL (계좌 무관)
-
-    def test_new_position_holds_not_defer(self):
-        d = R.decide_management_action(R.default_state(highest_price=100.0),
-                                       0.5, 100.5, T0, ctx=self._ctx())
-        self.assertEqual(d.action, R.ACT_HOLD)
-        self.assertIn("single_sell_authority", d.reason)
-
-    def test_never_returns_defer(self):
-        for pct in [1.5, 2.0, 2.5, 5.0, 10.0]:
-            d = R.decide_management_action(R.default_state(highest_price=100.0 + pct),
-                                           pct, 100.0 + pct, T0, ctx=self._ctx())
-            self.assertNotEqual(d.action, R.ACT_DEFER)
-
-    def test_recovery_to_normal_then_profit(self):
-        s = _recovery_state(100.0)
-        d = R.decide_management_action(s, 0.0, 100.5, T0, ctx=self._ctx())
-        self.assertEqual(d.state["management_mode"], R.MODE_NORMAL)
-        d2 = R.decide_management_action(d.state, 1.6, 101.6, T1, ctx=self._ctx())
-        self.assertTrue(d2.state["profit_trail_active"])
-
 
 class MergeTest(unittest.TestCase):
     def test_legacy_defaults(self):
         m = R.merge_state({"code": "AAPL", "qty": 10})
-        self.assertEqual(m["profit_breach_closes"], 0)
-        self.assertEqual(m["profit_prev_breach_closes"], 0)
         self.assertIsNone(m["last_profit_breach_bar_at"])
+        self.assertFalse(m["profit_trail_active"])
 
-    def test_preserves_breach_state(self):
-        s = _profit_state(active=True, closes=1, prev=0, last_bar="2231")
+    def test_preserves_active_and_lastbar(self):
+        s = _profit_state(active=True, last_bar="2231")
         m = R.merge_state(s)
-        self.assertEqual(m["profit_breach_closes"], 1)
+        self.assertTrue(m["profit_trail_active"])
         self.assertEqual(m["last_profit_breach_bar_at"], "2231")
 
 
