@@ -28,6 +28,8 @@ from phoenix.lifecycle import OrderLifecycleManager
 class FakeUSApi:
     def __init__(self):
         self.buy_calls   = []
+        self.buy_rt_cd   = "0"       # "0"=접수 / "9"=UNKNOWN / "reject"=명확거절
+        self.buy_odno    = "BUYODNO-1"
         self.sell_calls  = []
         self.sell_rt_cd  = "0"       # "0"=접수(ODNO) / "9"=타임아웃(UNKNOWN) / "reject"
         self.sell_odno   = "ODNO-TEST-1"
@@ -53,7 +55,11 @@ class FakeUSApi:
 
     def buy_us(self, symbol, qty, price, excd, allow_krw_order=False):
         self.buy_calls.append({"symbol": symbol, "qty": qty, "price": price})
-        return {"rt_cd": "0", "msg1": "매수접수", "output": {"ODNO": "BUYODNO-1"}}
+        if self.buy_rt_cd == "0":
+            return {"rt_cd": "0", "msg1": "매수접수", "output": {"ODNO": self.buy_odno}}
+        if self.buy_rt_cd == "9":
+            return {"rt_cd": "9", "msg1": "timeout(예외 래핑)"}
+        return {"rt_cd": "1", "msg1": "주문가능금액 부족"}   # 명확거절
 
     def sell_us(self, symbol, qty, price, excd):
         self.sell_calls.append({"symbol": symbol, "qty": qty})
@@ -81,6 +87,22 @@ def _iv(sell_score=0, ema9=0.0, ema9_rising=False, atr_pct=0.0):
             "ema9": ema9, "ema9_rising": ema9_rising, "atr_pct": atr_pct,
             "buy_score": 0, "vwap": 0.0, "ema_bull": True,
             "pullback_breakout": False, "obv_rising": True}
+
+
+class FakeLC:
+    """체결 delta 주입용 경량 lifecycle."""
+    def __init__(self, oid, code, filled_qty, avg_fill_price, side="BUY", order_qty=10):
+        _at = "2026-08-06T23:00:00"
+        self.order_lifecycle_id = oid
+        self.code = code
+        self.filled_qty = filled_qty
+        self.avg_fill_price = avg_fill_price
+        self.side = side
+        self.order_qty = order_qty
+        self.trade_id = ""
+        self.accepted_at = _at
+        self.submitted_at = _at
+        self.created_at = _at
 
 
 SESS = {"session": "미국정규장", "tradeable": True}
@@ -683,6 +705,87 @@ class USIntegrationTest(unittest.TestCase):
             self.assertTrue(any("US_MAX_TOTAL_EXPOSURE_USD" in w for w in h["warnings"]))
         finally:
             _m._US_CFG_WARNINGS[:] = _saved
+
+    # ══════════════════════════════════════════════════════════
+    # 예약 전체 생명주기 노출 검증 (예약→begin→접수/거절/타임아웃→체결→취소→재시작)
+    # ══════════════════════════════════════════════════════════
+    def _try_buy(self, sym="ZZZ", price=10.0):
+        return self.mgr._do_buy(sym, sym, "NASD", price, SESS, _iv(atr_pct=1.0))
+
+    def test_reservation_bind_excludes_no_double_recounts_when_gone(self):
+        # 예약 → durable meta 승계(bind) 시 이중 집계 없음, meta 사라지면 예약 재집계, 해제 시 0
+        q, rid = self.mgr._us_try_reserve_exposure("ZZZ", 10, 20.0)   # 예약 $200
+        self.assertEqual(q, 10)
+        self.assertAlmostEqual(self.mgr.us_total_exposure_usd(), 200.0, places=2)
+        self.mgr._us_pending_buy_meta["lc1"] = {"code": "ZZZ", "qty": 10, "price": 20.0}
+        self.mgr._us_bind_reservation_lc(rid, "lc1")                  # 승계(원자적)
+        self.assertAlmostEqual(self.mgr.us_total_exposure_usd(), 200.0, places=2)  # 400 아님
+        self.mgr._us_pending_buy_meta.pop("lc1")                      # 거절/재시도 갭
+        self.assertAlmostEqual(self.mgr.us_total_exposure_usd(), 200.0, places=2)  # under-count 아님
+        self.mgr._us_release_exposure(rid)
+        self.assertAlmostEqual(self.mgr.us_total_exposure_usd(), 0.0, places=2)
+
+    def test_do_buy_accepted_exposure_is_order_notional(self):
+        self.api.buy_rt_cd = "0"
+        r = self._try_buy("ZZZ", 10.0)                               # 예산 $200 → 20주
+        self.assertEqual(r["action"], "BUY_ACCEPTED")
+        self.assertAlmostEqual(self.mgr.us_total_exposure_usd(), 200.0, places=2)  # meta 승계
+        self.assertEqual(self.mgr._us_exposure_reservations, {})     # 예약 해제됨
+
+    def test_do_buy_clean_reject_releases_all(self):
+        self.api.buy_rt_cd = "reject"
+        r = self._try_buy("ZZZ", 10.0)
+        self.assertNotEqual(r["action"], "BUY_ACCEPTED")
+        self.assertAlmostEqual(self.mgr.us_total_exposure_usd(), 0.0, places=2)  # meta·예약 모두 해제
+        self.assertEqual(self.mgr._us_exposure_reservations, {})
+
+    def test_do_buy_unknown_keeps_pending_exposure(self):
+        self.api.buy_rt_cd = "9"                                     # UNKNOWN_CONFIRM
+        self._try_buy("ZZZ", 10.0)
+        self.assertAlmostEqual(self.mgr.us_total_exposure_usd(), 200.0, places=2)  # 접수취급 meta 유지
+        self.assertEqual(self.mgr._us_exposure_reservations, {})
+
+    def test_do_buy_begin_fail_releases_reservation_no_kis(self):
+        self.mgr._us_begin_submit_intent = lambda *a, **k: False     # begin 실패 주입
+        r = self._try_buy("ZZZ", 10.0)
+        self.assertEqual(r["action"], "BUY_FAIL")
+        self.assertEqual(self.api.buy_calls, [])                     # KIS 미호출
+        self.assertAlmostEqual(self.mgr.us_total_exposure_usd(), 0.0, places=2)
+        self.assertEqual(self.mgr._us_exposure_reservations, {})
+
+    def test_partial_then_full_fill_no_double_count(self):
+        oid = "US_BUY_ZZZ_1"
+        self.mgr._us_pending_buy_meta[oid] = {
+            "code": "ZZZ", "name": "ZZZ", "excd": "NASD", "level": 1, "qty": 10, "price": 20.0}
+        self.assertAlmostEqual(self.mgr.us_total_exposure_usd(), 200.0, places=2)  # 미체결 $200
+        self.mgr._us_apply_fill_delta(FakeLC(oid, "ZZZ", 4, 20.0, "BUY", 10))       # 부분 4주
+        self.assertEqual(self.mgr.pos_mgr.positions["ZZZ"].qty, 4)
+        self.assertAlmostEqual(self.mgr.us_total_exposure_usd(), 200.0, places=2)  # 실보유$80+미체결$120
+        self.mgr._us_apply_fill_delta(FakeLC(oid, "ZZZ", 10, 20.0, "BUY", 10))      # 완전체결
+        self.assertNotIn(oid, self.mgr._us_pending_buy_meta)                        # pending 소멸
+        self.assertAlmostEqual(self.mgr.us_total_exposure_usd(), 200.0, places=2)  # 실보유 $200 only
+
+    def test_cancel_releases_exposure_via_stale_sweep(self):
+        oid = "US_BUY_ZZZ_1"
+        self.mgr._us_pending_buy_meta[oid] = {"code": "ZZZ", "qty": 10, "price": 20.0}
+        self.assertAlmostEqual(self.mgr.us_total_exposure_usd(), 200.0, places=2)
+        self.mgr._us_meta_is_stale = lambda _oid: True              # 취소/terminal 감지 모사
+        self.assertFalse(self.mgr._us_has_active_order("ZZZ", "BUY"))  # 스윕이 meta 제거
+        self.assertAlmostEqual(self.mgr.us_total_exposure_usd(), 0.0, places=2)
+
+    def test_crash_after_reserve_no_durable_restart_zero(self):
+        q, rid = self.mgr._us_try_reserve_exposure("ZZZ", 10, 20.0)  # 메모리 예약 $200
+        self.assertAlmostEqual(self.mgr.us_total_exposure_usd(), 200.0, places=2)
+        mgr2 = self._new_mgr()                                       # 재시작(예약은 메모리)
+        self.assertAlmostEqual(mgr2.us_total_exposure_usd(), 0.0, places=2)  # 근거없는 예약 소멸
+
+    def test_crash_after_begin_restart_restores_exposure(self):
+        lc_id = USM.make_order_lifecycle_id("US", "BUY", "ZZZ")
+        ok = self.mgr._us_begin_submit_intent(lc_id, "ZZZ", "BUY", 10, 20.0, "NASD", "")
+        self.assertTrue(ok)
+        self.assertAlmostEqual(self.mgr.us_total_exposure_usd(), 200.0, places=2)  # durable meta
+        mgr2 = self._new_mgr()                                       # 재시작 → 복원
+        self.assertAlmostEqual(mgr2.us_total_exposure_usd(), 200.0, places=2)  # 제출가로 원금 복원(누락 없음)
 
     # ── 위험기반 사이징(최초 BUY·ADD 공통 최종 권위) ─────────────────
     def test_risk_sizing_blocks_on_atr_missing(self):
