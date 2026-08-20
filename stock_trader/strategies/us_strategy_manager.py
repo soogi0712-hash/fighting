@@ -1068,6 +1068,7 @@ class USStrategyManager:
         #     차단(startup 정합화 실패/미실행 시 첫 BUY 차단 — §7). 성공 시 True 로 승격.
         import threading as _th
         self._us_reconcile_lock   = _th.Lock()   # US 전용 비재진입 락(중복 실행 방지)
+        self._us_analytics_lock   = _th.Lock()   # 회복 분석 JSONL append 직렬화(줄 깨짐 방지)
         self._us_buy_gate_ok      = False
         self._us_buy_gate_reason  = "awaiting_first_authoritative_complete_reconcile"
         self._us_snapshot_seq     = 0            # snapshot_id 생성용 시퀀스
@@ -2625,12 +2626,17 @@ class USStrategyManager:
             rec["saved_vs_early_stop_usd"])
         # 추가 전용 매매일지 싱크(JSONL) — 기존 저널/lifecycle 파일·스키마 무변경.
         #   data/us_recovery_analytics.jsonl 에 append. 운영 후 이 데이터로 정책을 조정한다.
+        #   ★ 개인정보 없음(심볼·종목명·수량·손익만; 계좌·토큰·주문번호 미포함).
+        #   ★ 동시 기록 시 줄 깨짐/부분기록 방지 위해 락 + 한 번의 write(단일 라인) 사용.
         try:
             _path = os.path.join(os.path.dirname(US_POSITIONS_FILE),
                                  "us_recovery_analytics.jsonl")
-            os.makedirs(os.path.dirname(_path), exist_ok=True)
-            with open(_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            _line = json.dumps(rec, ensure_ascii=False) + "\n"
+            with self._us_analytics_lock:
+                os.makedirs(os.path.dirname(_path), exist_ok=True)
+                with open(_path, "a", encoding="utf-8") as f:
+                    f.write(_line)
+                    f.flush()
         except Exception as _we:
             logger.debug("[US회복분석] JSONL 기록 실패(무해): %s", _we)
 
@@ -2680,12 +2686,13 @@ class USStrategyManager:
             "bar1_close":  bar_ctx["last_completed_1m_close"],
             "bar5_ts":     bar_ctx["last_completed_5m_bar_at"],
             "bar5_close":  bar_ctx["last_completed_5m_close"],
-            # ★ 손실 매도의 위험한도 조건 — 손실 매도는 '구조적 5분봉 붕괴 연속 +
-            #   계좌위험 + 종목위험'이 **모두** 충족될 때만 허용된다.
-            #   account: 기존 DailyPnLGuard 손실한도/정지 상태(추가 정책 없음).
-            #   symbol : 이 종목의 미실현 손실($)이 종목별 최대 허용손실 초과.
-            "account_risk_exceeded": self._us_account_risk_exceeded(),
+            # ★ 개별 종목 손실 매도 조건 — '구조적 5분봉 붕괴 연속 2봉 AND 종목 금액손실
+            #   한도 초과'가 **모두** 충족될 때만. 계좌위험(DailyPnLGuard)은 개별 종목 매도
+            #   게이트가 아니다(신규 BUY 차단·포트폴리오 위험축소 용도).
+            #   symbol : 이 종목의 미실현 손실($) > 종목별 최대 허용손실($). USD-USD 동일단위.
             "symbol_risk_exceeded":  (pnl_usd < -abs(self.US_MAX_LOSS_PER_SYMBOL_USD)),
+            # ★ ATR 결측(<=0) 시 구조 판정 보류(추측 금지). 정상 양수일 때만 구조 매도 가능.
+            "atr_valid":             (float(_iv.get("atr_pct") or 0.0) > 0.0),
         }
         d = USR.decide_management_action(dict(pos.mgmt), net_pct, cur_price, now, ctx=ctx)
         # 갱신 상태 반영(액션 무관하게 last_evaluated_at/회복상태 저장) + highest 재동기화
@@ -3736,6 +3743,40 @@ class USStrategyManager:
             f"(ovrs_ord_psbl={krw_avail:,.0f}원)"
         )
 
+    def _us_risk_size_or_block(self, symbol, name, cur_price, budget_qty, iv, sess):
+        """신규/추가 매수 공통 **위험 사이징(최종 권위값)**. 반환: (qty, block_or_None).
+
+        · ATR 결측(<=0) → 위험거리 추정 불가 → **신규 BUY fail-safe 차단**(추측 금지, §6).
+        · risk_capped_qty: 종목별 최대허용손실 ÷ (현재가 × 구조적 위험거리%) 로 상한.
+          예산 수량을 넘겨 늘리지 않는다(축소만).
+        · 결과 0주면 **최소 1주로 강제하지 않고 주문 자체를 차단**(§3).
+        최초 BUY(_do_buy)·추가매수(_do_add_buy) 모두 이 함수를 통과한 값이 실제 주문수량.
+        """
+        _atr_pct = float((iv or {}).get("atr_pct") or 0.0)
+        if _atr_pct <= 0.0:
+            logger.warning("[%s] ATR 결측/0 → 위험거리 추정 불가 → 신규매수 차단(fail-safe)", symbol)
+            return 0, {"action": "BUY_BLOCKED", "symbol": symbol, "name": name,
+                       "reason": "ATR 결측 — 위험 사이징 불가로 매수 차단",
+                       "session": sess.get("session", "")}
+        try:
+            bq = int(budget_qty)
+        except (TypeError, ValueError):
+            bq = 0
+        rq = USR.risk_capped_qty(cur_price, _atr_pct, bq, self.US_MAX_LOSS_PER_SYMBOL_USD)
+        if rq < bq:
+            logger.info(
+                "[%s] 위험기반 축소: %d → %d주 (최대손실$%.0f, 위험거리%.2f%%=구조적, ATR%.2f%%)",
+                symbol, bq, rq, self.US_MAX_LOSS_PER_SYMBOL_USD,
+                USR.struct_stop_pct(_atr_pct), _atr_pct)
+        if rq <= 0:
+            logger.warning(
+                "[%s] 위험기반 수량 0주 → 주문 미제출(최소1주 강제 안 함, 최대손실$%.0f)",
+                symbol, self.US_MAX_LOSS_PER_SYMBOL_USD)
+            return 0, {"action": "BUY_BLOCKED", "symbol": symbol, "name": name,
+                       "reason": "위험기반 사이징 0주 — 주문 미제출",
+                       "session": sess.get("session", "")}
+        return rq, None
+
     # ── 매수 실행 ──────────────────────────────────────────
     def _do_buy(self, symbol, name, excd, cur_price, sess, iv,
                 entry_reason: str = "",
@@ -3799,17 +3840,34 @@ class USStrategyManager:
         # 원화 가능금액도 USD로 환산해서 예산 계산
         # ovrs_ord_psbl_amt > 0 이면 원화결제 사용 가능
         if krw_avail > 0:
+            # ★ 환율 실패 시 원화한도를 추측 환산하지 않는다(§6). USD 한도만 사용하고,
+            #   그 USD 한도로 1주도 못 사면 fail-safe 로 신규 BUY 를 차단한다.
+            fx = None
             try:
-                fx = self.api.get_usd_exchange_rate() or 1350.0
+                _fx = self.api.get_usd_exchange_rate()
+                fx = float(_fx) if (_fx and float(_fx) > 0) else None
             except Exception:
-                fx = 1350.0
-            usd_from_krw = (krw_avail / fx) * 0.99   # 환전 수수료 1% 감안
-            effective_usd = max(usd_avail, usd_from_krw)
-            logger.info(
-                f"[{symbol}] 원화결제 가능: ovrs_krw={krw_avail:,.0f}원 "
-                f"≈ USD${usd_from_krw:.2f} (환율{fx:.0f}) | "
-                f"frcr_usd=${usd_avail:.2f} → 실사용예산 max=${effective_usd:.2f}"
-            )
+                fx = None
+            if fx is None:
+                logger.warning(
+                    "[%s] 환율 조회 실패 → 원화한도 환산 보류(USD 한도만 사용, 추측 금지)",
+                    symbol)
+                effective_usd = usd_avail
+                if effective_usd < cur_price:
+                    logger.warning(
+                        "[%s] 환율 실패 + USD 한도($%.2f) < 1주($%.2f) → 신규매수 차단",
+                        symbol, effective_usd, cur_price)
+                    return {"action": "BUY_BLOCKED", "symbol": symbol, "name": name,
+                            "reason": "환율 조회 실패 — 원화환산 불가로 매수 차단(fail-safe)",
+                            "session": sess.get("session", "")}
+            else:
+                usd_from_krw = (krw_avail / fx) * 0.99   # 환전 수수료 1% 감안
+                effective_usd = max(usd_avail, usd_from_krw)
+                logger.info(
+                    f"[{symbol}] 원화결제 가능: ovrs_krw={krw_avail:,.0f}원 "
+                    f"≈ USD${usd_from_krw:.2f} (환율{fx:.0f}) | "
+                    f"frcr_usd=${usd_avail:.2f} → 실사용예산 max=${effective_usd:.2f}"
+                )
         else:
             effective_usd = usd_avail
 
@@ -3857,25 +3915,10 @@ class USStrategyManager:
                     "session": sess.get("session", "")}
         qty = _final_qty
 
-        # ── ★ 위험기반 수량 축소(§5): 고정 -5%/-6% 손절 제거로 손실 위험거리가 넓어졌다.
-        #   종목별 최대 허용손실(US_MAX_LOSS_PER_SYMBOL_USD) ÷ (현재가 × 구조적 위험거리%)
-        #   로 상한을 두어, 변동성 큰 종목의 신규 수량을 축소한다(예산 수량을 넘겨 늘리지 않음).
-        _atr_pct = float((iv or {}).get("atr_pct") or 0.0)
-        _risk_qty = USR.risk_capped_qty(cur_price, _atr_pct, qty,
-                                        self.US_MAX_LOSS_PER_SYMBOL_USD)
-        if _risk_qty < qty:
-            logger.info(
-                "[%s] 위험기반 축소: %d → %d주 (최대손실$%.0f, 위험거리%.2f%%=구조적, ATR%.2f%%)",
-                symbol, qty, _risk_qty, self.US_MAX_LOSS_PER_SYMBOL_USD,
-                USR.struct_stop_pct(_atr_pct), _atr_pct)
-        qty = _risk_qty
-        if qty <= 0:
-            logger.warning(
-                "[%s] 위험기반 수량 0주 → 주문 미제출(최대손실$%.0f 대비 위험거리 과대)",
-                symbol, self.US_MAX_LOSS_PER_SYMBOL_USD)
-            return {"action": "BUY_BLOCKED", "symbol": symbol, "name": name,
-                    "reason": "위험기반 사이징 0주 — 주문 미제출",
-                    "session": sess.get("session", "")}
+        # ── ★ 위험기반 수량 축소(§5) — 최초 BUY·ADD_BUY 공통 최종 권위값 ──
+        qty, _blk = self._us_risk_size_or_block(symbol, name, cur_price, qty, iv, sess)
+        if _blk is not None:
+            return _blk
 
         # ── 사전 잔고 체크 (USD + KRW 통합) ──────────────────
         can_buy, capacity_msg = self._check_buy_capacity(symbol, cur_price, qty)
@@ -4077,7 +4120,12 @@ class USStrategyManager:
                                 entry_reason, "")
 
     def _do_add_buy(self, symbol, name, excd, pos, cur_price, sess, iv) -> dict:
-        add_qty = max(1, int(INVEST_PER_TRADE_USD * ADD_BUY_RATIO / cur_price))
+        # 예산 기준 수량(최소1주 강제 없음) → 위험 사이징이 최종 권위값(ATR결측/0주 차단)
+        _budget_add = int(INVEST_PER_TRADE_USD * ADD_BUY_RATIO / cur_price) if cur_price > 0 else 0
+        add_qty, _blk = self._us_risk_size_or_block(
+            symbol, name, cur_price, _budget_add, iv, sess)
+        if _blk is not None:
+            return _blk
         # allow_krw_order=True → 추가매수도 원화환전 허용
 
         # ── [US 훅 E] 추가매수 SIGNAL + SUBMITTED ──
