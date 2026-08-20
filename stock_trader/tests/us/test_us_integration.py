@@ -290,15 +290,64 @@ class USIntegrationTest(unittest.TestCase):
             self.assertIn(s, self.mgr.pos_mgr.positions)
             self.assertFalse(self.mgr.pos_mgr.positions[s].is_quarantined)
 
-    def test_authoritative_empty_quarantines_all(self):
-        # 정상 complete empty(보유 0) → 내부 active 전부 격리
+    def test_empty_broker_with_internal_keeps_active_blocks_buy(self):
+        # ★ P0: 내부 active 존재 + broker 완전-빈 응답 → 권위 0잔고로 확정 금지.
+        #   전부 active 유지(격리 0), authoritative=False, buy_ok=False.
         self._seed_internal(["AAA", "BBB"])
-        self.api.balance_full = _snap([], complete=True)   # authoritative_empty
+        self.api.balance_full = _snap([], complete=True)   # complete but broker=0
+        h = self.mgr.us_reconcile_positions()
+        self.assertFalse(h["authoritative"])
+        self.assertFalse(h["authoritative_empty"])
+        self.assertFalse(h["buy_allowed"])
+        self.assertEqual(h["quarantined"], 0)              # 격리 0(단일 빈응답 자동격리 금지)
+        self.assertEqual(len(self.mgr.pos_mgr.active_positions()), 2)  # active 유지
+        self.assertFalse(self.mgr._us_buy_gate_ok)
+
+    def test_genuinely_empty_account_authoritative_empty(self):
+        # 내부 포지션 없음 + broker 완전-빈 → 진짜 빈 계좌: authoritative_empty, BUY 허용
+        self.api.balance_full = _snap([], complete=True)
         h = self.mgr.us_reconcile_positions()
         self.assertTrue(h["authoritative"])
         self.assertTrue(h["authoritative_empty"])
-        self.assertEqual(h["quarantined"], 2)
-        self.assertEqual(len(self.mgr.pos_mgr.active_positions()), 0)
+        self.assertTrue(h["buy_allowed"])
+
+    def test_incident_internal9_closed_broker0_then_recovery(self):
+        # 사고 재현: 내부 9종목 + 휴장 broker 완전-빈 → active 9, quarantine 0, held>0,
+        #   buy_ok=False, 신규 BUY 0, 기존 9종목 관리 유지. 이후 KIS 정상복구 → gate 정상.
+        self._seed_internal(INTERNAL_9)                    # qty=5, avg=50 → 원금 $250×9
+        self.assertEqual(len(INTERNAL_9), 9)
+        self.api.balance_full = _snap([], complete=True)  # 휴장 broker=0(complete)
+        h = self.mgr.us_reconcile_positions()
+        self.assertFalse(h["authoritative"])
+        self.assertFalse(h["authoritative_empty"])
+        self.assertFalse(h["buy_allowed"])
+        self.assertEqual(h["quarantined"], 0)             # 격리 0
+        self.assertEqual(len(self.mgr.pos_mgr.active_positions()), 9)   # active 9
+        self.assertFalse(self.mgr._us_buy_gate_ok)
+        # exposure 는 broker0 이어도 내부 qty×avg 포함(held_basis>0)
+        exp = self.mgr.us_exposure_health()
+        self.assertAlmostEqual(exp["held_basis_usd"], 9 * 5 * 50.0, places=2)
+        self.assertGreater(exp["held_basis_usd"], 0)
+        # 신규 BUY 0 (buy gate down → _check_entry HOLD)
+        er = self.mgr._check_entry("NEWSYM", "NEW", "NASD", 10.0, _iv(), [], {}, SESS)
+        self.assertEqual(er["action"], "HOLD")
+        # 기존 9종목 관리 유지(스킵 아님) + 자동 SELL 0
+        managed = 0
+        for s in INTERNAL_9:
+            r = self._manage(s, 51.0)
+            self.assertIn(r["action"], ("HOLD", "SELL_ACCEPTED"))
+            managed += 1
+        self.assertEqual(managed, 9)
+        self.assertEqual(self.api.sell_calls, [])
+        # ── req8: KIS 정상 복구(동일 9종목 반환) → buy gate·exposure 정상 복구 ──
+        self.api.balance_full = _snap(
+            [_holding(s, 5, 50.0, 51.0) for s in INTERNAL_9], complete=True)
+        h2 = self.mgr.us_reconcile_positions()
+        self.assertTrue(h2["authoritative"])
+        self.assertTrue(h2["buy_allowed"])
+        self.assertEqual(h2["quarantined"], 0)
+        self.assertEqual(len(self.mgr.pos_mgr.active_positions()), 9)
+        self.assertTrue(self.mgr._us_buy_gate_ok)
 
     def test_error_empty_no_quarantine(self):
         # 오류 empty(ok=False) → 비권위: 격리/삭제 없음, BUY 스킵

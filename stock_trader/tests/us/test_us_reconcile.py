@@ -103,18 +103,40 @@ class ReconcileIncidentTest(unittest.TestCase):
         self.assertEqual([x["symbol"] for x in r.to_restore], ["QUAR"])
         self.assertEqual(r.broker_absent, ["IONQ"])   # IONQ active·broker부재 → 격리후보
 
-    def test_authoritative_empty_complete(self):
-        # 완전·권위·보유 0 → authoritative_empty=True, 내부 active 전부 broker_absent
+    def test_empty_broker_with_internal_active_is_not_authoritative(self):
+        # ★ P0: 완전·빈 잔고라도 내부 active 존재 → 권위 0잔고로 확정 금지.
+        #   authoritative=False, buy_allowed=False, 격리 후보 없음(내부 유지).
         r = RC.reconcile_decision(ok=True, source="api", holdings=[],
                                   internal_symbols=["AAA", "BBB"], complete=True)
+        self.assertFalse(r.authoritative)
+        self.assertFalse(r.buy_allowed)
+        self.assertFalse(r.authoritative_empty)
+        self.assertEqual(r.broker_absent, [])
+        self.assertEqual(r.active_internal_count, 2)
+
+    def test_empty_broker_genuinely_empty_account_authoritative(self):
+        # 내부 active 도 없고 broker 도 완전-빈 → 진짜 빈 계좌(정상). authoritative_empty=True.
+        r = RC.reconcile_decision(ok=True, source="api", holdings=[],
+                                  internal_symbols=[], complete=True)
         self.assertTrue(r.authoritative)
         self.assertTrue(r.authoritative_empty)
-        self.assertEqual(r.broker_absent, ["AAA", "BBB"])
+        self.assertTrue(r.buy_allowed)
+        self.assertEqual(r.broker_absent, [])
+
+    def test_nonempty_complete_quarantines_absent(self):
+        # 양성 잔고 증거(broker 비어있지 않음) + 완전 스냅샷 → 부재 종목만 격리 후보(정상 경로 유지)
+        r = RC.reconcile_decision(
+            ok=True, source="api",
+            holdings=[{"symbol": "AAA", "qty": 10, "avg_price": 100.0, "cur_price": 101.0}],
+            internal_symbols=["AAA", "BBB"], complete=True)
+        self.assertTrue(r.authoritative)
+        self.assertEqual(r.broker_absent, ["BBB"])   # BBB 만 부재 → 격리 후보
 
     def test_incomplete_empty_not_authoritative_empty(self):
-        # 불완전 빈 잔고 → authoritative_empty=False, broker_absent 없음(격리 금지)
+        # 불완전 빈 잔고 + 내부 active → 권위 0잔고 아님, 격리 금지(P0 규칙)
         r = RC.reconcile_decision(ok=True, source="api", holdings=[],
                                   internal_symbols=["AAA"], complete=False)
+        self.assertFalse(r.authoritative)
         self.assertFalse(r.authoritative_empty)
         self.assertEqual(r.broker_absent, [])
 

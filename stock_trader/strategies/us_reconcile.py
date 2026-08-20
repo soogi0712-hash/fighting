@@ -19,6 +19,14 @@ Fail-safe 원칙(§6/C):
     일부 응답으로 실보유를 삭제/격리하는 사고를 막는다.
   - 이미 격리된 심볼(quarantined_symbols)은 broker_absent 재판정에서 제외한다.
     broker 잔고에 다시 나타나면 reappeared 로 보고(호출부가 즉시 정상 복구).
+
+빈 잔고의 권위 판정(P0) — §7:
+  - broker holdings 가 '빈 목록(양성 보유 0)'인데 내부 active 포지션이 존재하면,
+    complete=True 라도 **권위 있는 0잔고로 확정하지 않는다**(authoritative=False,
+    buy_allowed=False). 단일 빈응답으로 내부 포지션을 격리/삭제/제외하지 않는다.
+    격리·삭제는 '양성 잔고 증거(broker 비어있지 않은 완전 스냅샷)' 또는 운영자 승인이
+    있을 때만 허용한다. authoritative_empty=True 는 **내부 active 포지션이 없을 때만**
+    성립한다(진짜 빈 계좌).
 """
 from __future__ import annotations
 
@@ -138,6 +146,27 @@ def reconcile_decision(
             broker[sym] = h
 
     broker_syms = set(broker.keys())
+
+    # ★★ P0: broker 가 '빈 목록(양성 보유 0)'인데 내부 active 포지션이 존재하면 —
+    #   휴장·조회지연·빈응답·불완전 응답에서 흔히 발생 — '권위 있는 0잔고'로 확정하지
+    #   않는다(req1/req6). 단일 빈응답으로 격리·삭제·복원을 실행하지 않고,
+    #   authoritative=False·buy_allowed=False 로 처리한다. 내부 포지션은 그대로 유지되어
+    #   (호출부의 비권위 분기가 삭제/격리하지 않음) 시세감시·수익 트레일링·수동 SELL·
+    #   체결조회가 계속되고, exposure 는 내부 qty×avg 를 포함한다. 신규 BUY·ADD 만 차단.
+    #   → 명확한 '양성 잔고 증거(broker 비어있지 않음)' 또는 운영자 승인이 있을 때만
+    #     격리/삭제가 가능하다(정상 broker_absent 경로).
+    if len(broker_syms) == 0 and len(active_internal) > 0:
+        return ReconcileResult(
+            authoritative=False, buy_allowed=False, complete=complete,
+            authoritative_empty=False,
+            to_restore=[], to_reconcile=[], broker_absent=[], reappeared=[],
+            broker_count=0, internal_count=len(internal),
+            active_internal_count=len(active_internal),
+            quarantined_count=len(quarantined), mismatch_count=0,
+            reason=("empty_broker_with_internal_active(ambiguous empty balance: "
+                    "no quarantine/delete/restore, block new BUY/ADD, keep positions active)"),
+        )
+
     to_restore, to_reconcile = [], []
     for sym, h in broker.items():
         try:
