@@ -373,6 +373,15 @@ ADD_BUY_PCT           =  3.0   # +3% 달성 시 추가매수 (5→3%, 더 빠르
 ADD_BUY_RATIO         =  0.5
 MAX_LEVEL             =  3     # 최대 3레벨 (2→3, 더 공격적)
 
+# ── 계좌 위험 제한(손절 없는 수익 전용 정책의 리스크 통제) ─────────────
+#   손절이 없으므로 손실 노출은 '종목별 총매수금액'과 '최대 동시보유 종목 수'로 제한한다.
+#   · US_MAX_BUY_PER_SYMBOL_USD : 종목별 누적 매수원금(평단×수량) 상한($). 초과분 추가매수 차단.
+#   · US_MAX_CONCURRENT_POSITIONS: 최대 동시보유 종목 수. 초과 시 신규 종목 매수 차단.
+US_MAX_BUY_PER_SYMBOL_USD    = float(
+    os.environ.get("US_MAX_BUY_PER_SYMBOL_USD", "800") or 800)
+US_MAX_CONCURRENT_POSITIONS  = int(
+    os.environ.get("US_MAX_CONCURRENT_POSITIONS", "8") or 8)
+
 
 # ════════════════════════════════════════════════════════════
 # ── 지표 계산 엔진
@@ -1038,6 +1047,11 @@ class USStrategyManager:
     #   로 신규 수량을 축소한다. 환경변수 US_MAX_LOSS_PER_SYMBOL_USD 로 조정 가능.
     US_MAX_LOSS_PER_SYMBOL_USD = float(
         os.environ.get("US_MAX_LOSS_PER_SYMBOL_USD", "60") or 60)
+
+    # ── ★ 계좌 위험 제한(손절 없는 수익 전용 정책) — 인스턴스/환경변수로 조정 가능 ──
+    #   손절이 없으므로 손실 노출은 '종목별 총매수원금'과 '최대 동시보유 종목 수'로 제한한다.
+    US_MAX_BUY_PER_SYMBOL_USD    = US_MAX_BUY_PER_SYMBOL_USD      # 모듈 기본값(환경변수 반영)
+    US_MAX_CONCURRENT_POSITIONS  = US_MAX_CONCURRENT_POSITIONS
 
     # ── [US OPEN SCAN] 개장 추적 변수 ────────────────────────
     # 미국장 개장 시 초기화됨
@@ -3421,6 +3435,17 @@ class USStrategyManager:
             return _hold(f"max_loss 무결성 오류({','.join(sorted(_ml_bad))}) — 신규매수 차단",
                          "HOLD")
 
+        # ── ★ 최대 동시보유 종목 수 제한(손절 없는 정책의 계좌 위험 통제) ──
+        #   신규 '종목' 진입에만 적용(이미 보유 중인 종목은 위 pos 경로로 흐르므로 제외).
+        _held = self.pos_mgr.active_positions()
+        if symbol not in _held and len(_held) >= self.US_MAX_CONCURRENT_POSITIONS:
+            logger.info(
+                "[US진입] %s(%s) 최대 동시보유 %d종목 도달 → 신규 종목 매수 차단",
+                name, symbol, self.US_MAX_CONCURRENT_POSITIONS)
+            return _hold(
+                f"최대 동시보유 종목 수 초과({len(_held)}/{self.US_MAX_CONCURRENT_POSITIONS})",
+                "HOLD")
+
         # ── 현재 운영 단계 확인 ──────────────────────────────
         phase_info  = us_phase_info()
         phase       = phase_info["phase"]
@@ -4222,8 +4247,31 @@ class USStrategyManager:
                                 entry_reason, "")
 
     def _do_add_buy(self, symbol, name, excd, pos, cur_price, sess, iv) -> dict:
+        # ── ★ 손실 포지션에는 ADD_BUY 하지 않는다(손절 없는 수익 전용 정책의 물타기 방지) ──
+        _net = pos.net_pct(cur_price)
+        if _net < 0:
+            logger.info(
+                "[US추가매수] %s(%s) 손실 포지션(net=%+.2f%%) → 추가매수 차단(물타기 금지)",
+                name, symbol, _net)
+            return {"action": "BUY_BLOCKED", "symbol": symbol, "name": name,
+                    "reason": f"손실 포지션 추가매수 차단(net={_net:+.2f}%)",
+                    "session": sess.get("session", "")}
+        # ── ★ 종목별 누적 매수원금 상한($) 초과 시 추가매수 차단(계좌 위험 제한) ──
+        _basis_now = float(pos.avg_price or 0.0) * int(pos.qty or 0)
+        if _basis_now >= self.US_MAX_BUY_PER_SYMBOL_USD:
+            logger.info(
+                "[US추가매수] %s(%s) 종목 매수원금 $%.0f >= 상한 $%.0f → 추가매수 차단",
+                name, symbol, _basis_now, self.US_MAX_BUY_PER_SYMBOL_USD)
+            return {"action": "BUY_BLOCKED", "symbol": symbol, "name": name,
+                    "reason": (f"종목 매수원금 상한 초과($%.0f>=$%.0f)"
+                               % (_basis_now, self.US_MAX_BUY_PER_SYMBOL_USD)),
+                    "session": sess.get("session", "")}
         # 예산 기준 수량(최소1주 강제 없음) → 위험 사이징이 최종 권위값(ATR결측/0주 차단)
         _budget_add = int(INVEST_PER_TRADE_USD * ADD_BUY_RATIO / cur_price) if cur_price > 0 else 0
+        # 종목 매수원금 상한까지 남은 여유로 추가 수량 상한(초과 매수 방지)
+        _room_usd = max(0.0, self.US_MAX_BUY_PER_SYMBOL_USD - _basis_now)
+        if cur_price > 0:
+            _budget_add = min(_budget_add, int(_room_usd / cur_price))
         add_qty, _blk = self._us_risk_size_or_block(
             symbol, name, cur_price, _budget_add, iv, sess)
         if _blk is not None:
