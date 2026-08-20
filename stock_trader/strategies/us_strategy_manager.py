@@ -423,7 +423,8 @@ def _calc_indicators(candles: list[dict], realtime: dict = None) -> dict:
         "cur_price": 0.0, "prev_close": 0.0, "intraday_pct": 0.0,
         "vol_ratio": 1.0, "elapsed_ratio": 0.5,
         "vwap": 0.0, "above_vwap": False,
-        "ema9": 0.0, "ema21": 0.0, "ema50": 0.0, "ema_bull": False,
+        "ema9": 0.0, "ema9_prev": 0.0, "ema9_rising": False,
+        "ema21": 0.0, "ema50": 0.0, "ema_bull": False, "atr_pct": 0.0,
         "rsi": 50.0, "macd_above": False, "macd_cross": False,
         "last_bar_surge": 0.0, "pullback_breakout": False,
         "candle_volatility": 0.0,
@@ -467,10 +468,28 @@ def _calc_indicators(candles: list[dict], realtime: dict = None) -> dict:
     above_vwap = cur >= vwap if vwap > 0 else False
 
     # ── ④ EMA 정배열 ─────────────────────────────────────
-    ema9  = float(_ema_series(closes, 9)[-1])
+    _ema9_series = _ema_series(closes, 9)
+    ema9  = float(_ema9_series[-1])
+    ema9_prev = float(_ema9_series[-2]) if len(_ema9_series) >= 2 else ema9
+    ema9_rising = bool(ema9 > ema9_prev)        # EMA9 상승 기울기
     ema21 = float(_ema_series(closes, 21)[-1])  if len(closes) >= 21 else ema9
     ema50 = float(_ema_series(closes, 50)[-1])  if len(closes) >= 50 else ema21
     ema_bull = (cur > ema9 > ema21 > ema50)     # 완전 정배열
+
+    # ── ④-b ATR(14) → 현재가 대비 % (동적 트레일 폭 산정용) ──────
+    #   TR = max(high-low, |high-prevClose|, |low-prevClose|). ATR = 최근 14 TR 평균.
+    atr_pct = 0.0
+    if len(closes) >= 15:
+        _pc = closes[:-1]
+        _h  = highs[1:]
+        _l  = lows[1:]
+        _tr = np.maximum.reduce([
+            _h - _l,
+            np.abs(_h - _pc),
+            np.abs(_l - _pc),
+        ])
+        _atr = float(np.mean(_tr[-14:])) if len(_tr) >= 14 else float(np.mean(_tr))
+        atr_pct = (_atr / cur * 100.0) if cur > 0 else 0.0
 
     # ── ⑤ RSI(14) ────────────────────────────────────────
     if len(closes) >= 15:
@@ -587,9 +606,12 @@ def _calc_indicators(candles: list[dict], realtime: dict = None) -> dict:
         "vwap":              round(vwap, 4),
         "above_vwap":        above_vwap,
         "ema9":              round(ema9,  4),
+        "ema9_prev":         round(ema9_prev, 4),
+        "ema9_rising":       ema9_rising,
         "ema21":             round(ema21, 4),
         "ema50":             round(ema50, 4),
         "ema_bull":          ema_bull,
+        "atr_pct":           round(atr_pct, 4),
         "rsi":               round(rsi, 1),
         "macd_above":        macd_above,
         "macd_cross":        macd_cross,
@@ -2545,17 +2567,17 @@ class USStrategyManager:
     # US 복원/손실회복 관리 (§2/§3/§4/§8) — 기존 매도 로직보다 먼저 개입
     # ══════════════════════════════════════════════════════════
     def _us_apply_management(self, pos, symbol, name, excd, cur_price, net_pct,
-                             pnl_usd, pnl_krw_approx, sess):
-        """복원/손실회복 관리 판정을 기존 ①~⑩ 매도 로직보다 '먼저' 적용(§8).
+                             pnl_usd, pnl_krw_approx, sess, iv=None):
+        """복원/손실회복/수익 트레일링 관리 판정을 기존 ①~⑩ 매도 로직보다 '먼저' 적용.
 
         반환:
-          None  → DEFER: 관리 개입 없음 → 호출부가 기존 ①~⑩ 수행(신규·NORMAL·net>-5).
+          None  → DEFER: 관리 개입 없음 → 호출부가 기존 ①~⑩ 수행(신규·NORMAL·트레일 미활성).
           dict  → HOLD(기존 로직 스킵) 또는 SELL 결과. SELL 은 **오직 _do_sell 경유**
                   (crash-safe submit-intent → KIS SELL → lifecycle/registry). 별도
                   주문 경로 없음. 타임아웃/불명확 시 재제출 없음(EXIT_PENDING 유지).
 
-        부수효과: pos.mgmt 갱신 + pos_mgr.save()(원자적 영속). 포지션 제거는 하지 않음
-                 (실제 체결 시 execution-driven 경로가 제거).
+        지표(iv)에서 ATR%/EMA9/EMA9기울기를 ctx 로 주입해 동적 트레일·종가확정에 사용.
+        부수효과: pos.mgmt 갱신 + pos_mgr.save()(원자적 영속). 포지션 제거는 하지 않음.
         """
         now = datetime.now()
         # highest 단일화(하락 금지) 후 순수 판정
@@ -2566,7 +2588,14 @@ class USStrategyManager:
             return {"action": "HOLD", "symbol": symbol, "name": name, "excd": excd,
                     "reason": "[관리] 격리 포지션 — 매도판정 제외",
                     "session": sess.get("session", "")}
-        d = USR.decide_management_action(dict(pos.mgmt), net_pct, cur_price, now)
+        _iv = iv or {}
+        ctx = {
+            "atr_pct":     float(_iv.get("atr_pct") or 0.0),
+            "ema9":        _iv.get("ema9"),
+            "ema9_rising": bool(_iv.get("ema9_rising")),
+            "bar5_close":  False,   # 60초 루프 = 1분봉 근사 → 연속 2회 확정 경로 사용
+        }
+        d = USR.decide_management_action(dict(pos.mgmt), net_pct, cur_price, now, ctx=ctx)
         # 갱신 상태 반영(액션 무관하게 last_evaluated_at/회복상태 저장) + highest 재동기화
         pos.mgmt = d.state
         pos.sync_mgmt_high()
@@ -2941,46 +2970,20 @@ class USStrategyManager:
         # ════════════════════════════════════════════════════
         _mgmt_result = self._us_apply_management(
             pos, symbol, name, excd, cur_price, net_pct,
-            pnl_usd, pnl_krw_approx, sess
+            pnl_usd, pnl_krw_approx, sess, iv=iv
         )
         if _mgmt_result is not None:
             return _mgmt_result
 
         # ════════════════════════════════════════════════════
-        # 청산 우선순위: ①+2.5% → ②+2.0% → ③+1.5%+SCORE≥4
-        #               → ④KRW → ⑤트레일링 → ⑥시간청산
-        #               → ⑦손절(최후)
+        # 청산 우선순위: (①+2.5%·②+2.0% 고정익절 비활성화 — 동적 수익 트레일링이 지배)
+        #               → ③+1.5%+SCORE≥4 → ④KRW → ⑤트레일링 → ⑥시간청산 → ⑦손절
         # ════════════════════════════════════════════════════
-
-        # ════════════════════════════════════════════════════
-        # ① +2.5% 무조건 전량 익절 (최우선, 예외 없음)
-        # ════════════════════════════════════════════════════
-        if net_pct >= PROFIT_SUPER_PCT:
-            logger.info(
-                f"[익절판정] 종목={name}({symbol}) | net_pct={net_pct:+.3f}% | "
-                f"익절기준=+{PROFIT_SUPER_PCT}%무조건전량 | 결과=SELL_ALL"
-            )
-            return self._do_sell(
-                symbol, name, excd, pos.qty, cur_price,
-                f"✅+2.5%무조건전량익절 {net_pct:+.2f}% ≥ +{PROFIT_SUPER_PCT}%"
-                f" (${pnl_usd:+.2f}≈{pnl_krw_approx:,.0f}원)",
-                sess
-            )
-
-        # ════════════════════════════════════════════════════
-        # ② +2.0% 전량 익절 (SELL_SCORE 무관, 예외 없음)
-        # ════════════════════════════════════════════════════
-        if net_pct >= PROFIT_FULL_PCT:
-            logger.info(
-                f"[익절판정] 종목={name}({symbol}) | net_pct={net_pct:+.3f}% | "
-                f"익절기준=+{PROFIT_FULL_PCT}%전량 | 결과=SELL_ALL"
-            )
-            return self._do_sell(
-                symbol, name, excd, pos.qty, cur_price,
-                f"✅+2.0%전량익절 {net_pct:+.2f}% ≥ +{PROFIT_FULL_PCT}%"
-                f" (${pnl_usd:+.2f}≈{pnl_krw_approx:,.0f}원)",
-                sess
-            )
+        # ★ ①/② 고정익절(+2.5%/+2.0% 무조건 전량)은 '동적 수익 트레일링(ATR)' 보다
+        #   먼저 실행되지 않도록 비활성화한다. 수익 트레일링 활성(최고 net>=+1.5%) 시
+        #   _us_apply_management 가 이미 지배(HOLD/SELL)하므로 이 지점에 도달하지
+        #   않는다. 도달했다면 아직 트레일 미활성(최고 net<+1.5%) 이므로 고정익절도
+        #   당연히 미충족이다. (기존 ①② 블록 제거 — 파라미터/판정만 수정)
 
         # ════════════════════════════════════════════════════
         # ③ +1.5% + SELL_SCORE≥4 → 전량 익절
