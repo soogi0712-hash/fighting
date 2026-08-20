@@ -15,7 +15,7 @@ import shutil
 import tempfile
 import threading
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -33,6 +33,10 @@ class FakeUSApi:
         self.sell_reject_msg = "거래불가"   # '수량' 미포함 → 유령제거 아님(쿨다운 경로)
         self.balance_full = {"ok": True, "source": "api", "complete": True,
                              "authoritative_empty": False, "holdings": []}
+        self.intraday_bars = []      # [{"ts": datetime, "close": float}, ...]
+
+    def get_us_intraday_bars(self, symbol, excd="NASD", lookback_min=90):
+        return list(self.intraday_bars)
 
     def get_us_balance_full(self, max_pages: int = 20):
         return json.loads(json.dumps(self.balance_full))
@@ -118,6 +122,14 @@ class USIntegrationTest(unittest.TestCase):
         return self.mgr._manage_position(
             pos, sym, pos.name, pos.excd, cur,
             _iv(sell_score, ema9=ema9, ema9_rising=ema9_rising, atr_pct=atr_pct), SESS)
+
+    def _set_bars(self, closes, minute0=0):
+        """과거(항상 '마감 완료') 1분봉 주입. closes=[c1,c2,...] → 분 단위 증가."""
+        base = datetime(2020, 1, 1, 0, 0, tzinfo=timezone.utc)
+        self.api.intraday_bars = [
+            {"ts": base + timedelta(minutes=minute0 + i), "close": float(c)}
+            for i, c in enumerate(closes)
+        ]
 
     def _seed_internal(self, syms, qty=5, avg=50.0):
         for s in syms:
@@ -320,7 +332,9 @@ class USIntegrationTest(unittest.TestCase):
         self._manage("IONQ", 95.0)                 # net -5.25 → 진입(HOLD)
         self._manage("IONQ", 97.0)                 # net -3.25(>=-3.5) → arm, high=97
         self.assertTrue(self.mgr.pos_mgr.positions["IONQ"].mgmt["recovery_trail_armed"])
-        r = self._manage("IONQ", 95.8)             # (95.8-97)/97=-1.24% <=-1.2 → SELL
+        # 완료봉 종가 95.8(고점97 대비 -1.24% <=-1.2) → 확정봉 1개로 SELL
+        self._set_bars([95.8])
+        r = self._manage("IONQ", 95.8)
         self.assertEqual(len(self.api.sell_calls), 1)
         self.assertEqual(r["action"], "SELL_ACCEPTED")
 
@@ -430,34 +444,52 @@ class USIntegrationTest(unittest.TestCase):
     def test_fixed_takeprofit_disabled_dynamic_trail_governs(self):
         self.mgr.pos_mgr.add(USM.USPosition("IONQ", "IONQ", "NASD", 10, 100.0))
         # net +2.75(고점=103) → 예전 ① 무조건익절이면 즉시 SELL 이지만, 이제 비활성.
-        #   수익 트레일 활성(최고 net>=+1.5)만 되고 고점 유지 → HOLD(매도 없음).
         r = self._manage("IONQ", 103.0)
         self.assertEqual(self.api.sell_calls, [])
         self.assertEqual(r["action"], "HOLD")
         self.assertTrue(self.mgr.pos_mgr.positions["IONQ"].mgmt["profit_trail_active"])
-        # 트레일 이탈 + EMA9 하향이탈(cur<ema9) → 확정봉 1개 빠른 SELL
-        #   cur=101.8 → drop=(101.8-103)/103=-1.16% <=-1.0, ema9=102.5>cur → fast
-        r2 = self._manage("IONQ", 101.8, ema9=102.5)
+        # 실제 완료봉 종가 101.8(고점103 대비 -1.16% 이탈) + EMA9 하향(cur<ema9)
+        #   → 확정봉 1개 빠른 SELL. 실시간가는 급락 아님(101.9)이라 봉이 판정 근거.
+        self._set_bars([101.8])
+        r2 = self._manage("IONQ", 101.9, ema9=102.5)
         self.assertEqual(len(self.api.sell_calls), 1)
         self.assertEqual(r2["action"], "SELL_ACCEPTED")
 
     def test_profit_trail_panic_immediate_sell(self):
-        # 동적 트레일보다 +0.5%p 이상 급락 → 봉 확인 없이 즉시 SELL
+        # 동적 트레일보다 +0.5%p 이상 급락 → 봉 없이 실시간가로 즉시 SELL(데이터 없음)
         self.mgr.pos_mgr.add(USM.USPosition("NNE", "NNE", "NASD", 10, 100.0))
         self._manage("NNE", 103.0)                  # 활성화(고점 103)
-        # cur=101.3 → drop=(101.3-103)/103=-1.65% <= -(1.0+0.5) → panic (봉 없이 즉시)
-        r = self._manage("NNE", 101.3, ema9=100.0, ema9_rising=True)
+        self.api.intraday_bars = []                 # 봉 데이터 없음
+        r = self._manage("NNE", 101.3, ema9=100.0, ema9_rising=True)  # live -1.65% panic
         self.assertEqual(len(self.api.sell_calls), 1)
         self.assertEqual(r["action"], "SELL_ACCEPTED")
 
-    def test_profit_trail_ema9_uptrend_single_bar_holds(self):
-        # EMA9 상승 + 현재가>EMA9 → 확정봉 1개로는 HOLD(2봉 필요, veto 아님)
-        self.mgr.pos_mgr.add(USM.USPosition("QUBT", "QUBT", "NASD", 10, 100.0))
-        self._manage("QUBT", 103.0)                 # 활성화(고점 103)
-        # cur=101.8 drop -1.16%(이탈), ema9=101.0<cur 상승 → normal 경로 1봉 → HOLD
-        r = self._manage("QUBT", 101.8, ema9=101.0, ema9_rising=True)
+    def test_completed_bar_below_trail_sells(self):
+        # 실제 완료봉 종가가 트레일 아래 → 동적 트레일이 지배해 SELL(완료봉 근거)
+        self.mgr.pos_mgr.add(USM.USPosition("BBAI", "BBAI", "NASD", 10, 100.0))
+        self._manage("BBAI", 103.0)                 # 활성화(고점 103)
+        self._set_bars([101.7])                     # 완료봉 -1.26% 이탈
+        r = self._manage("BBAI", 101.9)             # 실시간가는 급락 아님 → 봉이 근거
+        self.assertEqual(len(self.api.sell_calls), 1)
+        self.assertEqual(r["action"], "SELL_ACCEPTED")
+
+    def test_data_missing_no_confirmed_sell(self):
+        # 데이터 없음 + 실시간가 이탈이나 급락 아님 → 확정봉 SELL 없음(HOLD)
+        self.mgr.pos_mgr.add(USM.USPosition("LEU", "LEU", "NASD", 10, 100.0))
+        self._manage("LEU", 103.0)
+        self.api.intraday_bars = []
+        r = self._manage("LEU", 101.9, ema9=102.5)  # live -1.07%(급락 아님), 봉 없음
         self.assertEqual(self.api.sell_calls, [])
         self.assertEqual(r["action"], "HOLD")
+
+    def test_hard_stop_works_without_bar_data(self):
+        # 데이터 없음에도 실시간 net<=-6 하드손절 SELL
+        self.mgr.pos_mgr.add(USM.USPosition("NVTS", "NVTS", "NASD", 10, 100.0))
+        self.api.intraday_bars = []
+        self._manage("NVTS", 94.0)                   # 진입(-6.25) → HOLD(즉시 아님)
+        self.assertEqual(self.api.sell_calls, [])
+        self._manage("NVTS", 94.0)                   # RECOVERY 하드손절 → SELL
+        self.assertEqual(len(self.api.sell_calls), 1)
 
     # ══════════════════════════════════════════════════════════
     # §5 단일 매도판정 권위: 고정익절/금액익절/SELL_SCORE/시간/MACD 매도 0회

@@ -47,8 +47,10 @@
 import os
 import json
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone as _tz
 from utils.logger             import get_logger
+
+_UTC = _tz.utc
 from utils.market_session     import (
     us_session_info, is_us_tradeable,
     get_us_trading_phase, us_phase_info,
@@ -61,6 +63,7 @@ from utils.order_sizing        import finalize_order_qty, qty_from_cash
 # ── US 손실회복 트레일링 + 복원 포지션 정합화(순수 로직) + 원자 저장소 ──
 import strategies.us_recovery      as USR
 import strategies.us_reconcile     as USRC
+import strategies.us_bars          as USBARS
 from strategies.us_position_store  import AtomicPositionStore, CorruptStoreError
 
 # ── Trading Journal (선택적 로드 — 실패 시 매매 루프 중단 없음) ──
@@ -2589,20 +2592,26 @@ class USStrategyManager:
                     "reason": "[관리] 격리 포지션 — 매도판정 제외",
                     "session": sess.get("session", "")}
         _iv = iv or {}
-        # ── 종가 확인용 봉 타임스탬프(봉 중복 방지) ──
-        #   bar1_ts : '직전에 마감한 1분봉' 종료시각 = 현재 분으로 내림(floor). 같은 분의
-        #             반복 평가는 동일 bar1_ts → 카운터 증가 안 함(미완성 현재봉 미사용).
-        #   bar5_ts : 5분 경계 분에서만 부여(완성된 5분봉 마감 근사). 그 외 None.
-        _b1 = now.replace(second=0, microsecond=0)
-        bar1_ts = _b1.isoformat()
-        bar5_ts = (_b1.replace(minute=(_b1.minute // 5) * 5).isoformat()
-                   if (_b1.minute % 5 == 0) else None)
+        # ── 종가 확인용 '실제 마감 완료 봉'(now.floor 금지) ──
+        #   실제 1분봉 OHLCV 를 조회해 UTC 정규화 → 마지막 '마감 완료' 1분봉/5분봉의
+        #   (timestamp, close) 를 뽑는다. 진행 중 봉은 제외. 데이터 없음/지연이면
+        #   bar_ts/close=None → 확정봉 매도판정 보류(단, 실시간가 하드손절·급락 안전매도는
+        #   계속 동작). tz(UTC/ET/KST) 는 정규화기가 동일 봉으로 통일한다.
+        bar_ctx = {"last_completed_1m_bar_at": None, "last_completed_1m_close": None,
+                   "last_completed_5m_bar_at": None, "last_completed_5m_close": None}
+        try:
+            _raw_bars = self.api.get_us_intraday_bars(symbol, excd)
+            bar_ctx = USBARS.completed_bar_context(_raw_bars, datetime.now(_UTC))
+        except Exception as _be:
+            logger.debug("[US관리] %s 1분봉 조회 실패 → 확정봉 보류: %s", symbol, _be)
         ctx = {
             "atr_pct":     float(_iv.get("atr_pct") or 0.0),
             "ema9":        _iv.get("ema9"),
             "ema9_rising": bool(_iv.get("ema9_rising")),
-            "bar1_ts":     bar1_ts,
-            "bar5_ts":     bar5_ts,
+            "bar1_ts":     bar_ctx["last_completed_1m_bar_at"],
+            "bar1_close":  bar_ctx["last_completed_1m_close"],
+            "bar5_ts":     bar_ctx["last_completed_5m_bar_at"],
+            "bar5_close":  bar_ctx["last_completed_5m_close"],
         }
         d = USR.decide_management_action(dict(pos.mgmt), net_pct, cur_price, now, ctx=ctx)
         # 갱신 상태 반영(액션 무관하게 last_evaluated_at/회복상태 저장) + highest 재동기화
