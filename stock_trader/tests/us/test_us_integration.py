@@ -27,6 +27,7 @@ from phoenix.lifecycle import OrderLifecycleManager
 
 class FakeUSApi:
     def __init__(self):
+        self.buy_calls   = []
         self.sell_calls  = []
         self.sell_rt_cd  = "0"       # "0"=접수(ODNO) / "9"=타임아웃(UNKNOWN) / "reject"
         self.sell_odno   = "ODNO-TEST-1"
@@ -46,6 +47,13 @@ class FakeUSApi:
 
     def get_usd_exchange_rate(self):
         return 1300.0
+
+    def get_us_available_amounts(self, symbol=None, excd="NASD", ord_unpr=0.0):
+        return {"ok": True, "usd": 1e9, "krw": 0.0, "qty": 999999, "raw": {}}
+
+    def buy_us(self, symbol, qty, price, excd, allow_krw_order=False):
+        self.buy_calls.append({"symbol": symbol, "qty": qty, "price": price})
+        return {"rt_cd": "0", "msg1": "매수접수", "output": {"ODNO": "BUYODNO-1"}}
 
     def sell_us(self, symbol, qty, price, excd):
         self.sell_calls.append({"symbol": symbol, "qty": qty})
@@ -71,7 +79,8 @@ def _iv(sell_score=0, ema9=0.0, ema9_rising=False, atr_pct=0.0):
     return {"sell_score": sell_score, "intraday_pct": 0.0, "rsi": 50.0,
             "vol_ratio": 2.0, "above_vwap": True, "macd_above": True,
             "ema9": ema9, "ema9_rising": ema9_rising, "atr_pct": atr_pct,
-            "buy_score": 0, "vwap": 0.0}
+            "buy_score": 0, "vwap": 0.0, "ema_bull": True,
+            "pullback_breakout": False, "obv_rising": True}
 
 
 SESS = {"session": "미국정규장", "tradeable": True}
@@ -588,6 +597,92 @@ class USIntegrationTest(unittest.TestCase):
                                   _iv(), [], {}, SESS)   # 신규 종목
         self.assertEqual(r["action"], "HOLD")
         self.assertIn("최대 동시보유", r["reason"])
+
+    # ── 총노출 제한($2,400) + 종목당 $300 + ADD $100 ─────────────────
+    def test_add_buy_profit_100_within_symbol_cap(self):
+        # 수익 포지션 ADD 예산 = INVEST_PER_TRADE_USD($200)×ADD_BUY_RATIO(0.5)=$100
+        self.mgr.US_MAX_LOSS_PER_SYMBOL_USD = 1e9      # 위험 사이징 비활성
+        self.mgr.pos_mgr.add(USM.USPosition("IONQ", "IONQ", "NASD", 10, 10.0))  # 원금 $100
+        pos = self.mgr.pos_mgr.positions["IONQ"]
+        r = self.mgr._do_add_buy("IONQ", "IONQ", "NASD", pos, 10.5,
+                                 SESS, _iv(atr_pct=1.0))   # net>0
+        self.assertIn(r["action"], ("BUY_ACCEPTED",))
+        self.assertEqual(len(self.api.buy_calls), 1)
+        add_notional = self.api.buy_calls[0]["qty"] * 10.5
+        self.assertLessEqual(add_notional, 100.0)          # ADD 예산 $100 이내(신규 $300 예산 아님)
+
+    def test_add_buy_capped_to_symbol_300(self):
+        # 종목 누적 원금이 이미 $300 이상이면 ADD 차단(종목합계 $300 초과 금지)
+        self.mgr.US_MAX_LOSS_PER_SYMBOL_USD = 1e9
+        self.mgr.pos_mgr.add(USM.USPosition("IONQ", "IONQ", "NASD", 30, 10.0))  # 원금 $300
+        pos = self.mgr.pos_mgr.positions["IONQ"]
+        r = self.mgr._do_add_buy("IONQ", "IONQ", "NASD", pos, 10.5,
+                                 SESS, _iv(atr_pct=1.0))
+        self.assertEqual(r["action"], "BUY_BLOCKED")
+        self.assertEqual(self.api.buy_calls, [])
+
+    def test_total_exposure_caps_at_2400(self):
+        # 실보유 매입원금 $2,000 + 100주($1,000) 예약시도 → 남은 $400 → 40주로 축소
+        self.mgr.pos_mgr.add(USM.USPosition("AAA", "AAA", "NASD", 200, 10.0))  # $2,000
+        q, rid = self.mgr._us_try_reserve_exposure("BBB", 100, 10.0)
+        self.assertEqual(q, 40)                            # $400 → 총 $2,400(초과 없음)
+        self.assertIsNotNone(rid)
+        self.assertAlmostEqual(self.mgr.us_total_exposure_usd(), 2400.0, places=2)
+        # 추가 예약은 자리 없음 → 차단
+        q2, rid2 = self.mgr._us_try_reserve_exposure("CCC", 1, 10.0)
+        self.assertEqual(q2, 0)
+        self.assertIsNone(rid2)
+
+    def test_exposure_2399_allows_2400_blocks_boundary(self):
+        self.mgr.pos_mgr.add(USM.USPosition("AAA", "AAA", "NASD", 2399, 1.0))  # $2,399
+        q1, r1 = self.mgr._us_try_reserve_exposure("BBB", 1, 1.0)   # +$1 → $2,400 허용
+        self.assertEqual(q1, 1)
+        q2, r2 = self.mgr._us_try_reserve_exposure("CCC", 1, 1.0)   # +$1 → $2,401 차단
+        self.assertEqual(q2, 0)
+        self.assertIsNone(r2)
+
+    def test_exposure_includes_inflight_pending_buy(self):
+        self.mgr.pos_mgr.add(USM.USPosition("AAA", "AAA", "NASD", 100, 10.0))  # held $1,000
+        self.mgr._us_pending_buy_meta["lc1"] = {"code": "BBB", "qty": 100, "price": 10.0}  # 미체결 $1,000
+        self.assertAlmostEqual(self.mgr.us_total_exposure_usd(), 2000.0, places=2)
+        q, rid = self.mgr._us_try_reserve_exposure("CCC", 50, 10.0)   # 남은 $400 → 40주
+        self.assertEqual(q, 40)
+
+    def test_concurrent_reservations_never_exceed_cap(self):
+        # 8개 스레드가 각각 100주($1,000) 예약 시도해도 총 예약 <= $2,400 (단일 락 TOCTOU 방지)
+        results = []
+        def worker(i):
+            q, rid = self.mgr._us_try_reserve_exposure(f"S{i}", 100, 10.0)
+            results.append(q * 10.0)
+        ts = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for t in ts: t.start()
+        for t in ts: t.join()
+        self.assertLessEqual(sum(results), 2400.0)
+        self.assertLessEqual(self.mgr.us_total_exposure_usd(), 2400.0 + 1e-6)
+
+    def test_balance_error_blocks_buy_only_sell_continues(self):
+        # 조회·정합화 실패(비권위) → 신규 BUY 차단, SELL·체결조회는 유지
+        self.mgr.pos_mgr.add(USM.USPosition("IONQ", "IONQ", "NASD", 10, 100.0))
+        self.api.balance_full = _snap([], ok=False)      # 잔고조회 실패(비권위)
+        self.mgr.us_reconcile_positions()
+        self.assertFalse(self.mgr._us_buy_gate_ok)       # BUY 게이트 하향
+        er = self.mgr._check_entry("AAPL", "Apple", "NASD", 10.0, _iv(), [], {}, SESS)
+        self.assertEqual(er["action"], "HOLD")           # 신규 BUY 차단
+        pos = self.mgr.pos_mgr.positions["IONQ"]
+        r = self.mgr._do_sell("IONQ", "IONQ", "NASD", pos.qty, 100.0,
+                              "수동 청산", SESS, auto=False)   # SELL 은 유지
+        self.assertEqual(r["action"], "SELL_ACCEPTED")
+
+    def test_config_health_flags_bad_env(self):
+        import strategies.us_strategy_manager as _m
+        _saved = list(_m._US_CFG_WARNINGS)
+        try:
+            _m._US_CFG_WARNINGS.append("US_MAX_TOTAL_EXPOSURE_USD=-1 비정상 → 안전 기본값")
+            h = self.mgr.us_config_health()
+            self.assertFalse(h["ok"])
+            self.assertTrue(any("US_MAX_TOTAL_EXPOSURE_USD" in w for w in h["warnings"]))
+        finally:
+            _m._US_CFG_WARNINGS[:] = _saved
 
     # ── 위험기반 사이징(최초 BUY·ADD 공통 최종 권위) ─────────────────
     def test_risk_sizing_blocks_on_atr_missing(self):

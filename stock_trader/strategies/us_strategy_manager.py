@@ -308,9 +308,32 @@ DEFAULT_US_WATCHLIST = {
 # ════════════════════════════════════════════════════════════
 # ── 핵심 파라미터
 # ════════════════════════════════════════════════════════════
+# ★ 환경변수 안전 파서: 누락 → 코드 기본값(아래), 비수치·0·음수 → 안전 기본값 + health 경고.
+#   (환경값이 누락돼도 예전 값으로 되돌아가지 않도록 코드 기본값을 신정책값으로 둔다.)
+_US_CFG_WARNINGS: list = []   # us_config_health() 로 노출
+
+
+def _us_env_num(key: str, default, cast=float, minimum=None):
+    raw = os.environ.get(key)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        val = cast(str(raw).strip())
+    except (TypeError, ValueError):
+        _US_CFG_WARNINGS.append(
+            f"{key}={raw!r} 비수치 → 안전 기본값 {default} 적용")
+        return default
+    if val <= 0 or (minimum is not None and val < minimum):
+        _US_CFG_WARNINGS.append(
+            f"{key}={val} 비정상(<=0 또는 최소미만) → 안전 기본값 {default} 적용")
+        return default
+    return val
+
+
 # ★ 1회 투자금: 실제 USD 주문가능금액(frcr_ord_psbl_amt1) 대비 비율로 동적 결정
 # INVEST_PER_TRADE_USD = 상한 cap, INVEST_RATIO_OF_AVAIL = 가용금액 대비 비율
-INVEST_PER_TRADE_USD  = 400.0   # 1회 최대 투자 상한 (USD) — $499 가능금액 기준 안전선
+#   ★ 미국 운용자금 $3,000 기준 신정책: 최초 BUY 최대 $200.
+INVEST_PER_TRADE_USD  = _us_env_num("INVEST_PER_TRADE_USD", 200.0, float)  # 1회 최대 투자 상한($)
 INVEST_RATIO_OF_AVAIL = 0.80    # 가용 USD의 80%까지 사용 (잔액 여유 확보)
 
 # ── 진입 필터 (★ 초공격 단타 — 진입 장벽 최소화) ──
@@ -373,14 +396,19 @@ ADD_BUY_PCT           =  3.0   # +3% 달성 시 추가매수 (5→3%, 더 빠르
 ADD_BUY_RATIO         =  0.5
 MAX_LEVEL             =  3     # 최대 3레벨 (2→3, 더 공격적)
 
-# ── 계좌 위험 제한(손절 없는 수익 전용 정책의 리스크 통제) ─────────────
-#   손절이 없으므로 손실 노출은 '종목별 총매수금액'과 '최대 동시보유 종목 수'로 제한한다.
-#   · US_MAX_BUY_PER_SYMBOL_USD : 종목별 누적 매수원금(평단×수량) 상한($). 초과분 추가매수 차단.
+# ── 계좌 위험 제한(손절 없는 수익 전용 정책의 리스크 통제) — 운용자금 $3,000 기준 ────
+#   손절이 없으므로 손실 노출을 다음으로 제한한다(환경 누락 시 코드 기본값 사용, $800 폴백 금지):
+#   · US_MAX_BUY_PER_SYMBOL_USD : 종목별 누적 매수원금(평단×수량) 상한($). ADD_BUY 는 이 상한
+#       까지만(기존 원금과 합산), 별도 신규 예산을 만들지 않는다.
 #   · US_MAX_CONCURRENT_POSITIONS: 최대 동시보유 종목 수. 초과 시 신규 종목 매수 차단.
-US_MAX_BUY_PER_SYMBOL_USD    = float(
-    os.environ.get("US_MAX_BUY_PER_SYMBOL_USD", "800") or 800)
-US_MAX_CONCURRENT_POSITIONS  = int(
-    os.environ.get("US_MAX_CONCURRENT_POSITIONS", "8") or 8)
+#   · US_MAX_TOTAL_EXPOSURE_USD : 총노출액 상한(실보유 매입원금 + 미체결 BUY 주문원금).
+#       주문 직전 단일 락 안에서 재확인(TOCTOU 방지).
+US_MAX_BUY_PER_SYMBOL_USD    = _us_env_num("US_MAX_BUY_PER_SYMBOL_USD", 300.0, float)
+US_MAX_CONCURRENT_POSITIONS  = int(_us_env_num("US_MAX_CONCURRENT_POSITIONS", 8, float))
+US_MAX_TOTAL_EXPOSURE_USD    = _us_env_num("US_MAX_TOTAL_EXPOSURE_USD", 2400.0, float)
+if _US_CFG_WARNINGS:
+    for _w in _US_CFG_WARNINGS:
+        logger.warning("[US설정] 환경변수 경고: %s", _w)
 
 # ── 자동 SELL 최종 초크포인트: 순수익 절대금액 게이트(퍼센트+금액) — 환경변수 조정 가능 ──
 #   +0.3% 는 체결 미끄러짐으로 실제 순손실이 될 수 있으므로 최소 달러 수익·안전버퍼를 함께 둔다.
@@ -1059,6 +1087,7 @@ class USStrategyManager:
     #   손절이 없으므로 손실 노출은 '종목별 총매수원금'과 '최대 동시보유 종목 수'로 제한한다.
     US_MAX_BUY_PER_SYMBOL_USD    = US_MAX_BUY_PER_SYMBOL_USD      # 모듈 기본값(환경변수 반영)
     US_MAX_CONCURRENT_POSITIONS  = US_MAX_CONCURRENT_POSITIONS
+    US_MAX_TOTAL_EXPOSURE_USD    = US_MAX_TOTAL_EXPOSURE_USD      # 총노출액 상한($)
     US_MIN_NET_PROFIT_USD        = US_MIN_NET_PROFIT_USD          # 자동 SELL 최소 달러 수익
     US_SELL_SAFETY_BUFFER_USD    = US_SELL_SAFETY_BUFFER_USD      # 체결 미끄러짐 안전버퍼($)
 
@@ -1092,6 +1121,9 @@ class USStrategyManager:
         import threading as _th
         self._us_reconcile_lock   = _th.Lock()   # US 전용 비재진입 락(중복 실행 방지)
         self._us_analytics_lock   = _th.Lock()   # 회복 분석 JSONL append 직렬화(줄 깨짐 방지)
+        self._us_order_lock       = _th.Lock()   # 총노출 재확인+예약 원자화(주문 TOCTOU 방지)
+        self._us_exposure_reservations: dict = {}  # {res_id: {"symbol","notional"}} — 미제출 예약분
+        self._us_res_counter      = 0            # 예약 id 생성용(락 안 증가)
         self._us_maxloss_bad: set = set()        # max_loss 누락/손상 종목(fail-safe·health)
         self._us_buy_gate_ok      = False
         self._us_buy_gate_reason  = "awaiting_first_authoritative_complete_reconcile"
@@ -2674,6 +2706,126 @@ class USStrategyManager:
             safety_buffer_usd=float(self.US_SELL_SAFETY_BUFFER_USD))
         return allowed, m
 
+    # ── 총노출 제한(실보유 매입원금 + 미체결 BUY 주문원금) ─────────────────
+    def _us_max_total_exposure_usd(self) -> float:
+        """총노출 상한($). 비수치·0·음수 인스턴스값이면 모듈 안전 기본값 사용(+경고)."""
+        try:
+            v = float(self.US_MAX_TOTAL_EXPOSURE_USD)
+            if v > 0:
+                return v
+        except (TypeError, ValueError):
+            pass
+        _US_CFG_WARNINGS.append(
+            f"US_MAX_TOTAL_EXPOSURE_USD 인스턴스값 비정상 → 기본값 {US_MAX_TOTAL_EXPOSURE_USD}")
+        return float(US_MAX_TOTAL_EXPOSURE_USD)
+
+    def _us_held_cost_basis_usd(self) -> float:
+        """실보유(FILLED, active) 매입원금 합계($). 격리 포지션 제외."""
+        total = 0.0
+        for p in self.pos_mgr.active_positions().values():
+            try:
+                total += float(p.avg_price or 0.0) * int(p.qty or 0)
+            except (TypeError, ValueError):
+                pass
+        return total
+
+    def _us_inflight_buy_notional_usd(self) -> float:
+        """미체결 BUY 주문원금 합계($) — ACCEPTED/UNKNOWN_CONFIRM/PENDING_SUBMIT.
+        (submit-intent 시 등록되고 FILLED/terminal 시 제거되는 pending BUY meta 기준)."""
+        total = 0.0
+        for meta in self._us_pending_buy_meta.values():
+            try:
+                total += float(meta.get("price") or 0.0) * int(meta.get("qty") or 0)
+            except (TypeError, ValueError):
+                pass
+        return total
+
+    def _us_reserved_notional_usd(self) -> float:
+        total = 0.0
+        for r in self._us_exposure_reservations.values():
+            try:
+                total += float(r.get("notional") or 0.0)
+            except (TypeError, ValueError):
+                pass
+        return total
+
+    def us_total_exposure_usd(self) -> float:
+        """현재 총노출액($) = 실보유 매입원금 + 미체결 BUY 주문원금 + 예약분. 락 안 집계."""
+        with self._us_order_lock:
+            return (self._us_held_cost_basis_usd()
+                    + self._us_inflight_buy_notional_usd()
+                    + self._us_reserved_notional_usd())
+
+    def _us_try_reserve_exposure(self, symbol, desired_qty, cur_price):
+        """★ 주문 제출 직전 '단일 락' 안에서 총노출 재확인 + 원자적 예약(TOCTOU 방지).
+
+        반환: (allowed_qty, res_id|None). desired_qty 를 (상한-현재노출) 이내로 축소하며
+        1주도 못 넣으면 (0, None). 예약분은 동시 진입한 다른 주문의 노출계산에 즉시 반영된다.
+        예약은 제출 완료/실패 후 _us_release_exposure 로 해제한다(미체결분은 pending meta 가
+        승계). 실패 시(락 안에서 자리 없음) 어떤 예약도 만들지 않는다.
+        """
+        try:
+            px = float(cur_price); dq = int(desired_qty)
+        except (TypeError, ValueError):
+            return 0, None
+        if px <= 0 or dq <= 0:
+            return 0, None
+        cap = self._us_max_total_exposure_usd()
+        with self._us_order_lock:
+            used = (self._us_held_cost_basis_usd()
+                    + self._us_inflight_buy_notional_usd()
+                    + self._us_reserved_notional_usd())
+            room = cap - used
+            if room < px:      # 1주도 못 넣음 → 예약 없이 차단
+                logger.info(
+                    "[US총노출] %s 예약 불가: 현재노출 $%.2f + 1주 $%.2f > 상한 $%.2f",
+                    symbol, used, px, cap)
+                return 0, None
+            allowed = min(dq, int(room / px))
+            if allowed <= 0:
+                return 0, None
+            self._us_res_counter += 1
+            res_id = f"expres-{symbol}-{self._us_res_counter}"
+            self._us_exposure_reservations[res_id] = {
+                "symbol": symbol, "notional": allowed * px}
+            if allowed < dq:
+                logger.info(
+                    "[US총노출] %s 수량축소 %d→%d주 (현재노출 $%.2f, 남은한도 $%.2f, 상한 $%.2f)",
+                    symbol, dq, allowed, used, room, cap)
+            return allowed, res_id
+
+    def _us_release_exposure(self, res_id) -> None:
+        if not res_id:
+            return
+        with self._us_order_lock:
+            self._us_exposure_reservations.pop(res_id, None)
+
+    def us_exposure_health(self) -> dict:
+        """/api/status 노출용 총노출 스냅샷(PII 없음)."""
+        with self._us_order_lock:
+            held = self._us_held_cost_basis_usd()
+            inflight = self._us_inflight_buy_notional_usd()
+            reserved = self._us_reserved_notional_usd()
+        cap = self._us_max_total_exposure_usd()
+        total = held + inflight + reserved
+        return {
+            "total_exposure_usd":  round(total, 2),
+            "held_basis_usd":      round(held, 2),
+            "inflight_buy_usd":    round(inflight, 2),
+            "reserved_usd":        round(reserved, 2),
+            "max_total_exposure_usd":   cap,
+            "max_buy_per_symbol_usd":   float(self.US_MAX_BUY_PER_SYMBOL_USD),
+            "max_concurrent_positions": int(self.US_MAX_CONCURRENT_POSITIONS),
+            "invest_per_trade_usd":     float(INVEST_PER_TRADE_USD),
+            "room_usd":            round(max(0.0, cap - total), 2),
+        }
+
+    @staticmethod
+    def us_config_health() -> dict:
+        """환경변수 파싱 경고(비수치·0·음수 → 안전 기본값 적용) 노출."""
+        return {"ok": (len(_US_CFG_WARNINGS) == 0),
+                "warnings": list(_US_CFG_WARNINGS)}
+
     def _us_record_recovery_analytics(self, symbol, name, pos, outcome: dict) -> None:
         """RECOVERY_WAIT 회복/청산 시 분석 레코드를 남긴다(향후 실제 데이터로 정책 조정).
 
@@ -4171,6 +4323,15 @@ class USStrategyManager:
             return any(_kw in _msg for _kw in
                        ("부족", "금액", "초과", "주문가능", "한도"))
 
+        # ── ★★ 총노출 상한 재확인 + 원자적 예약(주문 직전 단일 락, TOCTOU 방지) ──
+        #   실보유 매입원금 + 미체결 BUY 주문원금 + 예약분 합계가 상한을 넘지 않도록 축소·차단.
+        qty, _exp_res_id = self._us_try_reserve_exposure(symbol, qty, cur_price)
+        if qty <= 0:
+            return {"action": "BUY_BLOCKED", "symbol": symbol, "name": name,
+                    "reason": (f"총노출 한도 초과 — 신규매수 차단"
+                               f"(상한 ${self._us_max_total_exposure_usd():.0f})"),
+                    "session": sess.get("session", "")}
+
         _resized_once = False
         _us_lc_id = None
         while True:
@@ -4181,6 +4342,7 @@ class USStrategyManager:
                         _us_lc_id, symbol, "BUY", qty, cur_price, excd, _us_trade_id,
                         meta_extra={"name": name, "level": 1,
                                     "reason": entry_reason}):
+                    self._us_release_exposure(_exp_res_id)
                     return {"action": "BUY_FAIL", "symbol": symbol, "name": name,
                             "reason": "submit-intent 저장 실패 — 주문 미제출(안전)",
                             "session": sess["session"]}
@@ -4219,6 +4381,9 @@ class USStrategyManager:
                 "%d→%d주(1회 한정)", symbol, qty, _re_qty)
             qty = _re_qty
             _resized_once = True
+
+        # 제출/응답 확정 후 예약 해제(접수분은 pending BUY meta 가 노출을 승계, 거절분은 소멸)
+        self._us_release_exposure(_exp_res_id)
 
         if not order_ok:
             # ── [US 훅 C] ORDER_REJECTED ──
@@ -4319,6 +4484,13 @@ class USStrategyManager:
             symbol, name, cur_price, _budget_add, iv, sess)
         if _blk is not None:
             return _blk
+        # ── ★★ 총노출 상한 재확인 + 원자적 예약(주문 직전 단일 락, TOCTOU 방지) ──
+        add_qty, _add_res_id = self._us_try_reserve_exposure(symbol, add_qty, cur_price)
+        if add_qty <= 0:
+            return {"action": "BUY_BLOCKED", "symbol": symbol, "name": name,
+                    "reason": (f"총노출 한도 초과 — 추가매수 차단"
+                               f"(상한 ${self._us_max_total_exposure_usd():.0f})"),
+                    "session": sess.get("session", "")}
         # allow_krw_order=True → 추가매수도 원화환전 허용
 
         # ── [US 훅 E] 추가매수 SIGNAL + SUBMITTED ──
@@ -4358,6 +4530,7 @@ class USStrategyManager:
                     _us_add_lc_id, symbol, "BUY", add_qty, cur_price, excd,
                     _us_add_trade_id,
                     meta_extra={"name": name, "level": 2, "reason": reason}):
+                self._us_release_exposure(_add_res_id)
                 return {"action": "BUY_FAIL", "symbol": symbol, "name": name,
                         "reason": "submit-intent 저장 실패 — 주문 미제출(안전)",
                         "session": sess["session"]}
@@ -4372,6 +4545,8 @@ class USStrategyManager:
         else:
             _add_outcome = (_US_OUTCOME_ACCEPTED if result.get("rt_cd") == "0"
                             else _US_OUTCOME_REJECTED)
+        # 제출/응답 확정 후 예약 해제(접수분은 pending BUY meta 가 노출을 승계)
+        self._us_release_exposure(_add_res_id)
 
         if _add_outcome in (_US_OUTCOME_REJECTED, _US_OUTCOME_NOT_SENT):
             # ── [US 훅 F] 추가매수 ORDER_REJECTED (명확 거절/미전송 — 주문 없음) ──
