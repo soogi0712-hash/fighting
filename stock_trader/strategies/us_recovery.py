@@ -98,6 +98,12 @@ def default_state(recovered: bool = False, highest_price: float = 0.0,
         "recovery_high_net_pct": None,
         "recovery_reached_exit": False,   # net>=-2.0 회복 성공 표시(정보)
         "recovery_warn":         False,   # net<=-6.0 경고 표시(매도 아님)
+        # ── 매매일지 분석용(향후 실제 데이터로 정책 조정) ──
+        "recovery_entry_price":     None,   # RECOVERY_WAIT 진입 시각 가격
+        "recovery_entry_net":       None,   # 진입 시 net_pct(≈-5, 조기손절 가상손익 기준)
+        "recovery_max_drawdown_net": None,  # 진입 후 최저 net_pct(최대하락률)
+        "recovery_warn_at":         None,   # -6% 최초 도달 시각(ISO)
+        "recovery_last_outcome":    None,   # 회복/청산 시 1회 기록용(호출부가 소비 후 제거)
         # ── 구조적 추세 붕괴 '완성 5분봉' 연속 확인(봉 중복/역행/늦은정정 처리) ──
         "struct_breach_closes":      0,
         "struct_prev_breach_closes": 0,
@@ -239,17 +245,48 @@ def risk_capped_qty(cur_price: float, atr_pct: float, budget_qty: int,
     return max(0, min(bq, cap))
 
 
+def _elapsed_seconds(started_iso: Optional[str], now: datetime) -> Optional[float]:
+    if not started_iso:
+        return None
+    try:
+        return (now - datetime.fromisoformat(started_iso)).total_seconds()
+    except (TypeError, ValueError):
+        return None
+
+
+def _recovery_outcome(s: dict, outcome: str, net_pct, cur_price, now) -> dict:
+    """매매일지 분석 레코드(향후 실제 데이터로 정책 조정). 순수 dict."""
+    return {
+        "outcome":                outcome,          # recovered / structural_and_risk_sell
+        "entry_price":            s.get("recovery_entry_price"),
+        "entry_net_pct":          s.get("recovery_entry_net"),
+        "max_drawdown_net_pct":   s.get("recovery_max_drawdown_net"),
+        "warn6_at":               s.get("recovery_warn_at"),
+        "started_at":             s.get("recovery_started_at"),
+        "ended_at":               now.isoformat(),
+        "recovery_seconds":       _elapsed_seconds(s.get("recovery_started_at"), now),
+        "final_net_pct":          (float(net_pct) if net_pct is not None else None),
+        "final_price":            (float(cur_price) if cur_price is not None else None),
+        # 조기손절 가상손익 기준(진입 net≈-5%). 호출부가 수량으로 $환산.
+        "hypothetical_early_stop_net_pct": s.get("recovery_entry_net"),
+    }
+
+
 def evaluate(state: dict, net_pct: float, cur_price: float, now: datetime,
              atr_pct: float = 0.0, bar5_ts: Optional[str] = None,
              bar5_close: Optional[float] = None,
-             account_risk_exceeded: bool = False) -> RecoveryDecision:
+             account_risk_exceeded: bool = False,
+             symbol_risk_exceeded: bool = False) -> RecoveryDecision:
     """손실 관리(RECOVERY_WAIT) 판정. EXIT/CLOSED → HOLD.
 
-    ★ 고정 -6% 전량손절 없음. -5%/-6% 는 상태 진입·경고 기준. recovery high 대비 '단순
-      하락'만으로 매도하지 않는다(0% 회복 기회 부여). 손실 매도는 아래 둘만 허용:
-        (1) 완성 5분봉 ATR 구조적 추세 붕괴가 **연속 확인**(STRUCT_CONFIRM_BARS)
-        (2) account_risk_exceeded(계좌 위험한도 초과)
-      net_pct >= 0.0 → NORMAL 복귀.
+    목적: '정해진 손절률 준수'가 아니라 **누적 실현수익 극대화·불필요한 손실확정 최소화**.
+    ★ 고정 -6% 전량손절 없음. -5%/-6% 는 상태 진입·관찰(경고) 기준. recovery high 대비
+      '단순 하락'이나 '짧은 반등 실패'만으로 매도하지 않는다(0% 회복 기회 부여).
+    ★ 손실 매도는 **다음이 모두 동시 충족**될 때만 허용:
+        (1) 완성 5분봉 ATR 구조적 하락이 **연속 확인**(STRUCT_CONFIRM_BARS)  그리고
+        (2) account_risk_exceeded(계좌 위험한도 초과)                        그리고
+        (3) symbol_risk_exceeded(종목 위험한도 초과 — 호출부가 금액기준 판정)
+      net_pct >= 0.0 → NORMAL 복귀. 회복/청산 시 분석 레코드를 recovery_last_outcome 에 남긴다.
     """
     s = dict(state)
     s["last_evaluated_at"] = now.isoformat()
@@ -269,6 +306,12 @@ def evaluate(state: dict, net_pct: float, cur_price: float, now: datetime,
             s["recovery_high_net_pct"]  = float(net_pct)
             s["recovery_reached_exit"]  = False
             s["recovery_warn"]          = bool(net_pct <= RECOVERY_WARN_NET)
+            # 분석용 진입 스냅샷
+            s["recovery_entry_price"]     = float(cur_price or 0.0)
+            s["recovery_entry_net"]       = float(net_pct)
+            s["recovery_max_drawdown_net"] = float(net_pct)
+            s["recovery_warn_at"]         = (now.isoformat()
+                                             if net_pct <= RECOVERY_WARN_NET else None)
             _reset_breach(s, "struct_breach_closes",
                           "struct_prev_breach_closes", "last_struct_breach_bar_at")
             return RecoveryDecision(ACT_HOLD, MODE_RECOVERY_WAIT,
@@ -287,23 +330,30 @@ def evaluate(state: dict, net_pct: float, cur_price: float, now: datetime,
     if net_pct is not None and (rhn is None or net_pct > rhn):
         s["recovery_high_net_pct"] = float(net_pct)
 
-    # (0) 계좌 위험한도 초과 → 손실 포지션 강제 청산(허용된 손실 매도)
-    if account_risk_exceeded and net_pct is not None and net_pct < 0:
-        return RecoveryDecision(ACT_SELL_ALL, MODE_RECOVERY_WAIT,
-                                f"account_risk_limit(net={net_pct:.2f}%)", s)
+    # 분석용: 최대하락률 갱신, -6% 최초도달 시각
+    if net_pct is not None:
+        md = s.get("recovery_max_drawdown_net")
+        if md is None or net_pct < md:
+            s["recovery_max_drawdown_net"] = float(net_pct)
+        if net_pct <= RECOVERY_WARN_NET:
+            s["recovery_warn"] = True
+            if not s.get("recovery_warn_at"):
+                s["recovery_warn_at"] = now.isoformat()
 
-    # 경고 표시(매도 아님)
-    if net_pct is not None and net_pct <= RECOVERY_WARN_NET:
-        s["recovery_warn"] = True
-
-    # 손익분기(0%) 회복 → NORMAL 전환
+    # 손익분기(0%) 회복 → NORMAL 전환 (매매일지 분석 레코드 기록)
     if net_pct is not None and net_pct >= RECOVERY_NORMAL_NET:
+        s["recovery_last_outcome"] = _recovery_outcome(
+            s, "recovered", net_pct, cur_price, now)
         s["management_mode"]        = MODE_NORMAL
         s["recovery_started_at"]    = None
         s["recovery_high_price"]    = None
         s["recovery_high_net_pct"]  = None
         s["recovery_reached_exit"]  = False
         s["recovery_warn"]          = False
+        s["recovery_entry_price"]   = None
+        s["recovery_entry_net"]     = None
+        s["recovery_max_drawdown_net"] = None
+        s["recovery_warn_at"]       = None
         _reset_breach(s, "struct_breach_closes",
                       "struct_prev_breach_closes", "last_struct_breach_bar_at")
         return RecoveryDecision(ACT_HOLD, MODE_NORMAL,
@@ -313,8 +363,9 @@ def evaluate(state: dict, net_pct: float, cur_price: float, now: datetime,
     if net_pct is not None and net_pct >= RECOVERY_SUCCESS_NET:
         s["recovery_reached_exit"] = True
 
-    # (1) 구조적 추세 붕괴 — 완성 5분봉 종가가 recovery high 대비 넓은 ATR 거리 이탈,
-    #     **연속** 확인. 정상 5분봉이 끼면 초기화. (단순 하락 매도 아님)
+    # 손실 매도 — (1)구조적 붕괴 연속 확인 AND (2)계좌위험 AND (3)종목위험 **동시** 충족.
+    #   구조 카운트는 항상 갱신(정상 5분봉 끼면 초기화). 위험한도 미충족이면 HOLD(관찰).
+    struct_confirmed = False
     if bar5_ts and bar5_close is not None and rhp and rhp > 0:
         sstop = struct_stop_pct(atr_pct)
         b5drop = (float(bar5_close) - float(rhp)) / float(rhp) * 100.0
@@ -322,10 +373,15 @@ def evaluate(state: dict, net_pct: float, cur_price: float, now: datetime,
         closes = _update_breach_count(
             s, "struct_breach_closes", "struct_prev_breach_closes",
             "last_struct_breach_bar_at", bar5_ts, breakdown)
-        if breakdown and closes >= STRUCT_CONFIRM_BARS:
-            return RecoveryDecision(
-                ACT_SELL_ALL, MODE_RECOVERY_WAIT,
-                f"structural_breakdown(5m_drop={b5drop:.2f}%<=-{sstop:.2f}%,closes={closes})", s)
+        struct_confirmed = breakdown and closes >= STRUCT_CONFIRM_BARS
+
+    if struct_confirmed and account_risk_exceeded and symbol_risk_exceeded:
+        s["recovery_last_outcome"] = _recovery_outcome(
+            s, "structural_and_risk_sell", net_pct, cur_price, now)
+        return RecoveryDecision(
+            ACT_SELL_ALL, MODE_RECOVERY_WAIT,
+            "structural_breakdown+account_risk+symbol_risk("
+            f"net={net_pct:.2f}%,struct_closes={int(s.get('struct_breach_closes') or 0)})", s)
 
     return RecoveryDecision(ACT_HOLD, MODE_RECOVERY_WAIT, "recovery_wait_hold", s)
 
@@ -430,23 +486,20 @@ def decide_management_action(state: dict, net_pct: float, cur_price: float,
     bar5_ts     = ctx.get("bar5_ts")
     bar5_close  = ctx.get("bar5_close")
     account_risk_exceeded = bool(ctx.get("account_risk_exceeded"))
+    symbol_risk_exceeded  = bool(ctx.get("symbol_risk_exceeded"))
 
     mode = state.get("management_mode", MODE_NORMAL)
     if mode in (MODE_EXIT, MODE_CLOSED):
         s = dict(state); s["last_evaluated_at"] = now.isoformat()
         return RecoveryDecision(ACT_HOLD, mode, "exit_pending_or_closed", s)
 
-    # 0) 계좌 위험한도 초과 → 손실 포지션(net<0)만 강제 청산(허용된 손실 매도)
-    if account_risk_exceeded and net_pct is not None and net_pct < 0:
-        s = dict(state); s["last_evaluated_at"] = now.isoformat()
-        return RecoveryDecision(ACT_SELL_ALL, mode,
-                                f"account_risk_limit(net={net_pct:.2f}%)", s)
-
-    # 1) 손실 관리(RECOVERY_WAIT 진입 포함) — 최우선. 완성 5분봉 구조적 붕괴만 매도.
+    # 1) 손실 관리(RECOVERY_WAIT 진입 포함) — 최우선.
+    #    손실 매도는 '구조적 5분봉 붕괴 연속 + 계좌위험 + 종목위험'이 **모두** 충족될 때만.
     if mode == MODE_RECOVERY_WAIT or (net_pct is not None and net_pct <= RECOVERY_ENTER_NET):
         return evaluate(state, net_pct, cur_price, now, atr_pct=atr_pct,
                         bar5_ts=bar5_ts, bar5_close=bar5_close,
-                        account_risk_exceeded=account_risk_exceeded)
+                        account_risk_exceeded=account_risk_exceeded,
+                        symbol_risk_exceeded=symbol_risk_exceeded)
 
     # 2) 수익 트레일링 — 활성 시 모든 NORMAL 포지션(복원/신규) 지배
     s = dict(state); s["last_evaluated_at"] = now.isoformat()
